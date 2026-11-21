@@ -18,6 +18,7 @@ public extension CredentialStoring {
 
 public enum CredentialKeys {
     public static let tmdb = "tmdb"
+    public static let theSportsDB = "thesportsdb"
 }
 
 public struct KeychainError: LocalizedError, Sendable, Equatable {

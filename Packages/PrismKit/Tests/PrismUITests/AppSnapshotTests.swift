@@ -28,7 +28,11 @@ struct AppSnapshotTests {
             label: "home", size: CGSize(width: 1440, height: 900), scheme: .light
         )
         try await write(
-            BrowseScreen(kind: nil).environment(app).environment(navigation),
+            PrismRootView(playback: PrismPlaybackSession()).environment(app),
+            label: "home-dark", size: CGSize(width: 1440, height: 900)
+        )
+        try await write(
+            BrowseScreen(kind: nil).environment(app).environment(navigation).environment(SportsPresentation()),
             label: "home-content", size: CGSize(width: 1210, height: 900)
         )
         try await write(
@@ -52,17 +56,67 @@ struct AppSnapshotTests {
             ),
             label: "editions", size: CGSize(width: 540, height: 540)
         )
-        try await write(
-            LiveScreen().environment(app).environment(navigation),
-            label: "live", size: CGSize(width: 1170, height: 870)
+        for scheme in [ColorScheme.dark, .light] {
+            let suffix = scheme == .light ? "-light" : ""
+            try await write(
+                LiveScreen().environment(app).environment(navigation),
+                label: "live\(suffix)", size: CGSize(width: 1170, height: 870), scheme: scheme
+            )
+            try await write(
+                LiveGuide(
+                    channels: app.catalog.channels, guide: app.guide, start: .constant(nil), isRefreshing: false,
+                    onRefresh: {}, onPlay: { _, _ in }, onReplay: { _, _, _ in nil }, channelMenu: { _, _ in EmptyView() }
+                ),
+                label: "guide\(suffix)", size: CGSize(width: 1170, height: 870), scheme: scheme
+            )
+        }
+        let sport = try sportsFixture(in: app)
+        for scheme in [ColorScheme.light, .dark] {
+            try await write(
+                SportsScreen().environment(app).environment(sport).environment(\.isPageActive, false),
+                label: scheme == .light ? "sport-light" : "sport-dark", size: CGSize(width: 1170, height: 870), scheme: scheme
+            )
+            try await write(
+                SportsHomeShelf().environment(app).environment(navigation).environment(sport).environment(\.isPageActive, false),
+                label: scheme == .light ? "sport-shelf-light" : "sport-shelf-dark", size: CGSize(width: 1170, height: 248), scheme: scheme
+            )
+        }
+    }
+
+    private func sportsFixture(in app: AppModel) throws -> SportsPresentation {
+        let now = Calendar.current.startOfDay(for: .now).addingTimeInterval(13 * 3600)
+        let channel = try #require(app.catalog.channels.first { $0.name.localizedCaseInsensitiveContains("beIN Sports") }
+            ?? app.catalog.channels.first { !$0.variants.isEmpty })
+        let artwork = ProcessInfo.processInfo.environment["PRISM_SPORTS_SAMPLE_ART"]
+            .flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+        let football = EPGProgram(
+            channelID: channel.epgID ?? channel.id, start: now.addingTimeInterval(-900), end: now.addingTimeInterval(3600),
+            title: "Nice – Paris Saint-Germain", category: "Football"
         )
-        try await write(
-            LiveGuide(
-                channels: app.catalog.channels, guide: app.guide, start: .constant(nil), isRefreshing: false,
-                onRefresh: {}, onPlay: { _, _ in }, onReplay: { _, _, _ in nil }, channelMenu: { _, _ in EmptyView() }
-            ),
-            label: "guide", size: CGSize(width: 1170, height: 870)
+        let event = SportsEvent(
+            id: "fixture:league1", league: .ligue1, startsAt: football.start, status: .live,
+            home: SportsTeam(id: "nice", name: "Nice", abbreviation: "OGCN", score: 1),
+            away: SportsTeam(id: "paris", name: "Paris Saint-Germain", abbreviation: "PSG", score: 2),
+            displayClock: "36′", artworkURL: artwork
         )
+        let basketball = EPGProgram(
+            channelID: channel.epgID ?? channel.id, start: now.addingTimeInterval(5400), end: now.addingTimeInterval(10800),
+            title: "Chicago Bulls – Boston Celtics", category: "Basketball"
+        )
+        let boxing = EPGProgram(
+            channelID: channel.epgID ?? channel.id, start: now.addingTimeInterval(16200), end: now.addingTimeInterval(21600),
+            title: "Dubois – Parker", category: "Boxe"
+        )
+        let magazine = EPGProgram(
+            channelID: channel.epgID ?? channel.id, start: now.addingTimeInterval(7200), end: now.addingTimeInterval(10_800),
+            title: "NBA Today", category: "Basketball"
+        )
+        return SportsPresentation(fixtures: [
+            SportsFixture(event: event, broadcasts: [SportsBroadcast(channel: channel, program: football, sport: .football)]),
+            SportsFixture(broadcast: SportsBroadcast(channel: channel, program: basketball, sport: .basketball)),
+            SportsFixture(broadcast: SportsBroadcast(channel: channel, program: boxing, sport: .boxing)),
+            SportsFixture(broadcast: SportsBroadcast(channel: channel, program: magazine, sport: .basketball)),
+        ], now: now)
     }
 
     private func write(

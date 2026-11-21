@@ -19,11 +19,14 @@ struct SourceDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     BrowseHeading(title: source.name, subtitle: source.kind.displayLabel)
-                    HStack(spacing: 14) {
+                    HStack(spacing: 0) {
                         metric("Chaînes", count: counts.channels, symbol: "dot.radiowaves.left.and.right")
+                        Divider().frame(height: 42)
                         metric("Films", count: counts.movies, symbol: "film")
+                        Divider().frame(height: 42)
                         metric("Séries", count: counts.series, symbol: "rectangle.stack")
                     }
+                    .background(PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.panelRadius))
                     .padding(.horizontal, PrismMetrics.contentMargin)
                     Form {
                         Section("État") {
@@ -84,12 +87,11 @@ struct SourceDetailView: View {
     private func metric(_ name: String, count: Int, symbol: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Image(systemName: symbol).foregroundStyle(.tint)
-            Text(count.formatted()).font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
+            Text(count.formatted()).font(.system(size: 26, weight: .semibold).monospacedDigit())
             Text(name).font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
-        .background(.fill.tertiary, in: .rect(cornerRadius: 14))
         .accessibilityElement(children: .combine)
     }
 
@@ -246,6 +248,9 @@ private struct EditSourceSheet: View {
 struct PrismSettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var metadataKey = ""
+    @State private var sportsAPIKey = ""
+    @State private var sportsKeySaved = false
+    @State private var sportsKeyError: String?
     @State private var showAddSource = false
     @State private var preferences = PlayerPreferences.standard
 
@@ -260,11 +265,41 @@ struct PrismSettingsView: View {
                         .disabled(app.sources.isEmpty || app.isImportingAnything)
                     Button("Ajouter une source…", systemImage: "plus.circle") { showAddSource = true }
                 }
+                Section {
+                    Picker("Langues audio", selection: Binding(
+                        get: { app.homeAudioLanguages },
+                        set: { app.setHomeAudioLanguages($0) }
+                    )) {
+                        Text("Français").tag(Set([HomeAudioLanguage.french]))
+                        Text("Anglais").tag(Set([HomeAudioLanguage.english]))
+                        Text("Français et anglais").tag(HomeAudioLanguage.defaults)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Recommandations de l’accueil")
+                } footer: {
+                    Text("Langues audio des films et séries suggérés à l’accueil.")
+                }
                 Section("Métadonnées") {
                     SecureField("Clé TMDB", text: $metadataKey)
                     Button("Enregistrer la clé") { app.setTMDBKey(metadataKey) }
                     Text("La clé enrichit les fiches de vos films et séries avec les visuels et les informations de TMDB.")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                Section {
+                    SecureField("Clé TheSportsDB", text: $sportsAPIKey)
+                    Button("Enregistrer la clé") { saveSportsKey(sportsAPIKey) }
+                        .disabled(sportsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if sportsKeySaved {
+                        Button("Retirer la clé", role: .destructive) { saveSportsKey(nil) }
+                    }
+                    if let sportsKeyError {
+                        Text(sportsKeyError).foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Scores sportifs")
+                } footer: {
+                    Text("Pour suivre les scores en direct, ajoutez une clé TheSportsDB Premium.")
                 }
             }
             .formStyle(.grouped)
@@ -298,12 +333,26 @@ struct PrismSettingsView: View {
             .tabItem { Label("Lecteur", systemImage: "play.rectangle") }
         }
         .frame(width: 500, height: 365)
-        .task { metadataKey = app.tmdbKey ?? "" }
+        .task {
+            metadataKey = app.tmdbKey ?? ""
+            sportsKeySaved = app.hasSportsAPIKey
+        }
         .sheet(isPresented: $showAddSource) {
             AddSourceView(onImported: {
                 app.completeOnboarding()
                 showAddSource = false
             })
+        }
+    }
+
+    private func saveSportsKey(_ value: String?) {
+        do {
+            try app.setSportsAPIKey(value)
+            sportsAPIKey = ""
+            sportsKeySaved = app.hasSportsAPIKey
+            sportsKeyError = nil
+        } catch {
+            sportsKeyError = error.localizedDescription
         }
     }
 }

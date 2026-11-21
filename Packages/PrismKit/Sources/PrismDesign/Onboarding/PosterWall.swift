@@ -171,9 +171,9 @@ private struct PosterWallCell: View {
             }
         }
         .frame(width: size.width, height: size.height)
-        .clipShape(.rect(cornerRadius: 12, style: .continuous))
+        .clipShape(.rect(cornerRadius: PrismMetrics.wideRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: PrismMetrics.wideRadius, style: .continuous).strokeBorder(.white.opacity(0.08), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.4), radius: 10, y: 6)
     }

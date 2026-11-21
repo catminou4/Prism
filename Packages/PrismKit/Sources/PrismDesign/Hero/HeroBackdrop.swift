@@ -113,9 +113,9 @@ private struct PosterHeroArtwork: View {
                 let height = min(proxy.size.height * 0.74, 520)
                 let width = height * PrismMetrics.posterAspectRatio
                 RemoteImage(url: posterURL, size: CGSize(width: width, height: height), placeholderSeed: seed, placeholderTitle: nil)
-                    .clipShape(.rect(cornerRadius: 12, style: .continuous))
+                    .clipShape(.rect(cornerRadius: PrismMetrics.posterRadius, style: .continuous))
                     .overlay {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: PrismMetrics.posterRadius, style: .continuous).strokeBorder(.white.opacity(0.12), lineWidth: 1)
                     }
                     .shadow(color: .black.opacity(0.5), radius: 30, y: 16)
                     .scaleEffect(kenBurns ? 1.02 : 1)

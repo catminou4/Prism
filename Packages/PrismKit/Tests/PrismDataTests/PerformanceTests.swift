@@ -22,8 +22,9 @@ struct PerformanceTests {
         }
         print("[perf] Recommendations for \(catalog.movies.count + catalog.series.count) titles: \(String(format: "%.2f", recommendationMS)) ms")
         #expect(recommendationMS < 150)
-        #expect(recommendations.highlights.count == 7)
-        #expect(recommendations.wellRated.count == 24)
+        let selection = recommendations.selection(for: HomeAudioLanguage.defaults)
+        #expect(selection.highlights.isEmpty)
+        #expect(selection.wellRated.isEmpty)
 
         let (index, indexMS) = await measureMilliseconds { await SearchIndex.build(from: catalog) }
         print("[perf] SearchIndex.build \(index.entryCount) entries, \(index.wordCount) words: \(Int(indexMS)) ms")

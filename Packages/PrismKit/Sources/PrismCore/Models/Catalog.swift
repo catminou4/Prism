@@ -83,7 +83,7 @@ public struct MediaTitle: Identifiable, Sendable, Hashable {
     }
 
     public var primary: MediaVariant? { variants.first }
-    public var bestQuality: VideoQuality { variants.map(\.quality).max() ?? .unknown }
+    public var bestQuality: VideoQuality { variants.lazy.map(\.quality).max() ?? .unknown }
 }
 
 /// A live channel grouped across variants ("TF1", "TF1 HD", "FR: TF1 4K" from 2 sources…).

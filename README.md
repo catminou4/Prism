@@ -2,12 +2,19 @@
 
 Lecteur IPTV natif en français pour macOS 26 et ultérieur. Prism réunit les chaînes, films et séries de vos listes M3U et comptes Xtream Codes. Il lit les programmes de vos sources et inclut une démo pour essayer l’interface.
 
-- **Accueil** · Reprise de lecture, sélection française, incontournables américains et découvertes internationales lorsque ces œuvres sont disponibles dans le catalogue.
+- **Accueil** · Reprise de lecture, sélection française, incontournables américains et découvertes internationales. Le menu sur l’accueil permet de choisir les recommandations en français, en anglais ou dans les deux langues.
 - **Fiches** · Une entrée par œuvre lorsque les données permettent le rapprochement. Au lancement de la lecture, choisissez parmi les versions disponibles pour ce titre ou cet épisode. Le lecteur propose également les pistes audio et les sous-titres signalés par le flux.
 - **Direct** · Guide XMLTV, favoris, changement de chaîne au clavier, source préférée et replay lorsqu’une archive est disponible.
+- **Sport** · Affiches et horaires dans l’accueil et dans une rubrique dédiée. Calendrier et derniers résultats de la Ligue des champions, de la Ligue 1, de la NBA et de la boxe, avec un accès aux diffusions identifiées dans le guide IPTV.
 - **Sources** · Saisie ou collage des codes Xtream, listes M3U et réglages XMLTV. Le filtre d’une source permet de masquer des catégories avant le regroupement du catalogue.
 - **Bibliothèque** · Ma liste, historique et reprise, conservés sur le Mac. Le lecteur propose l’épisode suivant lorsqu’il est disponible dans l’édition en cours.
 - **Lecture** · Fenêtre dédiée, AVFoundation et VLCKit, avec repli automatique. L’enrichissement des fiches par TMDB est facultatif et se configure avec votre clé.
+
+## Données sportives
+
+Les calendriers et résultats proviennent de l’API publique TheSportsDB. L’accès gratuit fournit la prochaine rencontre et la plus récente par compétition. Pour les scores en direct selon la couverture du fournisseur, enregistrez une clé TheSportsDB Premium dans **Réglages → Général → Scores sportifs**. La boxe affiche les combats et les résultats en texte lorsque le fournisseur les renseigne. Les horaires s’affichent dans le fuseau de votre Mac. [Documentation TheSportsDB](https://api.thesportsdb.com/docs/api)
+
+La clé sportive est conservée dans le Trousseau de macOS. Les requêtes à TheSportsDB n’incluent aucun identifiant IPTV.
 
 ## Compiler
 

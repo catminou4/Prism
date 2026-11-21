@@ -120,7 +120,7 @@ struct HistoryScreen: View {
                                 RemoteImage(url: item.artwork, size: CGSize(width: 80, height: 46),
                                             contentMode: item.isLive ? .fit : .fill,
                                             placeholderSeed: item.title, placeholderStyle: .monogram)
-                                    .clipShape(.rect(cornerRadius: 8))
+                                    .clipShape(.rect(cornerRadius: PrismMetrics.smallArtworkRadius))
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(item.title).font(.headline)
                                     Text(entry.watchedAt, format: .dateTime.day().month(.wide).hour().minute())

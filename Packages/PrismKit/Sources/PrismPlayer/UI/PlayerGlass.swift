@@ -6,6 +6,8 @@ public enum PlayerMetrics {
     public static let margin: CGFloat = 16
     /// Bottom margin of the scrubber.
     public static let bottomMargin: CGFloat = 14
+    public static let panelRadius: CGFloat = 20
+    public static let artworkRadius: CGFloat = 8
     /// Top inset below the traffic lights (windowed).
     public static let windowedTopInset: CGFloat = 30
     public static let capsuleHeight: CGFloat = 35
@@ -14,11 +16,11 @@ public enum PlayerMetrics {
     /// Bottom-right menu buttons are packed slightly tighter.
     public static let menuButtonWidth: CGFloat = 35
     public static let capsulePadding: CGFloat = 3
-    public static let skipDiameter: CGFloat = 42
-    public static let playDiameter: CGFloat = 56
+    public static let skipDiameter: CGFloat = 40
+    public static let playDiameter: CGFloat = 52
     public static let skipSymbolSize: CGFloat = 19
     public static let playSymbolSize: CGFloat = 24
-    public static let centerSpacing: CGFloat = 16
+    public static let centerSpacing: CGFloat = 14
     public static let scrubberHeight: CGFloat = 32
     public static let scrubberPadding: CGFloat = 16.5
     public static let trackHeight: CGFloat = 6
@@ -44,9 +46,12 @@ struct PlayerGlassModifier<S: Shape>: ViewModifier {
     let shape: S
     let interactive: Bool
     @Environment(\.playerSnapshotRendering) private var snapshot
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
-        if snapshot {
+        if reduceTransparency {
+            content.background(Color(white: 0.16), in: shape)
+        } else if snapshot {
             content.background {
                 shape.fill(Color(white: 0.125))
                     .overlay {
@@ -95,6 +100,7 @@ private struct PlayerCapsuleButtonBody: View {
     let width: CGFloat
     @State private var hovering = false
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         configuration.label
@@ -107,32 +113,30 @@ private struct PlayerCapsuleButtonBody: View {
             }
             .contentShape(Capsule())
             .opacity(isEnabled ? 1 : 0.4)
-            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.94 : 1)
             .onHover { hovering = $0 }
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: hovering)
-            .animation(.spring(response: 0.25, dampingFraction: 0.8), value: configuration.isPressed)
+            .animation(reduceMotion ? nil : .smooth(duration: 0.2), value: hovering)
+            .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: configuration.isPressed)
     }
 }
 
 /// Individual glass actions for the transport cluster.
 struct PlayerTransportButtonStyle: ButtonStyle {
     let diameter: CGFloat
-    var prominent = false
 
     func makeBody(configuration: Configuration) -> some View {
-        PlayerTransportButtonBody(configuration: configuration, diameter: diameter, prominent: prominent)
+        PlayerTransportButtonBody(configuration: configuration, diameter: diameter)
     }
 }
 
 private struct PlayerTransportButtonBody: View {
     let configuration: ButtonStyleConfiguration
     let diameter: CGFloat
-    let prominent: Bool
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: prominent ? 18 : diameter / 2)
+        let shape = Circle()
         configuration.label
             .foregroundStyle(.white)
             .frame(width: diameter, height: diameter)

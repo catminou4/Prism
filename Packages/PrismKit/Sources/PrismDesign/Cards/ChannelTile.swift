@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// Live channel tile: logo centred on a gradient sampled from the logo, number, `EN DIRECT`,
-/// and a caption band with the programme title + progress.
+/// A station logo with channel and programme information on the surrounding page surface.
 public struct ChannelTile<MenuContent: View>: View {
     private let logoURL: URL?
     private let name: String
@@ -9,11 +8,9 @@ public struct ChannelTile<MenuContent: View>: View {
     private let programTitle: String?
     private let progress: Double?
     private let isLive: Bool
-    private let tint: PrismTint?
     private let width: CGFloat?
     private let action: (() -> Void)?
     private let menu: MenuContent
-    @State private var sampled: RGBA?
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -23,7 +20,7 @@ public struct ChannelTile<MenuContent: View>: View {
         programTitle: String? = nil,
         progress: Double? = nil,
         isLive: Bool = true,
-        tint: PrismTint? = nil,
+        tint _: PrismTint? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
         @ViewBuilder menu: () -> MenuContent
@@ -34,7 +31,6 @@ public struct ChannelTile<MenuContent: View>: View {
         self.programTitle = programTitle
         self.progress = progress
         self.isLive = isLive
-        self.tint = tint
         self.width = width
         self.action = action
         self.menu = menu()
@@ -42,111 +38,61 @@ public struct ChannelTile<MenuContent: View>: View {
 
     /// Tile height for a given width.
     public static func height(forWidth width: CGFloat) -> CGFloat {
-        (width / PrismMetrics.wideAspectRatio).rounded() + 38
+        (width / PrismMetrics.wideAspectRatio).rounded() + 44
     }
 
     public var body: some View {
         let w = width ?? shelfWidth ?? PrismMetrics.channelTileWidth
         let artworkHeight = (w / PrismMetrics.wideAspectRatio).rounded()
-        let size = CGSize(width: w, height: Self.height(forWidth: w))
-        CardContainer(accessibilityLabel: accessibilityText, action: action, menu: menu) { isHovered in
-            ArtworkSurface(radius: PrismMetrics.wideRadius) {
-                ZStack(alignment: .top) {
-                    background
-                    logo(size: CGSize(width: w * 0.46, height: artworkHeight * 0.42))
-                        .frame(width: w, height: artworkHeight)
+        CardContainer(accessibilityLabel: accessibilityText, action: action, hoverScale: 1.025, menu: menu) { isHovered in
+            VStack(alignment: .leading, spacing: 8) {
+                ArtworkSurface(radius: PrismMetrics.wideRadius) {
+                    Color(white: logoURL == nil ? 0.16 : 0.36)
+                        .overlay {
+                            RemoteImage(
+                                url: logoURL, size: CGSize(width: w * 0.56, height: artworkHeight * 0.54),
+                                contentMode: .fit, placeholderSeed: name, placeholderTitle: name,
+                                placeholderStyle: .channelLogo
+                            )
+                            .accessibilityHidden(true)
+                        }
+                        .overlay(alignment: .topLeading) {
+                            if let number {
+                                Text(number, format: .number.grouping(.never))
+                                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.65))
+                                    .padding(10)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        .overlay(alignment: .bottomTrailing) {
+                            if MenuContent.self != EmptyView.self {
+                                CardMenuButton(isHovered: isHovered, menu: menu).padding(4)
+                            }
+                        }
                 }
-                .frame(width: size.width, height: size.height, alignment: .top)
-                .overlay(alignment: .topLeading) {
-                    if let number {
-                        Text(number, format: .number.grouping(.never))
-                            .font(.system(size: 11, weight: .semibold).monospacedDigit())
-                            .foregroundStyle(.white.opacity(0.75))
-                            .padding(10)
+                .frame(width: w, height: artworkHeight)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name)
+                        .font(PrismFont.cardTitle)
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        if let progress {
+                            ProgressCapsule(fraction: progress, width: 26, height: 3, tint: .secondary, track: .primary.opacity(0.12))
+                        } else if isLive {
+                            Circle().fill(.secondary).frame(width: 4, height: 4)
+                        }
+                        Text(programTitle ?? (isLive ? "En direct" : ""))
+                            .font(PrismFont.cardMeta)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
-                .overlay(alignment: .topTrailing) {
-                    if isLive { LiveBadge(pulsing: false, compact: true).padding(10) }
-                }
-                .overlay(alignment: .bottom) { captionBlock(isHovered: isHovered) }
+                .padding(.horizontal, 2)
             }
-            .frame(width: size.width, height: size.height)
+            .frame(width: w, height: Self.height(forWidth: w), alignment: .topLeading)
         }
-        .task(id: logoURL) {
-            guard let logoURL else { return }
-            if let rgba = await ImagePipeline.shared.averageRGBA(for: logoURL), !Task.isCancelled {
-                withAnimation(PrismMotion.imageFade) { sampled = rgba }
-            }
-        }
-    }
-
-    private var background: some View {
-        let colors = gradientColors
-        return ZStack {
-            LinearGradient(colors: [colors.0, colors.1], startPoint: .topLeading, endPoint: .bottomTrailing)
-            RadialGradient(colors: [.white.opacity(0.14), .clear], center: UnitPoint(x: 0.5, y: 0.25), startRadius: 0, endRadius: 160)
-            LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: UnitPoint(x: 0.5, y: 0.45), endPoint: .bottom)
-        }
-    }
-
-    /// Deep, slightly desaturated tones so white logos and text stay legible.
-    private var gradientColors: (Color, Color) {
-        if let sampled, sampled.saturation > 0.18 {
-            let lum = max(sampled.luminance, 0.05)
-            let top = sampled.scaled(brightness: min(1.0, 0.55 / lum) * 0.9)
-            let bottom = sampled.scaled(brightness: min(1.0, 0.22 / lum))
-            return (top.color, bottom.color)
-        }
-        // Tint fallback: deep, desaturated version of the source tint.
-        let pair = (tint ?? PrismTint.forSeed(name)).gradientColors
-        return (pair.bottom.mix(with: .black, by: 0.35), pair.bottom.mix(with: .black, by: 0.72))
-    }
-
-    @ViewBuilder private func logo(size: CGSize) -> some View {
-        if let logoURL {
-            RemoteImage(url: logoURL, size: size, contentMode: .fit, placeholderSeed: name, showsPlaceholder: false)
-                .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
-                .background {
-                    Text(Monogram.initials(from: name))
-                        .font(.system(size: size.height * 0.7, weight: .heavy, design: .rounded))
-                        .foregroundStyle(.white.opacity(sampled == nil ? 0.9 : 0))
-                }
-        } else {
-            Text(name)
-                .font(.system(size: 22, weight: .heavy))
-                .tracking(-0.4)
-                .foregroundStyle(.white)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .minimumScaleFactor(0.5)
-                .frame(width: size.width * 1.4, height: size.height * 1.4)
-        }
-    }
-
-    private func captionBlock(isHovered: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(programTitle ?? name)
-                .font(PrismFont.cardCaption)
-                .foregroundStyle(.white)
-                .lineLimit(1)
-            HStack(spacing: 6) {
-                if let progress {
-                    ProgressCapsule(fraction: progress, width: 28, height: 4).padding(.trailing, 2)
-                }
-                Text(programTitle == nil ? (number.map { "Chaîne \($0)" } ?? "En direct") : name)
-                    .font(PrismFont.cardMeta.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if MenuContent.self != EmptyView.self {
-                    CardMenuButton(isHovered: isHovered, menu: menu).padding(.trailing, -6)
-                }
-            }
-            .frame(height: 16)
-        }
-        .padding(.leading, 12)
-        .padding(.trailing, 10)
-        .padding(.bottom, 9)
     }
 
     private var accessibilityText: Text {

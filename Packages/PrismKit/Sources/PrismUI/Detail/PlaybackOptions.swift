@@ -45,7 +45,7 @@ nonisolated struct PlaybackEdition: Hashable, Sendable {
     let key: String
     let title: String
 
-    init(tags: [String]) {
+    init(tags: [String], categoryLanguages: Set<String> = []) {
         let tags = tags.map { $0.uppercased() }
         let flags = Set(tags)
         let version: (String, String)? = switch true {
@@ -65,7 +65,8 @@ nonisolated struct PlaybackEdition: Hashable, Sendable {
             return
         }
 
-        let codes = Set(tags.compactMap { Self.languageCodes[$0] }).sorted()
+        let declared = Set(tags.compactMap { Self.languageCodes[$0] })
+        let codes = (declared.isEmpty ? categoryLanguages : declared).sorted()
         let locale = Locale(identifier: "fr-FR")
         let names = codes.compactMap { locale.localizedString(forLanguageCode: $0) }
         key = codes.isEmpty ? "unknown" : codes.joined(separator: "+").uppercased()
@@ -108,10 +109,10 @@ nonisolated struct TitleEdition: Identifiable, Sendable {
     let edition: PlaybackEdition
     var id: ContentID { variant.id }
 
-    init(variant: MediaVariant, source: Source) {
+    init(variant: MediaVariant, source: Source, categoryLanguages: Set<String> = []) {
         self.variant = variant
         self.source = source
-        self.edition = PlaybackEdition(tags: variant.tags)
+        self.edition = PlaybackEdition(tags: variant.tags, categoryLanguages: categoryLanguages)
     }
 }
 

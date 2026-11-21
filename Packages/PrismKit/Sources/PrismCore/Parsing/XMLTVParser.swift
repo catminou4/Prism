@@ -330,6 +330,7 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
             subtitle: Self.preferred(subtitles),
             summary: Self.preferred(descriptions),
             category: Self.preferred(categories),
+            categoryLabels: categories.count > 1 ? categories.map(\.1) : nil,
             iconURL: programmeIcon,
             episodeLabel: label,
             rating: rating,

@@ -82,6 +82,12 @@ struct EPGGuideTests {
         #expect(guide.resolveEPGID(for: byName) == "france2.fr")
         let unknownID = ChannelGroup(id: "tf1", name: "TF1", epgID: "nothing.here", variants: [])
         #expect(guide.resolveEPGID(for: unknownID) == "tf1.fr", "falls back to the name")
+        var withVariant = unknownID
+        withVariant.variants = [
+            F.channel(F.a, "empty", "TF1", epg: "nothing.here"),
+            F.channel(F.b, "guide", "TF1", epg: " France2.FR "),
+        ]
+        #expect(guide.resolveEPGID(for: withVariant) == "france2.fr", "prefers an ID from a variant to a name match")
         let noData = ChannelGroup(id: "arte", name: "Arte", variants: [])
         #expect(guide.resolveEPGID(for: noData) == nil)
         let byChannelID = ChannelGroup(id: TitleNormalizer.key("Canal Plus"), name: "CanalPlus", variants: [])

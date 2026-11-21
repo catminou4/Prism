@@ -10,24 +10,29 @@ public struct PlaceholderArtwork: View {
         case title
         /// Large initials (people, channels, sources).
         case monogram
+        /// Quiet initials on a caller-provided surface while a channel logo loads.
+        case channelLogo
         /// Gradient only.
         case none
     }
 
-    private let palette: Palette
+    private let seed: String
     private let title: String?
     private let style: TitleStyle
 
     public init(seed: String, title: String? = nil, style: TitleStyle = .title) {
-        palette = Palette(seed: seed)
+        self.seed = seed
         self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.style = title == nil ? .none : style
     }
 
     public var body: some View {
-        if style == .monogram {
+        switch style {
+        case .monogram:
             monogramBody
-        } else {
+        case .channelLogo:
+            label.accessibilityHidden(true)
+        case .title, .none:
             artworkBody
         }
     }
@@ -43,7 +48,8 @@ public struct PlaceholderArtwork: View {
     }
 
     private var artworkBody: some View {
-        ZStack {
+        let palette = Palette(seed: seed)
+        return ZStack {
             LinearGradient(colors: [palette.top, palette.bottom], startPoint: palette.start, endPoint: palette.end)
             RadialGradient(colors: [.white.opacity(0.10), .clear], center: palette.glowCenter, startRadius: 0, endRadius: 225)
             label
@@ -73,6 +79,13 @@ public struct PlaceholderArtwork: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.05)
                     .padding(22)
+            case .channelLogo:
+                Text(Monogram.initials(from: title))
+                    .font(.system(size: 26, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.58))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.32)
+                    .padding(4)
             case .none:
                 EmptyView()
             }

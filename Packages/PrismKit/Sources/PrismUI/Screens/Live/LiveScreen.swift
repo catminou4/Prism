@@ -14,7 +14,7 @@ public struct LiveScreen: View {
     @State private var mode: Mode = .channels
     @State private var category = Selection.all
     @State private var query = ""
-    @State private var results: [ChannelGroup]?
+    @State private var results: FilteredChannels?
     @State private var guideStart: Date?
 
     private let favoritesOnly: Bool
@@ -38,6 +38,17 @@ public struct LiveScreen: View {
         let query: String
         let revision: Int
         let isActive: Bool
+
+        var isUnfiltered: Bool { category == nil && favorites == nil && query.isEmpty }
+
+        func hasSameScope(as other: Self) -> Bool {
+            revision == other.revision && category == other.category && favorites == other.favorites
+        }
+    }
+
+    private struct FilteredChannels {
+        let request: Filter
+        let channels: [ChannelGroup]
     }
 
     private var filter: Filter {
@@ -50,32 +61,37 @@ public struct LiveScreen: View {
         )
     }
 
-    private var channels: [ChannelGroup] {
-        if let results { return results }
-        if let favorites = filter.favorites { return favorites.compactMap { model.catalog.channelGroup($0) } }
-        return model.catalog.channels
+    private func channels(for request: Filter) -> [ChannelGroup]? {
+        if request.isUnfiltered { return model.catalog.channels }
+        guard let results, results.request.hasSameScope(as: request) else { return nil }
+        if results.request.query == request.query { return results.channels }
+        return results.channels.isEmpty ? nil : results.channels
     }
 
     public var body: some View {
         let request = filter
+        let channels = channels(for: request)
         VStack(alignment: .leading, spacing: 0) {
-            header
+            header(channelCount: channels?.count)
             if !model.catalog.channels.isEmpty, !favoritesOnly {
-                ChipBar(items: chips, selection: Binding(get: { category }, set: { category = $0 ?? Selection.all }))
-                    .padding(.vertical, 8)
-                    .transaction { if reduceMotion { $0.animation = nil } }
+                categoryRail
             }
-            content
+            content(channels: channels)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: request) {
             guard request.isActive else { return }
+            guard !request.isUnfiltered else {
+                results = nil
+                return
+            }
+            let catalog = model.catalog
             if !request.query.isEmpty {
                 try? await Task.sleep(for: .milliseconds(150))
                 guard !Task.isCancelled else { return }
             }
-            let matches = await Self.filteredChannels(in: model.catalog, request: request)
-            if !Task.isCancelled { results = matches }
+            let matches = await Self.filteredChannels(in: catalog, request: request)
+            if !Task.isCancelled { results = FilteredChannels(request: request, channels: matches) }
         }
         .onChange(of: model.catalogRevision) {
             if let categoryID = filter.category, model.catalog.categoryGroup(categoryID) == nil {
@@ -91,19 +107,52 @@ public struct LiveScreen: View {
         }
     }
 
-    private var header: some View {
+    private var categoryRail: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 6) {
+                ForEach(chips) { chip in
+                    let selected = chip.id == category
+                    Button {
+                        category = chip.id
+                    } label: {
+                        HStack(spacing: 5) {
+                            if let symbol = chip.systemImage { Image(systemName: symbol).accessibilityHidden(true) }
+                            Text(chip.title).lineLimit(1)
+                        }
+                        .font(.subheadline.weight(selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? Color.primary : Color.secondary)
+                        .padding(.horizontal, 12)
+                        .frame(height: PrismMetrics.compactButtonSize)
+                        .background {
+                            if selected { Capsule().fill(PrismColors.panelFill) }
+                        }
+                        .contentShape(.capsule)
+                    }
+                    .buttonStyle(.pressable)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .scrollIndicators(.hidden)
+        .contentMargins(.horizontal, PrismMetrics.contentMargin, for: .scrollContent)
+        .accessibilityLabel("Catégories de chaînes")
+    }
+
+    private func header(channelCount: Int?) -> some View {
         HStack(alignment: .center, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(favoritesOnly ? "Chaînes favorites" : "TV en direct")
                     .font(.system(size: 34, weight: .bold))
                     .tracking(-1)
                     .accessibilityAddTraits(.isHeader)
-                if !channels.isEmpty {
-                    Text(channels.count == 1 ? "1 chaîne" : "\(channels.count.formatted()) chaînes")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
+                Text(channelCount == 1 ? "1 chaîne" : "\((channelCount ?? 0).formatted()) chaînes")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .opacity(channelCount.map { $0 > 0 } == true ? 1 : 0)
+                    .accessibilityHidden(channelCount.map { $0 > 0 } != true)
             }
             .layoutPriority(1)
             Spacer(minLength: 10)
@@ -133,8 +182,8 @@ public struct LiveScreen: View {
                     }
                 }
                 .padding(.horizontal, 11)
-                .frame(width: 166, height: 34)
-                .background(.quaternary, in: .capsule)
+                .frame(width: 166, height: PrismMetrics.compactButtonSize)
+                .prismGlass(.regular, in: .capsule)
             }
         }
         .padding(.horizontal, PrismMetrics.contentMargin)
@@ -142,13 +191,11 @@ public struct LiveScreen: View {
         .padding(.bottom, 14)
     }
 
-    @ViewBuilder private var content: some View {
-        if channels.isEmpty {
-            emptyState
-        } else {
+    @ViewBuilder private func content(channels: [ChannelGroup]?) -> some View {
+        if let channels, !channels.isEmpty {
             ZStack {
                 if mode == .channels {
-                    grid
+                    grid(channels: channels)
                         .transition(.opacity)
                 } else if model.guide.isEmpty {
                     EmptyStateView(
@@ -172,6 +219,13 @@ public struct LiveScreen: View {
                 }
             }
             .animation(reduceMotion ? nil : PrismMotion.quickFade, value: mode)
+        } else if channels == nil {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Chargement des chaînes")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            emptyState
         }
     }
 
@@ -196,7 +250,7 @@ public struct LiveScreen: View {
         }
     }
 
-    private var grid: some View {
+    private func grid(channels: [ChannelGroup]) -> some View {
         GeometryReader { geometry in
             let margin = PrismMetrics.contentMargin
             let spacing = PrismMetrics.cardSpacing
@@ -222,10 +276,9 @@ public struct LiveScreen: View {
 
     private func tile(_ group: ChannelGroup, width: CGFloat, now: Date) -> some View {
         let program = model.guide.resolveEPGID(for: group).flatMap { model.guide.nowAndNext(forEPGID: $0, at: now).now }
-        let tint = group.primary.flatMap { model.catalog.source($0.sourceID) }.flatMap { PrismTint(rawValue: $0.tint.rawValue) }
         return ChannelTile(
             logoURL: group.logoURL, name: group.name, number: group.number, programTitle: program?.title,
-            progress: program?.progress(at: now), tint: tint, width: width,
+            progress: program?.progress(at: now), width: width,
             action: { play(group, program: program) }
         ) { channelMenu(group, program: program) }
     }
@@ -287,17 +340,21 @@ public struct LiveScreen: View {
         guard !key.isEmpty else { return channels }
         let terms = key.split(separator: " ")
         let number = Int(key)
-        var matches: [ChannelGroup] = []
+        var exact: [ChannelGroup] = []
+        var prefixes: [ChannelGroup] = []
+        var other: [ChannelGroup] = []
         for (index, channel) in channels.enumerated() {
             if index.isMultiple(of: 256), Task.isCancelled { return [] }
-            if let number, channel.number == number {
-                matches.append(channel)
-                continue
+            // The catalog already uses the normalized channel name as its group ID.
+            if channel.id == key || (number != nil && channel.number == number) {
+                exact.append(channel)
+            } else if channel.id.hasPrefix(key) {
+                prefixes.append(channel)
+            } else if channel.id.first != "#", terms.allSatisfy({ channel.id.contains($0) }) {
+                other.append(channel)
             }
-            let name = TitleNormalizer.key(channel.name)
-            if terms.allSatisfy({ name.contains($0) }) { matches.append(channel) }
         }
-        return matches
+        return exact + prefixes + other
     }
 }
 

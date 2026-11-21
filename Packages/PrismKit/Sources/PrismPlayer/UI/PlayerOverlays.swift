@@ -68,7 +68,7 @@ struct PlayerErrorCard: View {
         .padding(.horizontal, 28)
         .padding(.vertical, 24)
         .frame(width: 400)
-        .playerGlass(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .playerGlass(RoundedRectangle(cornerRadius: PlayerMetrics.panelRadius, style: .continuous))
     }
 }
 
@@ -164,7 +164,7 @@ struct PlayerStreamInfoCard: View {
         .foregroundStyle(.white)
         .padding(16)
         .frame(width: 300, alignment: .leading)
-        .playerGlass(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .playerGlass(RoundedRectangle(cornerRadius: PlayerMetrics.panelRadius, style: .continuous))
         .task {
             while !Task.isCancelled {
                 controller.refreshTechInfo()
@@ -209,7 +209,7 @@ public struct PlayerUpNextCard<Artwork: View>: View {
         HStack(spacing: 12) {
             artwork
                 .frame(width: 112, height: 63)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: PlayerMetrics.artworkRadius, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
                 Text("ÉPISODE SUIVANT")
                     .font(.system(size: 10, weight: .semibold))
@@ -245,7 +245,7 @@ public struct PlayerUpNextCard<Artwork: View>: View {
         .foregroundStyle(.white)
         .padding(12)
         .frame(width: 380)
-        .playerGlass(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .playerGlass(RoundedRectangle(cornerRadius: PlayerMetrics.panelRadius, style: .continuous))
         .overlay(alignment: .topTrailing) {
             if let onDismiss {
                 Button(action: onDismiss) {

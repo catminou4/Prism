@@ -86,7 +86,7 @@ struct AddSourceView: View {
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
                 .frame(width: 45, height: 45)
-                .background(Color.accentColor.opacity(0.12), in: .rect(cornerRadius: 13))
+                .background(Color.accentColor.opacity(0.12), in: .rect(cornerRadius: PrismMetrics.listRowRadius))
                 .contentTransition(.symbolEffect(.replace))
                 .accessibilityHidden(true)
             Text(finished ? "Tout est prêt" : importing ? "Importation de la source" : kind?.setupTitle ?? "Ajouter une source")
@@ -103,38 +103,40 @@ struct AddSourceView: View {
     }
 
     private var choices: some View {
-        GlassEffectContainer(spacing: 10) {
-            VStack(spacing: 10) {
-                ForEach(SourceKind.allCases, id: \.self) { option in
-                    Button {
-                        changeStep { kind = option }
-                        focus = option == .m3uFile ? .name : .address
-                    } label: {
-                        HStack(spacing: 13) {
-                            Image(systemName: option.setupIcon)
-                                .font(.system(size: 17, weight: .semibold))
-                                .foregroundStyle(Color.accentColor)
-                                .frame(width: 22)
-                                .accessibilityHidden(true)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(option.setupTitle).font(.callout.weight(.semibold))
-                                Text(option.setupHelp).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
+        VStack(spacing: 0) {
+            ForEach(SourceKind.allCases, id: \.self) { option in
+                Button {
+                    changeStep { kind = option }
+                    focus = option == .m3uFile ? .name : .address
+                } label: {
+                    HStack(spacing: 13) {
+                        Image(systemName: option.setupIcon)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 22)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(option.setupTitle).font(.callout.weight(.semibold))
+                            Text(option.setupHelp).font(.caption).foregroundStyle(.secondary)
                         }
-                        .padding(.horizontal, 15)
-                        .padding(.vertical, 12)
-                        .prismGlass(in: .rect(cornerRadius: 13), interactive: true)
-                        .contentShape(.rect(cornerRadius: 13))
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
                     }
-                    .buttonStyle(.pressable)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 13)
+                    .contentShape(.rect(cornerRadius: PrismMetrics.listRowRadius))
+                }
+                .buttonStyle(.pressable)
+                if option != SourceKind.allCases.last {
+                    Divider().padding(.leading, 49).padding(.trailing, 14)
                 }
             }
         }
+        .padding(4)
+        .background(PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.panelRadius))
     }
 
     private func sourceForm(_ kind: SourceKind) -> some View {
@@ -203,6 +205,9 @@ struct AddSourceView: View {
                     .padding(.top, 11)
                 }
                 .font(.callout)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.panelRadius))
             }
             .padding(.trailing, 8)
         }
@@ -250,7 +255,7 @@ struct AddSourceView: View {
                 countRow("Programmes du guide", count: progress.counts.programs, icon: "calendar")
             }
             .padding(.horizontal, 13)
-            .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: 13))
+            .background(PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.panelRadius))
         }
         .padding(.top, 4)
     }
@@ -278,7 +283,7 @@ struct AddSourceView: View {
         HStack(spacing: 12) {
             if progress?.stage == .finished {
                 Spacer()
-                PrimaryCapsuleButton(allowsDemo ? "Ouvrir Prism" : "Terminer", style: .accent, height: 42, action: onImported)
+                PrimaryCapsuleButton(allowsDemo ? "Ouvrir Prism" : "Terminer", style: .accent, height: PrismMetrics.largeButtonHeight, action: onImported)
                     .keyboardShortcut(.defaultAction)
             } else if importTask != nil {
                 Button("Annuler l’importation") { importTask?.cancel() }
@@ -297,7 +302,7 @@ struct AddSourceView: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 Spacer()
-                PrimaryCapsuleButton("Se connecter", systemImage: "arrow.right", style: .accent, height: 42, action: startSelectedImport)
+                PrimaryCapsuleButton("Se connecter", systemImage: "arrow.right", style: .accent, height: PrismMetrics.largeButtonHeight, action: startSelectedImport)
                     .keyboardShortcut(.defaultAction)
             } else {
                 Button("Annuler", action: { dismiss() })

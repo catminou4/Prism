@@ -36,12 +36,14 @@ public enum CatalogBuilder {
         async let seriesKeys = parallelKeys(ordered.map(\.series)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
         async let channelKeys = parallelKeys(ordered.map(\.channels)) { channelKey($0) }
         let keys = await (movies: movieKeys, series: seriesKeys, channels: channelKeys)
+        guard !Task.isCancelled else { return .empty }
 
         // Grouping (each kind concurrently; title construction is itself chunked in parallel).
         async let movieTitles = groupMedia(kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context)
         async let seriesTitles = groupMedia(kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context)
         async let channelGroups = groupChannels(lists: ordered.map(\.channels), keys: keys.channels, context: context)
         let (movieGroups, seriesGroups, channelGrouping) = await (movieTitles, seriesTitles, channelGroups)
+        guard !Task.isCancelled else { return .empty }
         let movies = movieGroups.titles, series = seriesGroups.titles, channels = channelGrouping.groups
 
         // Categories and rankings are independent: build them concurrently.
@@ -56,6 +58,11 @@ public enum CatalogBuilder {
         var indexes = Catalog.Indexes()
         for (index, source) in enabled.enumerated() { indexes.sourceIndex[source.id] = index }
         indexes.categories = context.categories
+        indexes.hasTaggedEditions = movieGroups.hasTaggedEditions || seriesGroups.hasTaggedEditions
+        for category in context.categories.values where category.kind == .movie || category.kind == .series {
+            let languages = ProviderCategoryLanguage.codes(in: category.rawName)
+            if !languages.isEmpty { indexes.categoryLanguages[category.id] = languages }
+        }
         indexes.movieByTitleID = movieGroups.titleIndex
         indexes.movieByContent = movieGroups.contentIndex
         indexes.seriesByTitleID = seriesGroups.titleIndex
@@ -173,7 +180,10 @@ public enum CatalogBuilder {
                 while start < list.count {
                     let end = min(start + chunk, list.count)
                     let lower = start
-                    group.addTask { (listIndex, lower, list[lower..<end].map(key)) }
+                    group.addTask {
+                        guard !Task.isCancelled else { return (listIndex, lower, []) }
+                        return (listIndex, lower, list[lower..<end].map(key))
+                    }
                     start = end
                 }
             }
@@ -199,6 +209,7 @@ public enum CatalogBuilder {
         var contentIndex: [ContentID: Int] = [:]
         /// Category ids per title, in `titles` order.
         var categoryIDs: [Set<String>] = []
+        var hasTaggedEditions = false
     }
 
     /// Per-chunk output of the parallel title construction.
@@ -206,8 +217,6 @@ public enum CatalogBuilder {
         var lower: Int
         var titles: [MediaTitle] = []
         var added: [Double] = []
-        var contentIDs: [[ContentID]] = []
-        var categoryIDs: [Set<String>] = []
     }
 
     struct NameIdentity: Hashable, Sendable {
@@ -252,6 +261,7 @@ public enum CatalogBuilder {
         var resolvedCategories: [[String?]] = []
         var adultFlags: [[Bool]] = []
         var hasTMDBIdentity = false
+        var hasTaggedEditions = false
 
         for (catalogIndex, list) in lists.enumerated() {
             var cats = [String?](repeating: nil, count: list.count)
@@ -262,6 +272,7 @@ public enum CatalogBuilder {
                 let category = item.categoryID.flatMap { resolver[$0] }
                 let isAdult = item.isAdult || category?.isAdult == true
                 if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
+                if !hasTaggedEditions, !item.tags.isEmpty { hasTaggedEditions = true }
                 adult[itemIndex] = isAdult
                 cats[itemIndex] = category?.visibleID
                 if !hasTMDBIdentity, let tmdbID = item.tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
@@ -298,7 +309,9 @@ public enum CatalogBuilder {
         }
 
         // Build titles in parallel chunks (variant sorting + metadata merge).
-        let frozenGroups = hasTMDBIdentity ? reconcileMediaIdentities(mediaGroups, lists: lists) : mediaGroups
+        guard !Task.isCancelled else { return MediaGroups() }
+        let namedGroups = mergeEditorialAliases(mediaGroups, datedGroups: datedGroups, kind: kind, lists: lists)
+        let frozenGroups = hasTMDBIdentity ? reconcileMediaIdentities(namedGroups, lists: lists) : namedGroups
         let groupCount = frozenGroups.count
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunk = max(2_048, groupCount / (workers * 2))
@@ -309,6 +322,7 @@ public enum CatalogBuilder {
                 let lower = start, upper = min(start + chunk, groupCount)
                 group.addTask {
                     var built = BuiltChunk(lower: lower)
+                    guard !Task.isCancelled else { return built }
                     built.titles.reserveCapacity(upper - lower)
                     for index in lower..<upper {
                         let offer = frozenGroups[index]
@@ -323,8 +337,6 @@ public enum CatalogBuilder {
                             categories: frozenCategories, adult: frozenAdult
                         )
                         built.added.append(title.addedAt?.timeIntervalSinceReferenceDate ?? -.infinity)
-                        built.contentIDs.append(title.variants.map(\.id))
-                        built.categoryIDs.append(title.categoryIDs)
                         built.titles.append(title)
                     }
                     return built
@@ -335,6 +347,7 @@ public enum CatalogBuilder {
             for await part in group { parts.append(part) }
             return parts.sorted { $0.lower < $1.lower }
         }
+        guard !Task.isCancelled else { return MediaGroups() }
         let added = chunks.flatMap(\.added)
 
         // Order: addedAt desc, then normalized title, then year.
@@ -346,20 +359,18 @@ public enum CatalogBuilder {
             if left.name.year != right.name.year { return (left.name.year ?? .min) < (right.name.year ?? .min) }
             return (left.tmdbID ?? 0) < (right.tmdbID ?? 0)
         }
+        guard !Task.isCancelled else { return MediaGroups() }
 
         let unorderedTitles = chunks.flatMap(\.titles)
-        let unorderedContent = chunks.flatMap(\.contentIDs)
-        let unorderedCategories = chunks.flatMap(\.categoryIDs)
         async let titles = order.map { unorderedTitles[$0] }
-        async let categories = order.map { unorderedCategories[$0] }
+        async let categories = order.map { unorderedTitles[$0].categoryIDs }
         async let titleIndex: [TitleID: Int] = {
             var index: [TitleID: Int] = Dictionary(minimumCapacity: groupCount)
             for (position, group) in order.enumerated() {
                 let media = frozenGroups[group]
                 let id = unorderedTitles[group].id
                 index[id] = position
-                let legacy = media.name.id(kind: kind)
-                if !media.ambiguousName, legacy != id { index[legacy] = position }
+                if !media.ambiguousName, !media.aliases.isEmpty { index[media.name.id(kind: kind)] = position }
                 for alias in media.aliases { index[alias.id(kind: kind)] = position }
                 if let tmdbID = media.tmdbID { index[TitleID(kind: kind, tmdbID: tmdbID)] = position }
             }
@@ -368,11 +379,55 @@ public enum CatalogBuilder {
         async let contentIndex: [ContentID: Int] = {
             var index: [ContentID: Int] = Dictionary(minimumCapacity: total)
             for (position, group) in order.enumerated() {
-                for id in unorderedContent[group] { index[id] = position }
+                for variant in unorderedTitles[group].variants { index[variant.id] = position }
             }
             return index
         }()
-        return await MediaGroups(titles: titles, titleIndex: titleIndex, contentIndex: contentIndex, categoryIDs: categories)
+        return await MediaGroups(
+            titles: titles, titleIndex: titleIndex, contentIndex: contentIndex,
+            categoryIDs: categories, hasTaggedEditions: hasTaggedEditions
+        )
+    }
+
+    /// Link known translations only when the exact release year agrees and provider IDs don't conflict.
+    /// Saved versions keep resolving through the old grouping keys.
+    private static func mergeEditorialAliases<V: GroupableMedia>(
+        _ groups: [MediaGroup], datedGroups: [NameIdentity: Int], kind: MediaKind, lists: [[V]]
+    ) -> [MediaGroup] {
+        var replacements: [Int: MediaGroup] = [:]
+        var removed: Set<Int> = []
+        for shelf in EditorialSelection.shelves {
+            for entry in shelf where entry.kind == kind {
+                var offsets: [Int] = []
+                for key in entry.aliasKeys {
+                    guard let offset = datedGroups[NameIdentity(key: key, year: entry.year)],
+                          !removed.contains(offset), replacements[offset] == nil, !offsets.contains(offset)
+                    else { continue }
+                    offsets.append(offset)
+                }
+                guard offsets.count > 1, let first = offsets.first else { continue }
+                var trustedIDs: Set<Int> = []
+                for offset in offsets {
+                    for ref in groups[offset].refs {
+                        if let id = lists[Int(ref.catalog)][Int(ref.item)].tmdbID, id > 0 { trustedIDs.insert(id) }
+                        if trustedIDs.count > 1 { break }
+                    }
+                    if trustedIDs.count > 1 { break }
+                }
+                guard trustedIDs.count <= 1 else { continue }
+                var merged = groups[first]
+                for offset in offsets.dropFirst() {
+                    merged.refs.append(contentsOf: groups[offset].refs)
+                    merged.aliases.append(groups[offset].name)
+                    removed.insert(offset)
+                }
+                replacements[first] = merged
+            }
+        }
+        guard !removed.isEmpty else { return groups }
+        return groups.indices.compactMap { index in
+            removed.contains(index) ? nil : replacements[index] ?? groups[index]
+        }
     }
 
     /// Trusted provider IDs link translations, and keep homonyms separate even in the same year.
@@ -386,6 +441,7 @@ public enum CatalogBuilder {
             if let index = byTMDBID[tmdbID] {
                 result[index].refs.append(contentsOf: group.refs)
                 if !group.ambiguousName { result[index].aliases.append(group.name) }
+                result[index].aliases.append(contentsOf: group.aliases)
             } else {
                 byTMDBID[tmdbID] = result.count
                 result.append(group)
@@ -572,9 +628,7 @@ public enum CatalogBuilder {
     }
 
     static func cleanPlot(_ plot: String?) -> String? {
-        guard let plot, !plot.isEmpty else { return nil }
-        let value = trimmed(plot)
-        return value.isEmpty ? nil : value
+        ProviderSynopsis.cleaned(plot)
     }
 
     static func cleanGenres(_ genres: [String]) -> [String] {
@@ -807,7 +861,7 @@ public enum CatalogBuilder {
     }
 
     /// Deterministic top-k (score desc, then index asc) without sorting the whole array.
-    static func topIndices(_ scored: [(score: Double, index: Int32)], count: Int) -> [Int32] {
+    static func topIndices(_ scored: some Sequence<(score: Double, index: Int32)>, count: Int) -> [Int32] {
         var top: [(score: Double, index: Int32)] = []
         top.reserveCapacity(count + 1)
         for entry in scored {
@@ -847,6 +901,7 @@ protocol GroupableMedia: Sendable {
     var rating: Double? { get }
     var addedAt: Date? { get }
     var categoryID: String? { get }
+    var tags: [String] { get }
     var isAdult: Bool { get }
     var mediaVariant: MediaVariant { get }
 }

@@ -10,7 +10,11 @@ struct TitleDetailView: View {
 
     var body: some View {
         if let title = app.catalog.title(titleID) {
-            TitleDetailContent(title: title)
+            let editions = title.variants.compactMap { variant -> TitleEdition? in
+                guard let source = app.source(variant.sourceID), source.isEnabled else { return nil }
+                return TitleEdition(variant: variant, source: source, categoryLanguages: app.catalog.providerLanguages(for: variant))
+            }
+            TitleDetailContent(title: app.recommendations.named(title), editions: editions)
                 .id(title.id)
         } else {
             ContentUnavailableView("Titre indisponible", systemImage: "film", description: Text("Ce titre ne figure plus dans vos sources actives."))
@@ -24,12 +28,13 @@ private struct TitleDetailContent: View {
     @Environment(\.playPrismItem) private var playItem
     @Environment(\.isPageActive) private var isPageActive
     let title: MediaTitle
+    let editions: [TitleEdition]
 
-    @State private var movieDetail: MovieDetail?
+    @State private var loadedMovieDetail: MovieDetail?
     @State private var inventory: DetailEpisodeInventory?
     @State private var enriched: TMDBMetadata?
     @State private var related: [MediaTitle] = []
-    @State private var episodeInfo: [Int: TMDBEpisodeInfo] = [:]
+    @State private var seasonMetadata: SeasonMetadata?
     @State private var selectedSeason: Int?
     @State private var loadingEpisodes = true
     @State private var failedToLoadEpisodes = false
@@ -41,15 +46,13 @@ private struct TitleDetailContent: View {
 
     private var preferredID: ContentID? { app.library.preferredVariant(for: title.id) }
     private var preferredEditionID: ContentID? { browseEditionID ?? preferredID }
-    private var editions: [TitleEdition] {
-        title.variants.compactMap { variant in
-            guard let source = app.source(variant.sourceID), source.isEnabled else { return nil }
-            return TitleEdition(variant: variant, source: source)
-        }
-    }
     private var activeEdition: TitleEdition? {
-        let options = editions
-        return options.first { $0.id == preferredEditionID } ?? options.first
+        let preferred = preferredEditionID
+        return editions.first { $0.id == preferred } ?? editions.first
+    }
+    private var movieDetail: MovieDetail? {
+        guard let loadedMovieDetail, loadedMovieDetail.movieID == activeEdition?.id else { return nil }
+        return loadedMovieDetail
     }
     private var plot: String? { enriched?.overview ?? movieDetail?.plot ?? inventory?.detail.plot ?? title.plot }
     private var backdrop: URL? {
@@ -76,6 +79,9 @@ private struct TitleDetailContent: View {
     private var heroEpisode: Episode? {
         inventory?.nextEpisode(after: app.library.latestProgress(forTitle: title.id), isWatched: app.library.isWatched)
     }
+    private var seasonLookup: SeasonLookup {
+        SeasonLookup(active: isPageActive, tmdbID: enriched?.tmdbID, season: displayedSeason?.number)
+    }
 
     var body: some View {
         GeometryReader { viewport in
@@ -84,10 +90,15 @@ private struct TitleDetailContent: View {
                     masthead(viewportHeight: viewport.size.height)
                         .padding(.horizontal, 8)
                     if title.kind == .series { episodes }
-                    details
-                        .padding(.horizontal, margin)
+                    if let trailer {
+                        Link(destination: trailer) { Label("Bande-annonce", systemImage: "play.rectangle") }
+                            .buttonStyle(.glass)
+                            .padding(.horizontal, margin)
+                    }
                     if !related.isEmpty { similarTitles }
                     if !cast.isEmpty { castShelf }
+                    details
+                        .padding(.horizontal, margin)
                 }
                 .padding(.top, 8)
                 .padding(.bottom, 42)
@@ -104,9 +115,7 @@ private struct TitleDetailContent: View {
             guard isPageActive else { return }
             await loadEnrichment()
         }
-        .task(id: SeasonLookup(active: isPageActive, tmdbID: enriched?.tmdbID, season: displayedSeason?.number)) {
-            await loadEpisodeInfo()
-        }
+        .task(id: seasonLookup) { [lookup = seasonLookup] in await loadEpisodeInfo(for: lookup) }
         .task(id: isPageActive ? app.catalogRevision : nil) {
             guard isPageActive else { return }
             let values = await Self.relatedTitles(to: title, in: app.catalog)
@@ -125,6 +134,7 @@ private struct TitleDetailContent: View {
 
     private func masthead(viewportHeight: CGFloat) -> some View {
         let episode = heroEpisode
+        let edition = title.kind == .series ? inventory?.edition ?? activeEdition : activeEdition
         let progress = title.kind == .series
             ? episode.flatMap { app.library.progress(for: $0.id) }
             : app.library.latestProgress(forTitle: title.id)
@@ -135,7 +145,7 @@ private struct TitleDetailContent: View {
             genres.first,
             title.kind == .movie ? minutes.map { "\($0) min" } : nil,
             enriched?.certification,
-            (movieDetail?.tech?.quality.badge ?? title.bestQuality.badge),
+            movieDetail?.tech?.quality.badge ?? edition?.variant.quality.badge,
         ].compactMap { $0 }
         let label = episode.map {
             "\(resuming ? "Reprendre" : "Lire") \(EpisodeCoordinate($0).label)"
@@ -147,62 +157,97 @@ private struct TitleDetailContent: View {
             progress: resuming ? progress?.fraction : nil,
             canPlay: title.kind == .series ? episode != nil : activeEdition != nil,
             isInWatchlist: app.library.isInWatchlist(title.id),
-            edition: activeEdition, editionCount: editions.count,
+            edition: edition, editionCount: editions.count,
             play: { choosePlayback(episode: episode) },
             toggleWatchlist: { app.library.toggleWatchlist(title.id) },
             showEditions: { choosePlayback(episode: episode, alwaysShowPicker: true) }
         )
     }
 
-    @ViewBuilder private var episodes: some View {
-        if let season = displayedSeason {
-            VStack(alignment: .leading, spacing: 13) {
-                HStack(alignment: .center, spacing: 12) {
-                    Text("Épisodes")
-                        .font(.title2.weight(.semibold))
-                        .accessibilityAddTraits(.isHeader)
-                    Text("\(season.episodes.count) dans cette saison")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if let inventory, inventory.seasons.count > 1 {
-                        Picker("Saison", selection: seasonBinding) {
-                            ForEach(inventory.seasons) { season in
-                                Text(season.number == 0 ? "Épisodes spéciaux" : "Saison \(season.number)")
-                                    .tag(season.number)
-                            }
-                        }
-                        .labelsHidden()
-                        .accessibilityLabel("Saison")
-                        .fixedSize()
-                    } else if season.number > 0 {
-                        Text("Saison \(season.number)").foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, margin)
-
+    private var episodes: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            episodeShelfHeader
+            if let season = displayedSeason {
+                let lookup = seasonLookup
+                let metadata = seasonMetadata.flatMap { $0.matches(lookup) ? $0.episodes : nil }
                 Shelf(title: nil, items: season.episodes, sizing: .columns(minWidth: 224), spacing: 16, margin: margin) { episode in
-                    episodeCard(episode, metadata: episodeInfo[episode.number])
+                    episodeCard(episode, metadata: metadata?[episode.number])
                 }
                 .id(season.id)
+            } else {
+                episodeStatus
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, margin)
             }
-        } else if loadingEpisodes {
+        }
+    }
+
+    private var episodeShelfHeader: some View {
+        let edition = inventory?.edition ?? activeEdition
+        return HStack(alignment: .center, spacing: 12) {
+            Text("Épisodes")
+                .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+            if let season = displayedSeason {
+                if let inventory, inventory.seasons.count > 1 {
+                    Picker("Saison des épisodes", selection: seasonBinding) {
+                        ForEach(inventory.seasons) { season in
+                            Text(Self.seasonLabel(season)).tag(season.number)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                } else {
+                    Text(Self.seasonLabel(season))
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                Text(season.episodes.count == 1 ? "1 épisode" : "\(season.episodes.count) épisodes")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if let edition, editions.count > 1 {
+                Menu {
+                    ForEach(editions) { candidate in
+                        Button {
+                            browseEditionID = candidate.id
+                        } label: {
+                            if candidate.id == edition.id {
+                                Label(Self.editionLabel(candidate), systemImage: "checkmark")
+                            } else {
+                                Text(Self.editionLabel(candidate))
+                            }
+                        }
+                    }
+                } label: {
+                    Label(edition.source.name, systemImage: "rectangle.on.rectangle")
+                        .lineLimit(1)
+                }
+                .menuStyle(.borderedButton)
+                .accessibilityLabel("Source des épisodes")
+                .accessibilityValue(Self.editionLabel(edition))
+                .help("Changer la source de cette liste d’épisodes")
+            }
+        }
+        .padding(.horizontal, margin)
+    }
+
+    @ViewBuilder private var episodeStatus: some View {
+        if loadingEpisodes {
             HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
-                Text("Chargement des épisodes…").foregroundStyle(.secondary)
+                Text("Chargement des épisodes…")
             }
-            .padding(.horizontal, margin)
         } else if failedToLoadEpisodes {
             HStack(spacing: 12) {
-                Label("Cette source n’a pas répondu.", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.secondary)
+                Label("Impossible de charger les épisodes.", systemImage: "exclamationmark.circle")
                 Button("Réessayer") { retryCount += 1 }
             }
-            .padding(.horizontal, margin)
         } else {
             Label("Aucun épisode disponible dans vos sources.", systemImage: "tv")
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, margin)
         }
     }
 
@@ -234,50 +279,82 @@ private struct TitleDetailContent: View {
         }
     }
 
-    private var details: some View {
+    @ViewBuilder private var details: some View {
         let rating = enriched?.voteAverage ?? movieDetail?.rating ?? inventory?.detail.rating ?? title.rating
-        let directors = enriched?.directors ?? [movieDetail?.director ?? inventory?.detail.director
+        let providerDirectors = [movieDetail?.director ?? inventory?.detail.director
             ?? activeEdition?.variant.movie?.director ?? activeEdition?.variant.series?.director].compactMap { $0 }
-        let trailer = enriched?.trailerURL ?? movieDetail?.trailerURL ?? inventory?.detail.trailerURL
-            ?? activeEdition?.variant.movie?.trailerURL ?? activeEdition?.variant.series?.trailerURL
+        let directors = enriched?.directors.isEmpty == false ? enriched?.directors ?? [] : providerDirectors
+        let formattedRating: String? = if let rating, (0.1...10.0).contains(rating) {
+            "\(rating.formatted(.number.precision(.fractionLength(1)))) / 10"
+        } else { nil }
+        let fields: [(label: String, value: String?)] = [
+            ("Année", year.map(String.init)),
+            ("Durée", title.kind == .movie ? minutes.map { "\($0) min" } : nil),
+            ("Genres", genres.isEmpty ? nil : genres.joined(separator: ", ")),
+            ("Réalisation", directors.isEmpty ? nil : directors.joined(separator: ", ")),
+            ("Note", formattedRating),
+            ("Pays", movieDetail?.country),
+        ]
+        let rows: [(label: String, value: String)] = fields.compactMap { label, value in
+            guard let value, !value.isEmpty else { return nil }
+            return (label, value)
+        }
+        let edition = inventory?.edition ?? activeEdition
 
-        return VStack(alignment: .leading, spacing: 22) {
-            HStack(alignment: .top, spacing: 28) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("À propos").font(.title2.weight(.semibold)).accessibilityAddTraits(.isHeader)
+        if plot != nil || !rows.isEmpty || edition != nil {
+            VStack(alignment: .leading, spacing: 20) {
+                Divider()
+                HStack(alignment: .top, spacing: 32) {
                     if let plot {
-                        Text(plot).font(.callout).foregroundStyle(.secondary)
-                            .lineSpacing(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
+                        VStack(alignment: .leading, spacing: 10) {
+                            detailHeading("À propos")
+                            Text(plot)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineSpacing(4)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        }
+                        .layoutPriority(1)
+                        .frame(maxWidth: 530, alignment: .leading)
                     }
-                    if let trailer, let scheme = trailer.scheme?.lowercased(), ["https", "http"].contains(scheme) {
-                        Link(destination: trailer) { Label("Bande-annonce", systemImage: "play.rectangle") }
+                    if !rows.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            detailHeading("Informations")
+                            ForEach(rows, id: \.label) { row in credit(row.label, value: row.value) }
+                        }
+                        .frame(maxWidth: 220, alignment: .leading)
                     }
+                    if let edition { editionDetails(edition) }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    if !genres.isEmpty { credit("Genres", value: genres.joined(separator: ", ")) }
-                    if !directors.isEmpty { credit("Réalisation", value: directors.joined(separator: ", ")) }
-                    if let rating, rating.isFinite, (0.1...10).contains(rating) {
-                        credit("Note", value: "\(rating.formatted(.number.precision(.fractionLength(1)))) / 10")
-                    }
-                    if let country = movieDetail?.country, !country.isEmpty { credit("Pays", value: country) }
-                    if let container = activeEdition?.variant.movie?.containerExtension {
-                        credit("Format vidéo", value: [movieDetail?.tech?.quality.badge, container.uppercased()].compactMap { $0 }.joined(separator: " · "))
-                    }
-                }
-                .frame(maxWidth: 215, alignment: .leading)
-            }
-
-            if let edition = inventory?.edition ?? activeEdition {
-                Divider()
-                sourceLine(edition)
             }
         }
-        .padding(22)
-        .background(PrismColors.panelFill, in: .rect(cornerRadius: 16))
+    }
+
+    private func editionDetails(_ edition: TitleEdition) -> some View {
+        let tech = movieDetail?.tech
+        let format = [tech?.quality.badge ?? edition.variant.quality.badge, edition.variant.movie?.containerExtension?.uppercased()]
+            .compactMap { $0 }.joined(separator: " · ")
+        return VStack(alignment: .leading, spacing: 10) {
+            detailHeading("Édition")
+            credit("Source", value: edition.source.name)
+            credit("Langue ou version", value: edition.edition.title)
+            if !format.isEmpty { credit("Vidéo", value: format) }
+        }
+        .frame(maxWidth: 220, alignment: .leading)
+    }
+
+    private var trailer: URL? {
+        [enriched?.trailerURL, movieDetail?.trailerURL, inventory?.detail.trailerURL,
+         activeEdition?.variant.movie?.trailerURL, activeEdition?.variant.series?.trailerURL]
+            .compactMap { $0 }.first { url in
+                url.host != nil && (url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http")
+            }
+    }
+
+    private func detailHeading(_ title: String) -> some View {
+        Text(title).font(.title3.weight(.semibold)).accessibilityAddTraits(.isHeader)
     }
 
     private func credit(_ label: String, value: String) -> some View {
@@ -286,48 +363,6 @@ private struct TitleDetailContent: View {
             Text(value).font(.callout)
         }
         .accessibilityElement(children: .combine)
-    }
-
-    private func sourceLine(_ edition: TitleEdition) -> some View {
-        let sourceEditions = editions
-        return HStack(spacing: 12) {
-            Image(systemName: "rectangle.on.rectangle")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 36, height: 36)
-                .background(Color.accentColor.opacity(0.12), in: .rect(cornerRadius: 9))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title.kind == .movie ? (preferredID == nil ? "Édition par défaut" : "Édition préférée") : "Édition des épisodes")
-                    .font(.callout.weight(.semibold))
-                Text(Self.editionLabel(edition))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            Spacer()
-            if sourceEditions.count > 1 {
-                if title.kind == .series {
-                    Menu("Changer d’édition", systemImage: "chevron.up.chevron.down") {
-                        ForEach(sourceEditions) { candidate in
-                            Button {
-                                browseEditionID = candidate.id
-                            } label: {
-                                if candidate.id == edition.id {
-                                    Label(Self.editionLabel(candidate), systemImage: "checkmark")
-                                } else {
-                                    Text(Self.editionLabel(candidate))
-                                }
-                            }
-                        }
-                    }
-                    .menuStyle(.borderedButton)
-                    .fixedSize()
-                } else {
-                    Button("Voir les éditions") { choosePlayback(episode: nil, alwaysShowPicker: true) }
-                }
-            }
-        }
     }
 
     private var similarTitles: some View {
@@ -409,15 +444,17 @@ private struct TitleDetailContent: View {
         let ordered = [preferred].compactMap { $0 } + candidates.filter { $0.id != preferred?.id }
         if title.kind == .movie {
             guard let edition = ordered.first, let movie = edition.variant.movie else { return }
-            let detail = try? await app.detailRepository.movieDetail(movie, source: edition.source)
-            if !Task.isCancelled { movieDetail = detail }
+            var detail = try? await app.detailRepository.movieDetail(movie, source: edition.source)
+            guard !Task.isCancelled else { return }
+            let plot = ProviderSynopsis.cleaned(detail?.plot)
+            detail?.plot = plot
+            loadedMovieDetail = detail
             return
         }
 
         failedToLoadEpisodes = false
         if inventory?.edition.id != ordered.first?.id {
             inventory = nil
-            episodeInfo = [:]
         }
         loadingEpisodes = inventory == nil
         var encounteredFailure = false
@@ -450,13 +487,20 @@ private struct TitleDetailContent: View {
         if !Task.isCancelled { enriched = metadata }
     }
 
-    private func loadEpisodeInfo() async {
-        guard isPageActive, let id = enriched?.tmdbID, let season = displayedSeason?.number else { return }
-        episodeInfo = [:]
+    private func loadEpisodeInfo(for lookup: SeasonLookup) async {
+        guard lookup.active, let id = lookup.tmdbID, let season = lookup.season else { return }
+        if seasonMetadata?.matches(lookup) == true { return }
         let info = await app.metadataRepository.episodes(tmdbID: id, season: season)
-        if !Task.isCancelled {
-            episodeInfo = Dictionary(info.map { ($0.number, $0) }, uniquingKeysWith: { first, _ in first })
+        if !Task.isCancelled, !info.isEmpty {
+            seasonMetadata = SeasonMetadata(
+                tmdbID: id, season: season,
+                episodes: Dictionary(info.map { ($0.number, $0) }, uniquingKeysWith: { first, _ in first })
+            )
         }
+    }
+
+    nonisolated private static func seasonLabel(_ season: Season) -> String {
+        season.number == 0 ? "Épisodes spéciaux" : "Saison \(season.number)"
     }
 
     nonisolated private static func editionLabel(_ edition: TitleEdition) -> String {
@@ -489,5 +533,15 @@ private struct TitleDetailContent: View {
         let active: Bool
         let tmdbID: Int?
         let season: Int?
+    }
+
+    private struct SeasonMetadata {
+        let tmdbID: Int
+        let season: Int
+        let episodes: [Int: TMDBEpisodeInfo]
+
+        func matches(_ lookup: SeasonLookup) -> Bool {
+            tmdbID == lookup.tmdbID && season == lookup.season
+        }
     }
 }

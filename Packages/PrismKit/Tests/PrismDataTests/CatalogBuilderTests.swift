@@ -7,6 +7,29 @@ import Testing
 struct CatalogBuilderTests {
     typealias F = Fixture
 
+    @Test func providerLanguageLabelsUseTheRawCategoryForEachEdition() async throws {
+        let french = F.category(F.a, .movie, "10", "┃FR┃ Films - Nouveautés")
+        let english = F.category(F.b, .movie, "10", "VOD | en-GB | New Releases")
+        let frenchMovie = F.movie(F.a, "fr", "Inception", year: 2010, category: french.nativeID)
+        let englishMovie = F.movie(F.b, "en", "Inception", year: 2010, category: english.id)
+        let catalog = await F.build([F.source(F.a), F.source(F.b)], [
+            SourceCatalog(sourceID: F.a, categories: [french], movies: [frenchMovie]),
+            SourceCatalog(sourceID: F.b, categories: [english], movies: [englishMovie]),
+        ])
+        #expect(catalog.movies.count == 1)
+        #expect(catalog.providerLanguages(for: .movie(frenchMovie)) == ["fr"])
+        #expect(catalog.providerLanguages(for: .movie(englishMovie)) == ["en"])
+    }
+
+    @Test func categoriesDistinguishExplicitLanguagesFromIncidentalWords() {
+        #expect(ProviderCategoryLanguage.codes(in: "Films en famille").isEmpty)
+        #expect(ProviderCategoryLanguage.codes(in: "France • Documentaires").isEmpty)
+        #expect(ProviderCategoryLanguage.codes(in: "FR | Films VOSTFR").isEmpty)
+        #expect(ProviderCategoryLanguage.codes(in: "Audio EN | Sous-titres FR") == ["en"])
+        #expect(ProviderCategoryLanguage.codes(in: "SÉRIES [EN / VF]") == ["en", "fr"])
+        #expect(ProviderCategoryLanguage.codes(in: "|AR| Films récents") == ["ar"])
+    }
+
     @Test func crossSourceMoviesAreGroupedWithPriorityOrder() async {
         let catalogs = [
             SourceCatalog(sourceID: F.b, movies: [F.movie(F.b, "1", "Inception", year: 2010, quality: .uhd)]),

@@ -64,11 +64,11 @@ struct TitlePlaybackSheet: View {
                 url: title.posterURL, size: CGSize(width: 52, height: 78),
                 placeholderSeed: title.id.rawValue, placeholderTitle: title.title, placeholderStyle: .monogram
             )
-            .clipShape(.rect(cornerRadius: 7))
+            .clipShape(.rect(cornerRadius: PrismMetrics.smallArtworkRadius))
             .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Choisir une édition")
+                Text("Sources et langues")
                     .font(.system(size: 22, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
                 Text(title.title).font(.headline)
@@ -85,15 +85,18 @@ struct TitlePlaybackSheet: View {
     private var fields: some View {
         let visible = visibleOptions
         let activeID = selected?.id
+        let visibleSlots = min(max(selection.options.count + selection.otherEditions.count, 1), 4)
         return VStack(alignment: .leading, spacing: 14) {
-            Picker("Langue ou version", selection: $language) {
-                Text("Toutes les éditions").tag(nil as PlaybackEdition?)
-                ForEach(languages, id: \.key) { language in
-                    Text(language.title).tag(Optional(language))
+            if languages.count > 1 {
+                Picker("Langue ou version", selection: $language) {
+                    Text("Toutes les éditions").tag(nil as PlaybackEdition?)
+                    ForEach(languages, id: \.key) { language in
+                        Text(language.title).tag(Optional(language))
+                    }
                 }
+                .pickerStyle(.menu)
+                .onChange(of: language) { _, _ in selectedID = nil }
             }
-            .pickerStyle(.menu)
-            .onChange(of: language) { _, _ in selectedID = nil }
 
             Text("Sources disponibles")
                 .font(.headline)
@@ -107,7 +110,7 @@ struct TitlePlaybackSheet: View {
                 }
                 .padding(2)
             }
-            .frame(height: CGFloat(min(max(visible.count, 1), 4)) * 60)
+            .frame(height: CGFloat(visibleSlots) * 56 + 4)
             .defaultScrollAnchor(.top)
 
             if selected?.titleEdition.edition.key == "MULTI" {
@@ -138,7 +141,6 @@ struct TitlePlaybackSheet: View {
 
     private func editionRow(_ option: TitlePlaybackOption, isSelected: Bool) -> some View {
         let edition = option.titleEdition
-        let tint = PrismTint(rawValue: edition.source.tint.rawValue) ?? .blue
         return Button {
             selectedID = option.id
         } label: {
@@ -146,9 +148,6 @@ struct TitlePlaybackSheet: View {
                 Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
                     .foregroundStyle(isSelected ? Color.accentColor : .secondary)
                     .imageScale(.large)
-                    .accessibilityHidden(true)
-                Circle().fill(tint.color)
-                    .frame(width: 8, height: 8)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(edition.source.name).fontWeight(.semibold)
@@ -165,9 +164,9 @@ struct TitlePlaybackSheet: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 50)
-            .background(isSelected ? Color.accentColor.opacity(0.13) : PrismColors.panelFill, in: .rect(cornerRadius: 8))
+            .background(isSelected ? Color.accentColor.opacity(0.13) : PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.listRowRadius))
             .overlay {
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: PrismMetrics.listRowRadius)
                     .strokeBorder(Color.accentColor.opacity(isSelected ? 0.4 : 0), lineWidth: 1)
             }
         }
@@ -190,7 +189,7 @@ struct TitlePlaybackSheet: View {
             } label: {
                 Label(position == nil ? "Lire" : "Reprendre", systemImage: "play.fill")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.glassProminent)
             .keyboardShortcut(.defaultAction)
             .disabled(selected == nil)
         }

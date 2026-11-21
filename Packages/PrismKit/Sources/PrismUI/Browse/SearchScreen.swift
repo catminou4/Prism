@@ -13,13 +13,17 @@ struct SearchScreen: View {
     @State private var resultRequest: SearchRequest?
 
     var body: some View {
-        let request = SearchRequest(term: query.trimmingCharacters(in: .whitespacesAndNewlines),
-                                    revision: app.catalogRevision, active: isActive)
+        let request = SearchRequest(
+            term: query.trimmingCharacters(in: .whitespacesAndNewlines),
+            revision: app.catalogRevision, indexReady: app.searchIndex != nil, active: isActive
+        )
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
                 BrowseHeading(title: "Rechercher")
                 HStack(spacing: 12) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
                     TextField("Films, séries ou chaînes", text: $query)
                         .textFieldStyle(.plain)
                         .focused($isFocused)
@@ -31,12 +35,17 @@ struct SearchScreen: View {
                     }
                 }
                 .font(.system(size: 16))
-                .padding(14)
-                .background(.fill.tertiary, in: .rect(cornerRadius: 13))
+                .padding(.horizontal, 16)
+                .frame(height: 42)
+                .prismGlass(.regular, in: .capsule)
+                .frame(maxWidth: 610, alignment: .leading)
                 .padding(.horizontal, PrismMetrics.contentMargin)
 
                 if request.term.isEmpty {
-                    TitleShelf(title: "À découvrir", items: app.recommendations.highlights)
+                    TitleShelf(
+                        title: "À découvrir",
+                        items: app.recommendations.selection(for: app.homeAudioLanguages).highlights
+                    )
                 } else if let result, resultRequest == request {
                     if result.isEmpty {
                         ContentUnavailableView.search(text: request.term)
@@ -51,6 +60,7 @@ struct SearchScreen: View {
                 } else {
                     ProgressView()
                         .controlSize(.small)
+                        .accessibilityLabel(request.indexReady ? "Recherche en cours" : "Préparation de la recherche")
                         .frame(maxWidth: .infinity)
                         .padding(24)
                 }
@@ -72,6 +82,7 @@ struct SearchScreen: View {
     private struct SearchRequest: Equatable {
         let term: String
         let revision: Int
+        let indexReady: Bool
         let active: Bool
     }
 

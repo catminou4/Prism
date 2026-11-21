@@ -6,7 +6,7 @@ import PrismDesign
 
 /// Top-level sections shown in the sidebar.
 public enum SidebarItem: Hashable, Sendable {
-    case search, home, live, movies, series
+    case search, home, live, sports, movies, series
     case watchlist, favorites, history
     case source(SourceID)
 }

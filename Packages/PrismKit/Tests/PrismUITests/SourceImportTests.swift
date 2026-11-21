@@ -56,4 +56,18 @@ struct SourceImportTests {
         #expect(credentials.password(for: source.id) == nil)
         #expect(model.imports.isEmpty)
     }
+
+    @Test func overlappingRebuildsPublishSearchForTheLatestCatalog() async throws {
+        let model = await AppModel.preview()
+        let source = try #require(model.sources.first)
+        let prior = Task { await model.rebuild() }
+        await Task.yield()
+
+        model.setEnabled(false, for: source.id)
+        await model.rebuild()
+        await prior.value
+
+        #expect(model.catalog.source(source.id) == nil)
+        #expect(model.searchIndex?.entryCount == model.catalog.channels.count + model.catalog.movies.count + model.catalog.series.count)
+    }
 }

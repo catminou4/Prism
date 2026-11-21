@@ -129,7 +129,7 @@ public struct ProceduralPoster: View {
         ForEach(["Nocturne", "Les Échos", "Polaris", "Le Dernier Été"], id: \.self) { title in
             ProceduralPoster(seed: title, title: title)
                 .frame(width: 140, height: 210)
-                .clipShape(.rect(cornerRadius: 10))
+                .clipShape(.rect(cornerRadius: PrismMetrics.posterRadius))
         }
     }
     .padding(30)

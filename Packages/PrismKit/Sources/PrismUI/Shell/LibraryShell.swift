@@ -7,7 +7,9 @@ struct LibraryShell: View {
     @Environment(AppModel.self) private var app
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     @State private var navigation = NavigationModel()
+    @State private var sports = SportsPresentation()
     @State private var visited: [SidebarItem] = [.home]
     @State private var visibility = NavigationSplitViewVisibility.all
     @State private var isAddingSource = false
@@ -16,6 +18,9 @@ struct LibraryShell: View {
         let selection = navigation.selection
         return visited.contains(selection) ? visited : visited + [selection]
     }
+
+    private var sidebarText: Color { Color(white: colorScheme == .dark ? 0.92 : 0.12) }
+    private var sidebarSecondary: Color { Color(white: colorScheme == .dark ? 0.69 : 0.38) }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $visibility) {
@@ -42,6 +47,7 @@ struct LibraryShell: View {
                 .environment(\.prismShelfViewportWidth, layout.size.width)
             }
             .environment(navigation)
+            .environment(sports)
             .transaction { transaction in
                 if reduceMotion { transaction.animation = nil }
             }
@@ -93,26 +99,32 @@ struct LibraryShell: View {
                 get: { navigation.selection },
                 set: { if let item = $0, item != navigation.selection { navigation.select(item) } }
             )) {
-                Section("Explorer") {
+                Section {
                     row("Accueil", symbol: "house", item: .home)
                     row("Rechercher", symbol: "magnifyingglass", item: .search)
                     row("TV en direct", symbol: "dot.radiowaves.left.and.right", item: .live)
+                    row("Sport", symbol: "sportscourt", item: .sports)
                     row("Films", symbol: "film.stack", item: .movies)
                     row("Séries", symbol: "rectangle.stack", item: .series)
+                } header: {
+                    Text("Explorer").foregroundStyle(sidebarSecondary)
                 }
-                Section("Bibliothèque") {
+                Section {
                     row("Ma liste", symbol: "bookmark", item: .watchlist)
                     row("Chaînes favorites", symbol: "star", item: .favorites)
                     row("Historique", symbol: "clock.arrow.circlepath", item: .history)
+                } header: {
+                    Text("Bibliothèque").foregroundStyle(sidebarSecondary)
                 }
-                Section("Sources") {
+                Section {
                     ForEach(app.sources) { source in
+                        let item = SidebarItem.source(source.id)
                         HStack(spacing: 9) {
                             Image(systemName: source.id == DemoContent.sourceID ? "play.rectangle" : "rectangle.connected.to.line.below")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(rowSymbol(item))
                                 .frame(width: 17)
                                 .accessibilityHidden(true)
-                            Text(source.name).lineLimit(1)
+                            Text(source.name).lineLimit(1).foregroundStyle(rowText(item))
                             Spacer(minLength: 3)
                             if app.isImporting(source.id) {
                                 ProgressView().controlSize(.mini).accessibilityLabel("Importation")
@@ -120,11 +132,12 @@ struct LibraryShell: View {
                                 Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
                                     .accessibilityLabel("Erreur d’actualisation")
                             } else if !source.isEnabled {
-                                Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                                Image(systemName: "pause.circle").foregroundStyle(rowSymbol(item))
                                     .accessibilityLabel("Source inactive")
                             }
                         }
-                        .tag(SidebarItem.source(source.id))
+                        .tag(item)
+                        .listRowBackground(selectionBackground(item))
                         .contextMenu {
                             Button(source.isEnabled ? "Désactiver" : "Activer") {
                                 app.setEnabled(!source.isEnabled, for: source.id)
@@ -134,8 +147,18 @@ struct LibraryShell: View {
                                 .disabled(!source.isEnabled || app.isImporting(source.id))
                         }
                     }
-                    Button("Ajouter une source…", systemImage: "plus.circle") { isAddingSource = true }
-                        .buttonStyle(.plain)
+                    Button {
+                        isAddingSource = true
+                    } label: {
+                        Label {
+                            Text("Ajouter une source…").foregroundStyle(sidebarText)
+                        } icon: {
+                            Image(systemName: "plus.circle").foregroundStyle(sidebarSecondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } header: {
+                    Text("Sources").foregroundStyle(sidebarSecondary)
                 }
             }
             .listStyle(.sidebar)
@@ -152,14 +175,25 @@ struct LibraryShell: View {
 
     private func row(_ title: String, symbol: String, item: SidebarItem) -> some View {
         Label {
-            Text(title)
-                .foregroundStyle(.primary)
+            Text(title).foregroundStyle(rowText(item))
         } icon: {
-            Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+            Image(systemName: symbol).foregroundStyle(rowSymbol(item))
         }
-        .labelStyle(.titleAndIcon)
         .tag(item)
+        .listRowBackground(selectionBackground(item))
+    }
+
+    private func rowText(_ item: SidebarItem) -> Color {
+        navigation.selection == item ? .white : sidebarText
+    }
+
+    private func rowSymbol(_ item: SidebarItem) -> Color {
+        navigation.selection == item ? .white.opacity(0.87) : sidebarSecondary
+    }
+
+    private func selectionBackground(_ item: SidebarItem) -> some View {
+        RoundedRectangle(cornerRadius: PrismMetrics.listRowRadius)
+            .fill(navigation.selection == item ? Color(white: colorScheme == .dark ? 0.28 : 0.30) : .clear)
     }
 
     @ViewBuilder private func root(for section: SidebarItem) -> some View {
@@ -167,6 +201,7 @@ struct LibraryShell: View {
         case .home: BrowseScreen(kind: nil)
         case .search: SearchScreen()
         case .live: LiveScreen()
+        case .sports: SportsScreen()
         case .movies: BrowseScreen(kind: .movie)
         case .series: BrowseScreen(kind: .series)
         case .watchlist: CollectionView(collection: .watchlist)

@@ -101,22 +101,16 @@ public struct EPGGuide: Sendable {
     /// otherwise a match of the normalized channel name against the XMLTV display names.
     public func resolveEPGID(for channel: ChannelGroup) -> String? {
         guard !programsByChannel.isEmpty else { return nil }
-        var candidates: [String] = []
-        if let epgID = channel.epgID { candidates.append(epgID) }
-        candidates.append(contentsOf: channel.variants.compactMap(\.epgID))
-        for candidate in candidates {
-            let id = candidate.trimmingCharacters(in: .whitespaces).lowercased()
-            if !id.isEmpty, programsByChannel[id] != nil { return id }
+        if let id = matchingEPGID(channel.epgID) { return id }
+        for variant in channel.variants where variant.epgID != channel.epgID {
+            if let id = matchingEPGID(variant.epgID) { return id }
         }
-        var names = [channel.name]
-        names.append(contentsOf: channel.variants.map(\.name))
-        for name in names {
-            for key in Self.nameKeys(name) {
-                if let id = nameIndex[key] { return id }
-            }
+        guard !nameIndex.isEmpty else { return nil }
+        if let id = epgID(named: channel.name) { return id }
+        for variant in channel.variants where variant.name != channel.name {
+            if let id = epgID(named: variant.name) { return id }
         }
-        if let id = nameIndex[channel.id] { return id }
-        return nil
+        return nameIndex[channel.id]
     }
 
     /// Union of both guides; on conflicting programmes `self` wins.
@@ -143,6 +137,18 @@ public struct EPGGuide: Sendable {
     }
 
     // MARK: - Internals
+
+    private func matchingEPGID(_ candidate: String?) -> String? {
+        guard let candidate else { return nil }
+        let id = candidate.trimmingCharacters(in: .whitespaces).lowercased()
+        return programsByChannel[id] == nil ? nil : id
+    }
+
+    private func epgID(named name: String) -> String? {
+        let cleaned = TitleNormalizer.normalize(name).key
+        if let id = nameIndex[cleaned] { return id }
+        return nameIndex[TitleNormalizer.key(name)]
+    }
 
     /// Sorted by start; drops empty/duplicate programmes and trims overlaps (earlier programme ends
     /// when the next one starts).

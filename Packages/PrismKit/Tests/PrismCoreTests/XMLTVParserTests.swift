@@ -59,6 +59,18 @@ struct XMLTVParserTests {
         #expect(gz.channels == plain.channels)
     }
 
+    @Test func retainsMultipleProgrammeCategories() throws {
+        let input = Data("""
+            <tv><programme channel="basket.example" start="20250101120000 +0000" stop="20250101140000 +0000">
+              <title lang="fr">Lakers – Celtics</title>
+              <category lang="en">Sports</category><category lang="fr">Sport</category><category lang="fr">Basket-ball</category>
+            </programme></tv>
+            """.utf8)
+        let programme = try #require(XMLTVParser.parse(input).programs.first)
+        #expect(programme.category == "Sport")
+        #expect(programme.categoryLabels == ["Sports", "Sport", "Basket-ball"])
+    }
+
     @Test func windowFilter() throws {
         let window = DateInterval(start: date("2025-01-01T12:30:00Z"), end: date("2025-01-02T00:00:00Z"))
         let document = try XMLTVParser.parse(try Fixture.data("epg", "xml"), window: window)

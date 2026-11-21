@@ -117,10 +117,10 @@ public final class SearchIndex: Sendable {
     }
 
     @concurrent
-    public static func build(from catalog: Catalog) async -> SearchIndex {
+    public static func build(from catalog: Catalog, recommendations: Recommendations = .empty) async -> SearchIndex {
         let channels = catalog.channels, movies = catalog.movies, series = catalog.series
         let total = channels.count + movies.count + series.count
-        guard total > 0 else { return .empty }
+        guard total > 0, !Task.isCancelled else { return .empty }
 
         // Describe + fold + split in parallel chunks (entry order: channels, movies, series).
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
@@ -130,10 +130,11 @@ public final class SearchIndex: Sendable {
             while start < total {
                 let lower = start, upper = min(start + chunkSize, total)
                 group.addTask {
-                    processChunk(range: lower..<upper) { entry in
+                    guard !Task.isCancelled else { return Chunk(start: lower) }
+                    return processChunk(range: lower..<upper) { entry in
                         if entry < channels.count {
                             let group = channels[entry]
-                            let quality = group.variants.map(\.quality).max() ?? .unknown
+                            let quality = group.variants.lazy.map(\.quality).max() ?? .unknown
                             return (0, Int32(entry), Source(
                                 name: group.name, extraWord: nil,
                                 baseScore: baseScore(quality: quality, variants: group.variants.count, addedAt: nil, nameLength: group.name.utf8.count)
@@ -142,13 +143,15 @@ public final class SearchIndex: Sendable {
                         let isMovie = entry < channels.count + movies.count
                         let index = isMovie ? entry - channels.count : entry - channels.count - movies.count
                         let title = isMovie ? movies[index] : series[index]
+                        let name = recommendations.editorialCopy[title.id]?.title ?? title.title
                         var alternateNames: Set<String> = []
+                        if title.title != name { alternateNames.insert(title.title) }
                         if title.variants.count > 1 {
-                            for variant in title.variants where variant.title != title.title { alternateNames.insert(variant.title) }
+                            for variant in title.variants where variant.title != name { alternateNames.insert(variant.title) }
                         }
                         return (isMovie ? 1 : 2, Int32(index), Source(
-                            name: title.title, extraWord: title.year.map(String.init),
-                            baseScore: baseScore(quality: title.bestQuality, variants: title.variants.count, addedAt: title.addedAt, nameLength: title.title.utf8.count),
+                            name: name, extraWord: title.year.map(String.init),
+                            baseScore: baseScore(quality: title.bestQuality, variants: title.variants.count, addedAt: title.addedAt, nameLength: name.utf8.count),
                             alternateNames: alternateNames
                         ))
                     }
@@ -159,6 +162,7 @@ public final class SearchIndex: Sendable {
             for await chunk in group { result.append(chunk) }
             return result.sorted { $0.start < $1.start }
         }
+        guard !Task.isCancelled else { return .empty }
         let kinds = chunks.flatMap(\.kinds)
         let refs = chunks.flatMap(\.refs)
         let baseScores = chunks.flatMap(\.baseScores)
@@ -230,6 +234,7 @@ public final class SearchIndex: Sendable {
             wordOffsets.append(Int32(wordBytes.count))
         }
         let entryWords = entryWordIDs.map { rankOfID[Int($0)] }
+        guard !Task.isCancelled else { return .empty }
 
         // Posting lists (counting sort by rank; entries stay ascending inside each list).
         var counts = [Int32](repeating: 0, count: order.count + 1)

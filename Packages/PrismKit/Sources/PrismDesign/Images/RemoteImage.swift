@@ -16,6 +16,7 @@ public struct RemoteImage: View {
     private let placeholderStyle: PlaceholderArtwork.TitleStyle
     private let blurRadius: CGFloat
     private let showsPlaceholder: Bool
+    private let onLoadFailure: (() -> Void)?
 
     @Environment(\.displayScale) private var displayScale
     @State private var loaded: Loaded?
@@ -29,7 +30,8 @@ public struct RemoteImage: View {
         placeholderTitle: String? = nil,
         placeholderStyle: PlaceholderArtwork.TitleStyle = .title,
         blurRadius: CGFloat = 0,
-        showsPlaceholder: Bool = true
+        showsPlaceholder: Bool = true,
+        onLoadFailure: (() -> Void)? = nil
     ) {
         self.url = url
         self.size = size
@@ -39,6 +41,7 @@ public struct RemoteImage: View {
         self.placeholderStyle = placeholderStyle
         self.blurRadius = blurRadius
         self.showsPlaceholder = showsPlaceholder
+        self.onLoadFailure = onLoadFailure
     }
 
     private struct Loaded: Equatable {
@@ -116,8 +119,12 @@ public struct RemoteImage: View {
             loaded = Loaded(key: key, image: cached)
             return
         }
-        guard let image = await ImagePipeline.shared.image(for: url, pixelSize: target, fitting: fitting, blurRadius: blurRadius),
-              !Task.isCancelled else { return }
+        let image = await ImagePipeline.shared.image(for: url, pixelSize: target, fitting: fitting, blurRadius: blurRadius)
+        guard !Task.isCancelled else { return }
+        guard let image else {
+            if loaded?.key.url != url { onLoadFailure?() }
+            return
+        }
         withAnimation(PrismMotion.imageFade) {
             loaded = Loaded(key: key, image: image)
         }

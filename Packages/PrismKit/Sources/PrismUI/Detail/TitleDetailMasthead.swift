@@ -22,8 +22,20 @@ struct TitleDetailMasthead: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.isPageActive) private var isPageActive
     @State private var drift = false
+    @State private var failedArtwork: Set<URL> = []
 
     private let ink = Color(white: 0.045)
+    private var displayTitle: String {
+        if let name = metadata?.title, !name.isEmpty { return name }
+        return title.title
+    }
+    private var availableBackdrop: URL? {
+        guard let backdrop, !failedArtwork.contains(backdrop) else { return nil }
+        return backdrop
+    }
+    private var availablePoster: URL? {
+        [metadata?.images.posterURL, title.posterURL].compactMap { $0 }.first { !failedArtwork.contains($0) }
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -55,12 +67,12 @@ struct TitleDetailMasthead: View {
             }
         }
         .frame(height: height)
-        .clipShape(.rect(cornerRadius: 15))
-        .task(id: isPageActive && !reduceMotion && backdrop != nil) {
+        .clipShape(.rect(cornerRadius: PrismMetrics.heroRadius))
+        .task(id: isPageActive && !reduceMotion && availableBackdrop != nil) {
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) { drift = false }
-            guard isPageActive, !reduceMotion, backdrop != nil else { return }
+            guard isPageActive, !reduceMotion, availableBackdrop != nil else { return }
             // Yield after clearing the previous transaction so the first animation has a start state.
             await Task.yield()
             guard !Task.isCancelled else { return }
@@ -70,9 +82,9 @@ struct TitleDetailMasthead: View {
 
     @ViewBuilder private var titleLine: some View {
         if let logo = metadata?.images.logoURL {
-            TitleLogo(url: logo, fallbackTitle: title.title, maxSize: CGSize(width: 380, height: 100))
+            TitleLogo(url: logo, fallbackTitle: displayTitle, maxSize: CGSize(width: 380, height: 100))
         } else {
-            Text(title.title)
+            Text(displayTitle)
                 .font(.system(size: 53, weight: .bold))
                 .tracking(-1.8)
                 .foregroundStyle(.white)
@@ -88,14 +100,14 @@ struct TitleDetailMasthead: View {
             HStack(spacing: 10) {
                 playButton
                 watchlistButton
-                if edition != nil, editionCount > 1 { editionButton }
+                if let edition { editionButton(edition) }
             }
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
                     playButton
                     watchlistButton
                 }
-                if edition != nil, editionCount > 1 { editionButton }
+                if let edition { editionButton(edition) }
             }
         }
     }
@@ -111,28 +123,34 @@ struct TitleDetailMasthead: View {
         WatchlistButton(isAdded: isInWatchlist, size: 39, action: toggleWatchlist)
     }
 
-    private var editionButton: some View {
+    private func editionButton(_ edition: TitleEdition) -> some View {
         GlassCapsuleButton(
-            title: "Sources et langues",
+            title: editionCount > 1 ? "\(editionCount) éditions" : edition.source.name,
             systemImage: "rectangle.on.rectangle",
+            trailingChevron: false,
             action: showEditions
         )
         .disabled(!canPlay)
-        .help("Voir les langues, les qualités et les sources disponibles")
+        .accessibilityLabel("Sources et langues")
+        .accessibilityValue(editionCount > 1 ? "\(editionCount) éditions" : edition.source.name)
+        .help("Source actuelle : \(edition.source.name) · \(edition.edition.title)")
     }
 
     private func artwork(size: CGSize) -> some View {
         ZStack(alignment: .trailing) {
             ink
-            if let backdrop {
+            if let backdrop = availableBackdrop {
                 let artSize = CGSize(width: size.width, height: size.height)
-                RemoteImage(url: backdrop, size: artSize, placeholderSeed: title.id.rawValue, showsPlaceholder: false)
-                    .scaleEffect(drift ? 1.045 : 1, anchor: .trailing)
-            } else {
+                RemoteImage(
+                    url: backdrop, size: artSize, placeholderSeed: title.id.rawValue, showsPlaceholder: false,
+                    onLoadFailure: { failedArtwork.insert(backdrop) }
+                )
+                .scaleEffect(drift ? 1.045 : 1, anchor: .trailing)
+            } else if let poster = availablePoster {
                 let artSize = CGSize(width: size.width * 0.72, height: size.height)
                 RemoteImage(
-                    url: metadata?.images.posterURL ?? title.posterURL, size: artSize,
-                    placeholderSeed: title.id.rawValue, placeholderStyle: .none, blurRadius: 28
+                    url: poster, size: artSize,
+                    placeholderSeed: title.id.rawValue, blurRadius: 28, showsPlaceholder: false
                 )
                 .opacity(0.44)
                 .mask {
@@ -140,13 +158,15 @@ struct TitleDetailMasthead: View {
                 }
                 let posterHeight = size.height * 0.68
                 RemoteImage(
-                    url: metadata?.images.posterURL ?? title.posterURL,
+                    url: poster,
                     size: CGSize(width: posterHeight * PrismMetrics.posterAspectRatio, height: posterHeight),
-                    placeholderSeed: title.id.rawValue, placeholderTitle: title.title
+                    placeholderSeed: title.id.rawValue, showsPlaceholder: false,
+                    onLoadFailure: { failedArtwork.insert(poster) }
                 )
-                .clipShape(.rect(cornerRadius: 10))
-                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.15), lineWidth: 1) }
+                .clipShape(.rect(cornerRadius: PrismMetrics.posterRadius))
                 .padding(.trailing, size.width * 0.105)
+            } else {
+                LinearGradient(colors: [ink, Color(white: 0.16)], startPoint: .bottomLeading, endPoint: .topTrailing)
             }
 
             LinearGradient(

@@ -23,7 +23,9 @@ public final class AppModel {
     @ObservationIgnored public let epgRepository: EPGRepository
     @ObservationIgnored public let detailRepository: DetailRepository
     @ObservationIgnored public let metadataRepository: MetadataRepository
+    @ObservationIgnored public let sportsRepository: SportsRepository
     @ObservationIgnored private let sourceStore: SourceStore
+    @ObservationIgnored private let settings = AppSettings()
     @ObservationIgnored private let isEphemeral: Bool
     public private(set) var library: LibraryStore
 
@@ -32,9 +34,14 @@ public final class AppModel {
     public private(set) var phase: Phase = .launching
     public private(set) var sources: [Source] = []
     public private(set) var catalog: Catalog = .empty
-    public private(set) var guide: EPGGuide = .empty
+    public private(set) var guide: EPGGuide = .empty {
+        didSet { guideRevision &+= 1 }
+    }
+    public private(set) var guideRevision = 0
     public private(set) var searchIndex: SearchIndex?
     public private(set) var recommendations = Recommendations.empty
+    public private(set) var homeAudioLanguages = HomeAudioLanguage.defaults
+    public private(set) var sportsSettingsRevision = 0
     /// In-flight imports/refreshes, by source.
     public private(set) var imports: [SourceID: ImportProgress] = [:]
     /// Last refresh error per source (French, user-facing).
@@ -57,6 +64,8 @@ public final class AppModel {
     @ObservationIgnored private var sourceCatalogs: [SourceID: SourceCatalog] = [:]
     @ObservationIgnored private var pendingSources: Set<SourceID> = []
     @ObservationIgnored private var rebuildGeneration = 0
+    @ObservationIgnored private var catalogTask: Task<Void, Never>?
+    @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var didBootstrap = false
 
     private enum Keys {
@@ -85,10 +94,12 @@ public final class AppModel {
         self.epgRepository = EPGRepository(directories: directories, credentials: credentials)
         self.detailRepository = DetailRepository(directories: directories, credentials: credentials)
         self.metadataRepository = MetadataRepository(directories: directories, credentials: credentials)
+        self.sportsRepository = SportsRepository(credentials: credentials)
         self.sourceStore = SourceStore(directories: directories)
         self.library = library ?? LibraryStore(directories: directories)
         self.hideAdultContent = UserDefaults.standard.object(forKey: Keys.hideAdult) as? Bool ?? true
         if !isEphemeral {
+            self.homeAudioLanguages = settings.homeAudioLanguages
             self.hiddenCategoriesBySource = UserDefaults.standard.dictionary(forKey: Keys.hiddenCategories) as? [String: [String]] ?? [:]
         }
     }
@@ -130,6 +141,12 @@ public final class AppModel {
         Set(hiddenCategoriesBySource[id.rawValue] ?? [])
     }
 
+    public func setHomeAudioLanguages(_ languages: Set<HomeAudioLanguage>) {
+        guard !languages.isEmpty, languages != homeAudioLanguages else { return }
+        homeAudioLanguages = languages
+        if !isEphemeral { settings.homeAudioLanguages = languages }
+    }
+
     // MARK: Lifecycle
 
     /// Loads sources and cached catalogs, then refreshes stale data in the background.
@@ -147,7 +164,7 @@ public final class AppModel {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
         }
-        await rebuild()
+        await rebuildCatalog()
         phase = .ready
         guide = await epgRepository.cachedGuide(for: sources)
 
@@ -318,6 +335,14 @@ public final class AppModel {
         }
     }
 
+    public var hasSportsAPIKey: Bool { credentials.secret(named: CredentialKeys.theSportsDB) != nil }
+
+    public func setSportsAPIKey(_ key: String?) throws {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try credentials.setSecret(trimmed?.isEmpty == false ? trimmed : nil, named: CredentialKeys.theSportsDB)
+        sportsSettingsRevision &+= 1
+    }
+
     // MARK: Guide
 
     public func refreshGuideIfStale() async {
@@ -394,7 +419,7 @@ public final class AppModel {
             updated.lastRefreshedAt = .now
             upsert(updated)
         }
-        await rebuild()
+        await rebuildCatalog()
 
         var counts = finished.counts
         let guideStart = ImportProgress(stage: .guide(0), counts: counts, fraction: 0.92)
@@ -404,29 +429,57 @@ public final class AppModel {
         let guideDone = ImportProgress(stage: .guide(counts.programs), counts: counts, fraction: 0.98)
         imports[id] = guideDone
         report(guideDone)
+        await waitForCurrentCatalog(includingSearch: true)
+        try Task.checkCancellation()
         report(ImportProgress(stage: .finished, counts: counts, fraction: 1, catalog: catalog, epgURLs: finished.epgURLs))
     }
 
-    /// Rebuilds the merged catalog + search index off the main actor; the latest call wins.
+    /// Rebuilds the merged catalog and waits until that snapshot is searchable.
     public func rebuild() async {
-        rebuildGeneration += 1
-        let generation = rebuildGeneration
+        await rebuildCatalog(includingSearch: true)
+    }
+
+    /// Publish the merged catalog as soon as browsing is possible. Search indexes that snapshot separately.
+    private func rebuildCatalog(includingSearch: Bool = false) async {
+        rebuildGeneration &+= 1
+        catalogTask?.cancel()
+        searchTask?.cancel()
         let sources = self.sources
         let catalogs = sources.compactMap { sourceCatalogs[$0.id] }
         let options = CatalogBuildOptions(
             hideAdult: hideAdultContent,
             hiddenCategoryIDs: Set(hiddenCategoriesBySource.values.joined())
         )
-        let built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
-        async let index = SearchIndex.build(from: built)
-        async let recommendations = RecommendationBuilder.build(for: built)
-        let (newIndex, newRecommendations) = await (index, recommendations)
-        guard generation == rebuildGeneration else { return }
+        catalogTask = Task { [weak self] in
+            let built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
+            guard !Task.isCancelled else { return }
+            let recommendations = await RecommendationBuilder.build(for: built)
+            guard !Task.isCancelled else { return }
+            self?.publish(built, recommendations: recommendations)
+        }
+        await waitForCurrentCatalog(includingSearch: includingSearch)
+    }
+
+    private func publish(_ built: Catalog, recommendations: Recommendations) {
         library.reconcileTitles(in: built)
         catalog = built
-        searchIndex = newIndex
-        self.recommendations = newRecommendations
+        searchIndex = nil
+        self.recommendations = recommendations
         catalogRevision &+= 1
+        searchTask = Task { [weak self] in
+            let index = await SearchIndex.build(from: built, recommendations: recommendations)
+            guard !Task.isCancelled else { return }
+            self?.searchIndex = index
+        }
+    }
+
+    private func waitForCurrentCatalog(includingSearch: Bool = false) async {
+        while !Task.isCancelled {
+            let generation = rebuildGeneration
+            await catalogTask?.value
+            if includingSearch { await searchTask?.value }
+            if generation == rebuildGeneration { return }
+        }
     }
 }
 

@@ -4,6 +4,8 @@ import PrismCore
 import PrismData
 import PrismDesign
 
+private let guideTimeFormat = Date.FormatStyle.dateTime.hour().minute().locale(Locale(identifier: "fr_FR"))
+
 struct LiveGuide<ChannelMenu: View>: View {
     let channels: [ChannelGroup]
     let guide: EPGGuide
@@ -18,7 +20,7 @@ struct LiveGuide<ChannelMenu: View>: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let channelWidth = min(206, max(128, geometry.size.width * 0.23))
+            let channelWidth = min(220, max(146, geometry.size.width * 0.23))
             let margin = PrismMetrics.contentMargin
             let timeWidth = max(1, geometry.size.width - 2 * margin - channelWidth)
             LiveClock(active: isPageActive) { now in
@@ -48,10 +50,18 @@ struct LiveGuide<ChannelMenu: View>: View {
     }
 
     private func controls(_ timeline: GuideTimeline) -> some View {
-        HStack(spacing: 8) {
-            GlassCircleButton(systemName: "chevron.left", size: 32, accessibilityLabel: "Programmes précédents") {
-                start = timeline.interval.start.addingTimeInterval(-timeline.interval.duration)
+        let controlSize = PrismMetrics.compactButtonSize
+        return HStack(spacing: 10) {
+            HStack(spacing: 0) {
+                guideButton("Programmes précédents", symbol: "chevron.left") {
+                    start = timeline.interval.start.addingTimeInterval(-timeline.interval.duration)
+                }
+                Divider().frame(height: 14)
+                guideButton("Programmes suivants", symbol: "chevron.right") {
+                    start = timeline.interval.end
+                }
             }
+            .prismGlass(.regular, in: .capsule)
             DatePicker("Jour du programme", selection: Binding(
                 get: { timeline.interval.start },
                 set: { start = Calendar.current.startOfDay(for: $0) }
@@ -59,24 +69,48 @@ struct LiveGuide<ChannelMenu: View>: View {
             .labelsHidden()
             .datePickerStyle(.compact)
             .environment(\.locale, Locale(identifier: "fr_FR"))
-            GlassCircleButton(systemName: "chevron.right", size: 32, accessibilityLabel: "Programmes suivants") {
-                start = timeline.interval.end
-            }
             Spacer(minLength: 10)
-            GlassCapsuleButton(title: "Maintenant", systemImage: "clock", trailingChevron: false, style: .regular) {
+            Button {
                 start = nil
+            } label: {
+                Label("Maintenant", systemImage: "clock")
+                    .font(PrismFont.capsuleButton)
+                    .foregroundStyle(start == nil ? Color.secondary : Color.primary)
+                    .padding(.horizontal, 12)
+                    .frame(height: controlSize)
+                    .prismGlass(.regular, in: .capsule, interactive: start != nil)
+                    .contentShape(.capsule)
             }
+            .buttonStyle(.pressable)
+            .disabled(start == nil)
             if isRefreshing {
-                ProgressView().controlSize(.small).frame(width: 32, height: 32)
+                ProgressView().controlSize(.small)
+                    .frame(width: controlSize, height: controlSize)
+                    .prismGlass(.regular, in: .circle)
                     .accessibilityLabel("Actualisation du guide")
             } else {
-                GlassCircleButton(systemName: "arrow.clockwise", size: 32, accessibilityLabel: "Actualiser le guide", action: onRefresh)
+                GlassCircleButton(systemName: "arrow.clockwise", size: controlSize, accessibilityLabel: "Actualiser le guide", action: onRefresh)
+                    .help("Actualiser le guide")
             }
         }
+        .frame(minHeight: controlSize)
+    }
+
+    private func guideButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: PrismMetrics.compactButtonSize, height: PrismMetrics.compactButtonSize)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.pressable)
+        .help(title)
+        .accessibilityLabel(title)
     }
 
     private func timelineHeader(_ timeline: GuideTimeline, channelWidth: CGFloat) -> some View {
-        HStack(spacing: 0) {
+        let currentLabelX = timeline.nowPosition.map { max(22, min($0, timeline.width - 22)) }
+        return HStack(spacing: 0) {
             Text("Chaînes")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -84,23 +118,27 @@ struct LiveGuide<ChannelMenu: View>: View {
             ZStack(alignment: .leading) {
                 HStack(spacing: 0) {
                     ForEach(0..<timeline.slotCount, id: \.self) { index in
-                        Text(timeline.tick(at: index), format: Self.timeFormat)
+                        let tickLabelX = CGFloat(index) * timeline.slotWidth + 22
+                        let overlapsCurrent = currentLabelX.map { abs($0 - tickLabelX) < 34 } ?? false
+                        Text(timeline.tick(at: index), format: guideTimeFormat)
                             .font(.system(size: 11, weight: .semibold).monospacedDigit())
                             .foregroundStyle(.secondary)
                             .padding(.leading, 6)
                             .frame(width: timeline.slotWidth, alignment: .leading)
+                            .opacity(overlapsCurrent ? 0 : 1)
+                            .accessibilityHidden(overlapsCurrent)
                     }
                 }
-                if let x = timeline.nowPosition {
-                    Text(timeline.now, format: Self.timeFormat)
+                if let currentLabelX {
+                    Text(timeline.now, format: guideTimeFormat)
                         .font(.system(size: 10, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.white)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 3)
                         .background(Color.accentColor, in: .capsule)
                         .fixedSize()
-                        .position(x: max(22, min(x, timeline.width - 22)), y: 15)
-                        .accessibilityLabel("Heure actuelle \(timeline.now.formatted(Self.timeFormat))")
+                        .position(x: currentLabelX, y: 15)
+                        .accessibilityLabel("Heure actuelle \(timeline.now.formatted(guideTimeFormat))")
                 }
             }
             .frame(width: timeline.width, height: 30)
@@ -113,21 +151,16 @@ struct LiveGuide<ChannelMenu: View>: View {
     private func guideRow(_ channel: ChannelGroup, timeline: GuideTimeline, channelWidth: CGFloat) -> some View {
         let id = guide.resolveEPGID(for: channel)
         let programmes = id.map { guide.programs(forEPGID: $0, in: timeline.interval) } ?? []
-        let current = id.flatMap { guide.nowAndNext(forEPGID: $0, at: timeline.now).now }
-        let archiveWindow = channel.variants.compactMap(\.catchup).map(\.days).max() ?? 0
+        let archiveWindow = channel.variants.lazy.compactMap { $0.catchup?.days }.max() ?? 0
+        func airingProgramme() -> EPGProgram? {
+            id.flatMap { guide.nowAndNext(forEPGID: $0, at: Date.now).now }
+        }
         return HStack(spacing: 0) {
-            GuideChannelButton(channel: channel) { onPlay(channel, current) }
+            GuideChannelButton(channel: channel) { onPlay(channel, airingProgramme()) }
                 .frame(width: channelWidth)
-                .contextMenu { channelMenu(channel, current) }
+                .contextMenu { channelMenu(channel, airingProgramme()) }
             ZStack(alignment: .topLeading) {
                 timelineBackground(timeline)
-                if programmes.isEmpty {
-                    Text("Programme indisponible")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 10)
-                        .frame(maxHeight: .infinity)
-                }
                 ForEach(programmes) { program in
                     let x = timeline.x(for: max(program.start, timeline.interval.start))
                     let end = timeline.x(for: min(program.end, timeline.interval.end))
@@ -151,6 +184,8 @@ struct LiveGuide<ChannelMenu: View>: View {
             }
             .frame(width: timeline.width, height: Self.rowHeight)
             .clipped()
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(programmes.isEmpty ? "Aucun programme sur cette plage horaire" : "Programmes")
         }
         .frame(height: Self.rowHeight)
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
@@ -170,7 +205,6 @@ struct LiveGuide<ChannelMenu: View>: View {
     }
 
     private static var rowHeight: CGFloat { 58 }
-    private static var timeFormat: Date.FormatStyle { .dateTime.hour().minute().locale(Locale(identifier: "fr_FR")) }
 }
 
 private struct GuideChannelButton: View {
@@ -189,10 +223,10 @@ private struct GuideChannelButton: View {
                     .accessibilityHidden(true)
                 RemoteImage(
                     url: channel.logoURL, size: CGSize(width: 31, height: 31), contentMode: .fit,
-                    placeholderSeed: channel.name, placeholderTitle: channel.name, placeholderStyle: .monogram
+                    placeholderSeed: channel.name, placeholderTitle: channel.name, placeholderStyle: .channelLogo
                 )
-                .background(.quaternary, in: .rect(cornerRadius: 6))
-                .clipShape(.rect(cornerRadius: 6))
+                .background(Color(white: channel.logoURL == nil ? 0.16 : 0.36), in: .rect(cornerRadius: PrismMetrics.smallArtworkRadius))
+                .clipShape(.rect(cornerRadius: PrismMetrics.smallArtworkRadius))
                 .accessibilityHidden(true)
                 Text(channel.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
                     .layoutPriority(1)
@@ -231,11 +265,11 @@ private struct GuideProgrammeButton: View {
         program.end <= now && now.timeIntervalSince(program.start) <= Double(archiveWindow) * 86_400
     }
     private var times: String {
-        let format = Date.FormatStyle.dateTime.hour().minute().locale(Locale(identifier: "fr_FR"))
-        return "\(program.start.formatted(format)) – \(program.end.formatted(format))"
+        "\(program.start.formatted(guideTimeFormat)) – \(program.end.formatted(guideTimeFormat))"
     }
 
     var body: some View {
+        let times = times
         Button {
             showingDetails = true
         } label: {
@@ -262,27 +296,27 @@ private struct GuideProgrammeButton: View {
             }
         }
         .buttonStyle(.plain)
-        .contentShape(.rect(cornerRadius: 7))
+        .contentShape(.rect(cornerRadius: PrismMetrics.listRowRadius))
         .onHover { hovered = $0 }
         .animation(reduceMotion ? nil : PrismMotion.quickFade, value: hovered)
         .help("\(program.title) · \(times)")
         .accessibilityLabel("\(program.title), \(times)\(isLive ? ", en direct" : "")")
         .accessibilityHint("Afficher le programme")
-        .popover(isPresented: $showingDetails, arrowEdge: .bottom) { details }
+        .popover(isPresented: $showingDetails, arrowEdge: .bottom) { details(times: times) }
     }
 
     private var surface: some View {
-        RoundedRectangle(cornerRadius: 7)
-            .fill(isLive ? Color.accentColor.opacity(hovered ? 0.29 : 0.19) : Color.primary.opacity(hovered ? 0.13 : 0.07))
+        RoundedRectangle(cornerRadius: PrismMetrics.listRowRadius)
+            .fill(Color.primary.opacity(hovered ? 0.14 : isLive ? 0.10 : 0.055))
             .overlay {
                 if isLive {
-                    RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: PrismMetrics.listRowRadius)
+                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
                 }
             }
     }
 
-    private var details: some View {
+    private func details(times: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 if isLive { LiveBadge(pulsing: false, compact: true) }

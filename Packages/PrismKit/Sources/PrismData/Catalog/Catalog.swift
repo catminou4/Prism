@@ -30,6 +30,8 @@ public struct Catalog: Sendable {
     struct Indexes: Sendable {
         var sourceIndex: [SourceID: Int] = [:]
         var categories: [String: PrismCore.Category] = [:]
+        var hasTaggedEditions = false
+        var categoryLanguages: [String: Set<String>] = [:]
         /// Category group id → (kind, index in the kind's category array).
         var categoryGroups: [String: GroupRef] = [:]
         /// Raw category id → category group id.
@@ -83,6 +85,20 @@ public struct Catalog: Sendable {
 
     public func category(_ id: String) -> PrismCore.Category? {
         indexes.categories[id]
+    }
+
+    /// Declared language labels from this edition's provider category (ISO 639-1).
+    public func providerLanguages(for variant: MediaVariant) -> Set<String> {
+        guard !indexes.categoryLanguages.isEmpty else { return [] }
+        let category: (id: String?, kind: MediaKind) = switch variant {
+        case .movie(let movie): (movie.categoryID, .movie)
+        case .series(let series): (series.categoryID, .series)
+        }
+        guard let id = category.id else { return [] }
+        // Older imports can carry the native category ID instead of the canonical reference.
+        let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
+        let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
+        return indexes.categoryLanguages[canonicalID] ?? []
     }
 
     public func categoryGroup(_ id: String) -> CategoryGroup? {

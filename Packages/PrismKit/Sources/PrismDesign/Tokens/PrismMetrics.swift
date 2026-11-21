@@ -43,12 +43,15 @@ nonisolated public enum PrismMetrics {
     public static let channelTileWidth: CGFloat = 260
 
     // MARK: Radii
-    public static let posterRadius: CGFloat = 10
     public static let wideRadius: CGFloat = 12
-    public static let tileRadius: CGFloat = 12
+    public static let posterRadius = wideRadius
+    public static let tileRadius = wideRadius
+    public static let heroRadius: CGFloat = 18
+    public static let panelRadius: CGFloat = 14
+    public static let listRowRadius: CGFloat = 10
+    public static let smallArtworkRadius: CGFloat = 8
+    public static let sourceCardRadius = panelRadius
     public static let badgeRadius: CGFloat = 3
-    public static let panelRadius: CGFloat = 12
-    public static let sourceCardRadius: CGFloat = 12
 
     // MARK: Badges
     public static let badgeHeight: CGFloat = 12

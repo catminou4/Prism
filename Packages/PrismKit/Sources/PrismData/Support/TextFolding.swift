@@ -17,14 +17,15 @@ enum TextFolding {
             return String(decoding: text.utf8.map { ($0 >= 0x41 && $0 <= 0x5A) ? $0 &+ 0x20 : $0 }, as: UTF8.self)
         }
         var folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
-        if folded.contains(where: { ligatures[$0] != nil }) {
-            folded = String(folded.flatMap { ligatures[$0] ?? String($0) })
+        if folded.contains(where: { equivalents[$0] != nil }) {
+            folded = String(folded.flatMap { equivalents[$0] ?? String($0) })
         }
         return folded.lowercased()
     }
 
-    private static let ligatures: [Character: String] = [
+    private static let equivalents: [Character: String] = [
         "œ": "oe", "Œ": "oe", "æ": "ae", "Æ": "ae", "ß": "ss", "ø": "o", "Ø": "o", "ł": "l", "Ł": "l", "đ": "d", "Đ": "d",
+        "’": "'", "‘": "'", "ʼ": "'", "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-", "…": "...",
     ]
 
     /// Splits folded text into words (ASCII alphanumerics and any non-ASCII byte are word characters).

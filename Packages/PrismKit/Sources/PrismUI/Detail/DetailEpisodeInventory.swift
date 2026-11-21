@@ -10,6 +10,8 @@ nonisolated struct DetailEpisodeInventory: Sendable {
     let episodesByID: [ContentID: Episode]
 
     @concurrent static func build(edition: TitleEdition, detail: SeriesDetail) async -> Self {
+        var detail = detail
+        detail.plot = ProviderSynopsis.cleaned(detail.plot)
         let groups = Dictionary(grouping: detail.seasons, by: \.number)
         let seasons = groups.keys.sorted().compactMap { number -> Season? in
             guard let parts = groups[number], var season = parts.first else { return nil }

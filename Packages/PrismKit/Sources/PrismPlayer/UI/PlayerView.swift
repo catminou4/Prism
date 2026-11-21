@@ -233,7 +233,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 .onHover { controller.setHoveringControls($0) }
         }
         .overlay(alignment: .top) {
-            if controller.isLive, let secondary = controller.secondaryTitle, !secondary.isEmpty {
+            if controller.isLive, !hasInfoAccessory, let secondary = controller.secondaryTitle, !secondary.isEmpty {
                 Text(secondary)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white.opacity(0.82))
@@ -280,26 +280,28 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
 
     private var centerCluster: some View {
         let showsSkip = controller.canSeek
-        return HStack(spacing: PlayerMetrics.centerSpacing) {
-            if showsSkip {
-                skipButton(-10)
+        return GlassEffectContainer(spacing: 8) {
+            HStack(spacing: PlayerMetrics.centerSpacing) {
+                if showsSkip {
+                    skipButton(-10)
+                }
+                Button {
+                    controller.togglePlayPause()
+                } label: {
+                    Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: PlayerMetrics.playSymbolSize, weight: .medium))
+                        .contentTransition(.symbolEffect(.replace))
+                        .offset(x: controller.isPlaying ? 0 : 1.5)
+                }
+                .buttonStyle(PlayerTransportButtonStyle(diameter: PlayerMetrics.playDiameter))
+                .help(controller.isPlaying ? "Pause (espace)" : "Lecture (espace)")
+                .accessibilityLabel(controller.isPlaying ? "Pause" : "Lecture")
+                if showsSkip {
+                    skipButton(10)
+                }
             }
-            Button {
-                controller.togglePlayPause()
-            } label: {
-                Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: PlayerMetrics.playSymbolSize, weight: .medium))
-                    .contentTransition(.symbolEffect(.replace))
-                    .offset(x: controller.isPlaying ? 0 : 1.5)
-            }
-            .buttonStyle(PlayerTransportButtonStyle(diameter: PlayerMetrics.playDiameter, prominent: true))
-            .help(controller.isPlaying ? "Pause (espace)" : "Lecture (espace)")
-            .accessibilityLabel(controller.isPlaying ? "Pause" : "Lecture")
-            if showsSkip {
-                skipButton(10)
-            }
+            .onHover { controller.setHoveringControls($0) }
         }
-        .onHover { controller.setHoveringControls($0) }
     }
 
     private func skipButton(_ seconds: Int) -> some View {
@@ -452,8 +454,8 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
             sidePanel
                 .frame(width: PlayerMetrics.sidePanelWidth)
                 .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .playerGlass(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: PlayerMetrics.panelRadius, style: .continuous))
+                .playerGlass(RoundedRectangle(cornerRadius: PlayerMetrics.panelRadius, style: .continuous))
                 // Between the top bar and the bottom-right capsule: every control stays reachable.
                 .padding(.top, topInset + PlayerMetrics.capsuleHeight + 12)
                 .padding(
