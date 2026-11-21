@@ -21,20 +21,29 @@ struct AppSnapshotTests {
             }
         })
         let navigation = NavigationModel()
+        let demo = AppModel(directories: .temporary("prism-snapshot-demo"), credentials: InMemoryCredentialStore(),
+                            library: .inMemory(), isEphemeral: true)
+        for try await _ in demo.importDemo() {}
 
         try await write(OnboardingView().environment(app), label: "onboarding", size: CGSize(width: 1320, height: 820), settle: .seconds(2))
         try await write(
-            PrismRootView(playback: PrismPlaybackSession()).environment(app),
+            LibraryShell().environment(demo),
             label: "home", size: CGSize(width: 1440, height: 900), scheme: .light
         )
         try await write(
-            PrismRootView(playback: PrismPlaybackSession()).environment(app),
+            LibraryShell().environment(demo),
             label: "home-dark", size: CGSize(width: 1440, height: 900)
         )
         try await write(
-            BrowseScreen(kind: nil).environment(app).environment(navigation).environment(SportsPresentation()),
+            BrowseScreen(kind: nil).environment(demo).environment(navigation).environment(SportsPresentation()),
             label: "home-content", size: CGSize(width: 1210, height: 900)
         )
+        for (kind, label) in [(MediaKind.movie, "films"), (.series, "series")] {
+            try await write(
+                BrowseScreen(kind: kind).environment(demo).environment(navigation),
+                label: label, size: CGSize(width: 1170, height: 870), scheme: .light
+            )
+        }
         try await write(
             TitleDetailView(titleID: movie.id).environment(app).environment(navigation),
             label: "film", size: CGSize(width: 1170, height: 870)

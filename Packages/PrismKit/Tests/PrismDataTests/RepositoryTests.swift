@@ -332,6 +332,10 @@ struct RepositoryTests {
             if path.hasSuffix("/movie/949") {
                 return .json(#"{"id":949,"title":"Heat","overview":"Un braqueur et un flic.","runtime":170,"release_date":"1995-12-15","vote_average":7.9,"genres":[{"id":28,"name":"Action"}],"credits":{"cast":[{"id":1158,"name":"Al Pacino","character":"Vincent Hanna","profile_path":"/a.jpg"}],"crew":[{"id":638,"name":"Michael Mann","job":"Director"}]},"images":{"backdrops":[],"logos":[],"posters":[]},"videos":{"results":[]},"release_dates":{"results":[]}}"#)
             }
+            if path == "/3/trending/movie/week" {
+                Thread.sleep(forTimeInterval: 0.05)
+                return .json(#"{"results":[{"id":949,"title":"Heat","release_date":"1995-12-15","original_language":"en"}]}"#)
+            }
             return .text("", status: 404)
         }
         defer { StubURLProtocol.unregister(host: host) }
@@ -357,10 +361,19 @@ struct RepositoryTests {
         #expect(await repository.metadata(for: unknown) == nil)
         #expect(StubURLProtocol.requestCount(host: host) == afterMiss, "negative result cached")
 
+        async let firstTrend = repository.weeklyTrending(for: .movie)
+        async let secondTrend = repository.weeklyTrending(for: .movie)
+        let (chart, sharedChart) = await (firstTrend, secondTrend)
+        #expect(chart.map(\.id) == [949])
+        #expect(sharedChart == chart)
+        #expect(await repository.weeklyTrending(for: .movie) == chart)
+        #expect(StubURLProtocol.requestCount(host: host) == afterMiss + 1, "one weekly chart request")
+
         try credentials.setSecret(nil, named: CredentialKeys.tmdb)
         await repository.reload()
         #expect(await repository.isEnabled == false)
         #expect(await repository.metadata(for: title) == nil)
+        #expect(await repository.weeklyTrending(for: .movie).isEmpty)
     }
 
     @Test func m3uDetailsComeFromTheCatalog() async throws {

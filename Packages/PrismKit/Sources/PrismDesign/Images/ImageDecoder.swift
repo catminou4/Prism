@@ -20,22 +20,28 @@ nonisolated enum ImageDecoder {
     }
 
     /// Decodes and downsamples `data` so the result covers (`fill`) or fits in (`fit`) `target` pixels.
-    @concurrent static func decode(_ data: Data, target: CGSize, fill: Bool) async -> CGImage? {
+    @concurrent static func decode(
+        _ data: Data, target: CGSize, fitting: ImagePipeline.Fitting, fillsForBlur: Bool
+    ) async -> CGImage? {
         guard !Task.isCancelled,
               let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
         else { return nil }
-        return thumbnail(source, target: target, fill: fill)
+        return thumbnail(source, target: target, fitting: fitting, fillsForBlur: fillsForBlur)
     }
 
-    /// Same as `decode(_:target:fill:)` reading straight from a local file.
-    @concurrent static func decode(fileURL: URL, target: CGSize, fill: Bool) async -> CGImage? {
+    /// Reads straight from a local file.
+    @concurrent static func decode(
+        fileURL: URL, target: CGSize, fitting: ImagePipeline.Fitting, fillsForBlur: Bool
+    ) async -> CGImage? {
         guard !Task.isCancelled,
               let source = CGImageSourceCreateWithURL(fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
         else { return nil }
-        return thumbnail(source, target: target, fill: fill)
+        return thumbnail(source, target: target, fitting: fitting, fillsForBlur: fillsForBlur)
     }
 
-    private static func thumbnail(_ source: CGImageSource, target: CGSize, fill: Bool) -> CGImage? {
+    private static func thumbnail(
+        _ source: CGImageSource, target: CGSize, fitting: ImagePipeline.Fitting, fillsForBlur: Bool
+    ) -> CGImage? {
         guard CGImageSourceGetCount(source) > 0 else { return nil }
         var maxPixel = max(target.width, target.height)
         if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -43,11 +49,15 @@ nonisolated enum ImageDecoder {
            let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
            width > 0, height > 0, target.width > 0, target.height > 0 {
             var w = width, h = height
-            if let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue, orientation >= 5 {
+            if let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue, (5...8).contains(orientation) {
                 swap(&w, &h)
             }
+            guard fitting.acceptsSource(width: w, height: h) else { return nil }
+            let fill = fitting.fillsTarget || fillsForBlur
             let scale = fill ? max(target.width / w, target.height / h) : min(target.width / w, target.height / h)
             maxPixel = min(max(w, h), (max(w, h) * scale).rounded(.up))
+        } else if fitting.needsSourceDimensions {
+            return nil
         }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,

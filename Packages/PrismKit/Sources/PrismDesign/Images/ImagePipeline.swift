@@ -17,6 +17,29 @@ public actor ImagePipeline {
         case fill
         /// The decoded image fits inside the target (aspect fit / max pixel size).
         case fit
+        /// A backdrop must be landscape and large enough for a hero.
+        case landscapeFill
+        /// A standalone poster stays portrait and is displayed without cropping.
+        case portraitFit
+
+        nonisolated var fillsTarget: Bool {
+            self == .fill || self == .landscapeFill
+        }
+
+        nonisolated func acceptsSource(width: CGFloat, height: CGFloat) -> Bool {
+            switch self {
+            case .landscapeFill:
+                width >= 640 && height >= 300 && (1.30...3.25).contains(width / height)
+            case .portraitFit:
+                width >= 120 && height >= 180 && (0.42...0.86).contains(width / height)
+            case .fill, .fit:
+                true
+            }
+        }
+
+        nonisolated var needsSourceDimensions: Bool {
+            self == .landscapeFill || self == .portraitFit
+        }
     }
 
     nonisolated struct Key: Hashable, Sendable {
@@ -155,14 +178,13 @@ public actor ImagePipeline {
         // Blurred variants are always small: they are displayed upscaled.
         let longest = blurRadius > 0 ? 96 : max(pixelSize.width, pixelSize.height)
         // Fill targets are bucketed on both sides' aspect so 2:3 and 16:9 slots don't collide.
-        let aspectTag = fitting == .fill && pixelSize.height > 0 ? Int((pixelSize.width / pixelSize.height * 8).rounded()) : 0
+        let aspectTag = fitting.fillsTarget && pixelSize.height > 0 ? Int((pixelSize.width / pixelSize.height * 8).rounded()) : 0
         return Key(url: url, bucket: bucket(for: longest) * 100 + aspectTag, fitting: fitting, blur: Int(blurRadius.rounded()))
     }
 
     private func makeTask(for key: Key, pixelSize: CGSize) -> Task<CGImage?, Never> {
         let memory = memory
         let blur = CGFloat(key.blur)
-        let fill = key.fitting == .fill
         // Target in pixels, rounded up to the bucket so cached images serve slightly bigger slots.
         let longest = max(pixelSize.width, pixelSize.height)
         let bucketScale = blur > 0 ? 1 : CGFloat(key.bucket / 100) / max(longest, 1)
@@ -172,9 +194,9 @@ public actor ImagePipeline {
         return Task.detached(priority: .userInitiated) {
             var image: CGImage?
             if key.url.isFileURL {
-                image = await ImageDecoder.decode(fileURL: key.url, target: target, fill: fill || blur > 0)
+                image = await ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             } else if let data = await self.sharedData(for: key.url) {
-                image = await ImageDecoder.decode(data, target: target, fill: fill || blur > 0)
+                image = await ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             }
             if let decoded = image, blur > 0 {
                 image = await ImageDecoder.blurred(decoded, radius: blur * 0.25)

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import PrismCore
 import PrismData
 import PrismDesign
@@ -276,14 +277,14 @@ struct PrismSettingsView: View {
                     }
                     .pickerStyle(.segmented)
                 } header: {
-                    Text("Recommandations de l’accueil")
+                    Text("Recommandations")
                 } footer: {
-                    Text("Langues audio des films et séries suggérés à l’accueil.")
+                    Text("Langues audio des titres suggérés dans Accueil, Films et Séries.")
                 }
                 Section("Métadonnées") {
                     SecureField("Clé TMDB", text: $metadataKey)
                     Button("Enregistrer la clé") { app.setTMDBKey(metadataKey) }
-                    Text("La clé enrichit les fiches de vos films et séries avec les visuels et les informations de TMDB.")
+                    Text("La clé enrichit les fiches et affiche les tendances TMDB disponibles dans vos sources.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -300,6 +301,25 @@ struct PrismSettingsView: View {
                     Text("Scores sportifs")
                 } footer: {
                     Text("Pour suivre les scores en direct, ajoutez une clé TheSportsDB Premium.")
+                }
+                Section("Crédits") {
+                    if let website = URL(string: "https://www.themoviedb.org") {
+                        Link(destination: website) {
+                            if let file = Bundle.module.url(forResource: "TMDBLogo", withExtension: "svg"),
+                               let logo = NSImage(contentsOf: file) {
+                                Image(nsImage: logo)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 110)
+                                    .accessibilityLabel("TMDB")
+                            } else {
+                                Text("TMDB")
+                            }
+                        }
+                    }
+                    Text(verbatim: "This product uses the TMDB API but is not endorsed or certified by TMDB.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)

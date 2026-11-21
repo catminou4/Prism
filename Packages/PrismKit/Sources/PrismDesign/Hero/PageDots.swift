@@ -9,6 +9,7 @@ public struct PageDots: View {
     private let dotSize: CGFloat
     private let spacing: CGFloat
     private let onSelect: ((Int) -> Void)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(count: Int, index: Int, maxVisible: Int = 8, dotSize: CGFloat = 6, spacing: CGFloat = 10, onSelect: ((Int) -> Void)? = nil) {
         self.count = max(count, 0)
@@ -43,7 +44,7 @@ public struct PageDots: View {
         .offset(x: -CGFloat(start) * pitch)
         .frame(width: CGFloat(visible) * pitch - spacing, alignment: .leading)
         .clipped()
-        .animation(PrismMotion.standard, value: index)
+        .animation(PrismMotion.respecting(reduceMotion, PrismMotion.standard), value: index)
         .accessibilityElement()
         .accessibilityLabel("Page \(index + 1) sur \(count)")
         .accessibilityAdjustableAction { direction in

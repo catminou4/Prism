@@ -2,13 +2,15 @@
 
 Lecteur IPTV natif en français pour macOS 26 et ultérieur. Prism réunit les chaînes, films et séries de vos listes M3U et comptes Xtream Codes. Il lit les programmes de vos sources et inclut une démo pour essayer l’interface.
 
-- **Accueil** · Reprise de lecture, sélection française, incontournables américains et découvertes internationales. Le menu sur l’accueil permet de choisir les recommandations en français, en anglais ou dans les deux langues.
-- **Fiches** · Une entrée par œuvre lorsque les données permettent le rapprochement. Au lancement de la lecture, choisissez parmi les versions disponibles pour ce titre ou cet épisode. Le lecteur propose également les pistes audio et les sous-titres signalés par le flux.
+- **Accueil, Films et Séries** · Reprise de lecture, sélections éditoriales et recommandations adaptées à Ma liste et à l’historique. Le menu permet de choisir le français, l’anglais ou les deux. Balayez le grand visuel horizontalement pour changer de titre.
+- **Fiches** · Une entrée par œuvre lorsque les données permettent le rapprochement, avec épisodes, titres similaires, distribution et notes selon les données disponibles. Au lancement de la lecture, choisissez parmi les versions disponibles pour ce titre ou cet épisode.
 - **Direct** · Guide XMLTV, favoris, changement de chaîne au clavier, source préférée et replay lorsqu’une archive est disponible.
 - **Sport** · Affiches et horaires dans l’accueil et dans une rubrique dédiée. Calendrier et derniers résultats de la Ligue des champions, de la Ligue 1, de la NBA et de la boxe, avec un accès aux diffusions identifiées dans le guide IPTV.
 - **Sources** · Saisie ou collage des codes Xtream, listes M3U et réglages XMLTV. Le filtre d’une source permet de masquer des catégories avant le regroupement du catalogue.
 - **Bibliothèque** · Ma liste, historique et reprise, conservés sur le Mac. Le lecteur propose l’épisode suivant lorsqu’il est disponible dans l’édition en cours.
-- **Lecture** · Fenêtre dédiée, AVFoundation et VLCKit, avec repli automatique. L’enrichissement des fiches par TMDB est facultatif et se configure avec votre clé.
+- **Lecture** · Fenêtre dédiée, AVFoundation et VLCKit, avec repli automatique et sélection des pistes audio et sous-titres signalés par le flux. L’enrichissement des fiches par TMDB est facultatif et se configure avec votre clé.
+
+Avec une clé TMDB dans les réglages, Films et Séries peuvent afficher le classement hebdomadaire TMDB des titres retrouvés dans vos sources. Si TMDB ne fournit pas de portraits pour une série, Prism recherche le nom de la série et vérifie son année de sortie dans TVmaze. Les photos et les rôles apparaissent lorsqu’une correspondance unique existe. Le classement de vos sources et le calcul par genre utilisent les données locales. [API TVmaze](https://www.tvmaze.com/api)
 
 ## Données sportives
 

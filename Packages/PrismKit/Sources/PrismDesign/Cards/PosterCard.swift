@@ -8,6 +8,7 @@ public struct PosterCard<MenuContent: View>: View {
     private let subtitle: String?
     private let showsTitle: Bool
     private let badge: String?
+    private let rank: Int?
     private let progress: Double?
     private let width: CGFloat?
     private let action: (() -> Void)?
@@ -21,6 +22,7 @@ public struct PosterCard<MenuContent: View>: View {
         subtitle: String? = nil,
         showsTitle: Bool = false,
         badge: String? = nil,
+        rank: Int? = nil,
         progress: Double? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
@@ -32,6 +34,7 @@ public struct PosterCard<MenuContent: View>: View {
         self.subtitle = subtitle
         self.showsTitle = showsTitle
         self.badge = badge
+        self.rank = rank
         self.progress = progress
         self.width = width
         self.action = action
@@ -43,7 +46,8 @@ public struct PosterCard<MenuContent: View>: View {
     public var body: some View {
         let w = resolvedWidth
         let artworkSize = CGSize(width: w, height: (w / PrismMetrics.posterAspectRatio).rounded())
-        CardContainer(accessibilityLabel: Text([title, subtitle].compactMap { $0 }.joined(separator: ", ")), action: action, menu: menu) { _ in
+        let label = [title, subtitle, rank.map { "Rang \($0)" }].compactMap { $0 }.joined(separator: ", ")
+        CardContainer(accessibilityLabel: Text(label), action: action, menu: menu) { _ in
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkSurface(radius: PrismMetrics.posterRadius) {
                     RemoteImage(url: imageURL, size: artworkSize, placeholderSeed: seed, placeholderTitle: title)
@@ -52,6 +56,17 @@ public struct PosterCard<MenuContent: View>: View {
                                 MediaBadge(badge, style: .filled)
                                     .foregroundStyle(.white.opacity(0.9))
                                     .padding(8)
+                            }
+                        }
+                        .overlay(alignment: .topLeading) {
+                            if let rank {
+                                Text(rank, format: .number)
+                                    .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
+                                    .foregroundStyle(.white)
+                                    .frame(minWidth: 34, minHeight: 30)
+                                    .background(.black.opacity(0.64), in: .capsule)
+                                    .padding(8)
+                                    .accessibilityHidden(true)
                             }
                         }
                         .overlay(alignment: .bottom) {
@@ -91,11 +106,15 @@ extension PosterCard where MenuContent == EmptyView {
         subtitle: String? = nil,
         showsTitle: Bool = false,
         badge: String? = nil,
+        rank: Int? = nil,
         progress: Double? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil
     ) {
-        self.init(imageURL: imageURL, seed: seed, title: title, subtitle: subtitle, showsTitle: showsTitle, badge: badge, progress: progress, width: width, action: action) { EmptyView() }
+        self.init(
+            imageURL: imageURL, seed: seed, title: title, subtitle: subtitle, showsTitle: showsTitle,
+            badge: badge, rank: rank, progress: progress, width: width, action: action
+        ) { EmptyView() }
     }
 }
 

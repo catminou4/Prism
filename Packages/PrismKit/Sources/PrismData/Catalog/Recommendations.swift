@@ -22,6 +22,7 @@ public struct Recommendations: Sendable {
     struct EditorialCopy: Sendable {
         let title: String
         let plot: String?
+        let originalLanguage: HomeAudioLanguage?
     }
 
     public func selection(for languages: Set<HomeAudioLanguage>) -> RecommendationSelection {
@@ -35,6 +36,31 @@ public struct Recommendations: Sendable {
         result.title = copy.title
         result.plot = copy.plot
         return result
+    }
+
+    public func matchesAudioLanguage(_ media: MediaTitle, in catalog: Catalog, languages: Set<HomeAudioLanguage>) -> Bool {
+        RecommendationBuilder.availableAudio(for: media, original: editorialCopy[media.id]?.originalLanguage, catalog: catalog)
+            .isDisjoint(with: languages.isEmpty ? HomeAudioLanguage.defaults : languages) == false
+    }
+
+    /// Prefer known official names, then the clean name of an edition with matching audio.
+    public func localizedName(
+        for media: MediaTitle, in catalog: Catalog, languages: Set<HomeAudioLanguage>
+    ) -> String? {
+        let languages = languages.isEmpty ? HomeAudioLanguage.defaults : languages
+        if let editorial = editorialCopy[media.id], matchesAudioLanguage(media, in: catalog, languages: languages),
+           RecommendationBuilder.hasLatinTitle(editorial.title) {
+            return editorial.title
+        }
+        var englishName: String?
+        for variant in media.variants {
+            let audio = RecommendationBuilder.availableAudio(for: variant, original: nil, catalog: catalog)
+            guard !audio.isDisjoint(with: languages),
+                  RecommendationBuilder.hasLatinTitle(variant.title) else { continue }
+            if languages.contains(.french), audio.contains(.french) { return variant.title }
+            if englishName == nil { englishName = variant.title }
+        }
+        return englishName
     }
 }
 
@@ -52,7 +78,9 @@ public enum RecommendationBuilder {
         let editorial = EditorialSelection.shelves.map { shelf in
             shelf.map { entry in
                 entry.matches(in: catalog).map { title in
-                    let copy = editorialCopy[title.id] ?? .init(title: entry.name, plot: homePlot(for: title))
+                    let copy = editorialCopy[title.id] ?? .init(
+                        title: entry.name, plot: homePlot(for: title), originalLanguage: entry.originalLanguage
+                    )
                     editorialCopy[title.id] = copy
                     var item = title
                     item.title = copy.title
@@ -146,44 +174,46 @@ public enum RecommendationBuilder {
     ]
     private static let originalTags: Set<String> = ["VO", "VOST", "VOSTFR", "VOSTA", "SUBFRENCH"]
 
-    private static func availableAudio(
+    static func availableAudio(
         for item: MediaTitle, original: HomeAudioLanguage?, catalog: Catalog
     ) -> Set<HomeAudioLanguage> {
-        let hasCategoryEvidence = !catalog.indexes.categoryLanguages.isEmpty
         var result: Set<HomeAudioLanguage> = []
         for variant in item.variants {
-            let tags = variant.tags
-            if tags.isEmpty, !hasCategoryEvidence {
-                if let original { result.insert(original) }
-                continue
-            }
-            let isOriginal = tags.contains(where: originalTags.contains)
-            let hasFrenchTag = tags.contains(where: frenchTags.contains)
-            let hasEnglishTag = tags.contains(where: englishTags.contains)
-            if hasFrenchTag && (!isOriginal || tags.contains(where: frenchDubs.contains)) {
-                result.insert(.french)
-            }
-            if hasEnglishTag {
-                result.insert(.english)
-            }
-            if !hasFrenchTag, !hasEnglishTag {
-                if tags.contains(where: otherLanguageTags.contains) { continue }
-                if isOriginal {
-                    if let original { result.insert(original) }
-                } else {
-                    let languages = catalog.providerLanguages(for: variant)
-                    result.formUnion(languages.compactMap(HomeAudioLanguage.init(rawValue:)))
-                    if languages.isEmpty, let original { result.insert(original) }
-                }
-            } else if isOriginal, let original {
-                result.insert(original)
-            }
+            result.formUnion(availableAudio(for: variant, original: original, catalog: catalog))
             if result == HomeAudioLanguage.defaults { break }
         }
         return result
     }
 
-    private static func hasLatinTitle(_ title: String) -> Bool {
+    static func availableAudio(
+        for variant: MediaVariant, original: HomeAudioLanguage?, catalog: Catalog
+    ) -> Set<HomeAudioLanguage> {
+        let tags = variant.tags
+        if tags.isEmpty, catalog.indexes.categoryLanguages.isEmpty {
+            return if let original { [original] } else { [] }
+        }
+        var result: Set<HomeAudioLanguage> = []
+        let isOriginal = tags.contains(where: originalTags.contains)
+        let hasFrenchTag = tags.contains(where: frenchTags.contains)
+        let hasEnglishTag = tags.contains(where: englishTags.contains)
+        if hasFrenchTag && (!isOriginal || tags.contains(where: frenchDubs.contains)) { result.insert(.french) }
+        if hasEnglishTag { result.insert(.english) }
+        if !hasFrenchTag, !hasEnglishTag {
+            if tags.contains(where: otherLanguageTags.contains) { return [] }
+            if isOriginal {
+                if let original { result.insert(original) }
+            } else {
+                let languages = catalog.providerLanguages(for: variant)
+                result.formUnion(languages.compactMap(HomeAudioLanguage.init(rawValue:)))
+                if languages.isEmpty, let original { result.insert(original) }
+            }
+        } else if isOriginal, let original {
+            result.insert(original)
+        }
+        return result
+    }
+
+    static func hasLatinTitle(_ title: String) -> Bool {
         var hasLetters = false
         for scalar in title.unicodeScalars where scalar.properties.isAlphabetic {
             switch scalar.value {

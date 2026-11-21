@@ -28,7 +28,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     private let onHeaderTap: (() -> Void)?
     private let card: (Item) -> Card
 
-    @State private var position = ScrollPosition(edge: .leading)
+    @State private var position = ScrollPosition()
     @State private var viewport = ShelfViewport()
     @State private var scrollAvailability = ScrollAvailability()
     @State private var measuredWidth: CGFloat = 0
@@ -98,6 +98,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .fixedSize(horizontal: false, vertical: true)
         .scrollIndicators(.hidden)
         .contentMargins(.horizontal, margin, for: .scrollContent)
+        .defaultScrollAnchor(.leading, for: .initialOffset)
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
         .scrollPosition($position)
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in

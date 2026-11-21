@@ -11,50 +11,63 @@ struct BrowseScreen: View {
     @State private var selectedHero: Int? = 0
     let kind: MediaKind?
 
-    private func hero(in selection: RecommendationSelection) -> [MediaTitle] {
+    private func hero(in selection: RecommendationSelection, discovery: DiscoveryShelves?) -> [MediaTitle] {
         guard let kind else { return Array(selection.highlights.prefix(5)) }
-        let editorial = selection.highlights.lazy.filter { $0.kind == kind }
-        if !editorial.isEmpty { return Array(editorial.prefix(5)) }
-        return app.catalog.featured(limit: 16).lazy.filter { $0.kind == kind }.prefix(5).map(app.recommendations.named)
+        let editorial = [selection.french, selection.american, selection.discoveries].map { shelf in
+            shelf.filter { $0.kind == kind && $0.backdropURL != nil }
+        }
+        let leads = (0..<3).flatMap { index in
+            editorial.compactMap { $0.indices.contains(index) ? $0[index] : nil }
+        }
+        let candidates = (discovery?.trending ?? []) + leads
+            + (discovery?.recommended ?? []) + (discovery?.localHighlights ?? [])
+        var seen: Set<TitleID> = []
+        var result: [MediaTitle] = []
+        for title in candidates where seen.insert(title.id).inserted {
+            guard title.backdropURL != nil || title.posterURL != nil else { continue }
+            result.append(title)
+            if result.count == 5 { break }
+        }
+        return result
     }
 
     var body: some View {
+        let request = isActive ? kind.map { app.discoveryRequest(for: $0) } : nil
         GeometryReader { geometry in
             let selection = app.recommendations.selection(for: app.homeAudioLanguages)
-            let featured = hero(in: selection)
-            let spotlightHeight = max(322, min(500, geometry.size.height * 0.55))
-            let artworkSize = CGSize(width: max(1, geometry.size.width - 16), height: spotlightHeight)
+            let discovery = kind.map { app.discovery(for: $0) }
+            let featured = hero(in: selection, discovery: discovery)
+            let spotlightHeight = min(610, max(356, geometry.size.height * 0.60, geometry.size.width * 0.37))
+            let artworkSize = CGSize(width: max(1, geometry.size.width - 24), height: spotlightHeight)
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 26) {
+                LazyVStack(alignment: .leading, spacing: 30) {
                     if !featured.isEmpty {
                         HeroCarousel(
                             items: featured,
-                            interval: isActive ? 9 : 0,
+                            interval: isActive ? 12 : 0,
                             height: spotlightHeight,
-                            index: $selectedHero
+                            index: $selectedHero,
+                            isInteractive: isActive
                         ) { title in
                             Spotlight(title: title, size: artworkSize)
                         }
                         .clipShape(.rect(cornerRadius: PrismMetrics.heroRadius))
                         .overlay(alignment: .topTrailing) {
-                            if kind == nil {
-                                HomeLanguageMenu()
-                                    .environment(\.colorScheme, .dark)
-                                    .padding(.top, 48)
-                                    .padding(.trailing, 16)
-                            }
+                            browseControls(style: .dark)
+                                .environment(\.colorScheme, .dark)
+                                .padding(.top, 47)
+                                .padding(.trailing, 21)
                         }
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 12)
                         .task(id: nextArtwork(in: featured, size: artworkSize)) {
                             guard isActive, let next = nextArtwork(in: featured, size: artworkSize) else { return }
-                            _ = await ImagePipeline.shared.image(for: next.url, pixelSize: next.size, fitting: .fill)
+                            _ = await ImagePipeline.shared.image(for: next.url, pixelSize: next.size, fitting: .landscapeFill)
                         }
                     } else {
                         HStack {
                             BrowseHeading(title: kind.map(\.sectionTitle) ?? "Accueil")
-                            if kind == nil {
-                                HomeLanguageMenu().padding(.trailing, PrismMetrics.contentMargin)
-                            }
+                            browseControls(style: .regular)
+                                .padding(.trailing, PrismMetrics.contentMargin)
                         }
                         .padding(.top, 20)
                     }
@@ -70,39 +83,10 @@ struct BrowseScreen: View {
                         }
                     }
 
-                    if kind == nil {
-                        SportsHomeShelf()
-                    }
-                    editorialShelf("Le cinéma et les séries d’ici", titles: selection.french)
-                    editorialShelf("Les incontournables américains", titles: selection.american)
-                    editorialShelf("À découvrir", titles: selection.discoveries)
-                    if kind == nil, !selection.hasEditorialTitles {
-                        editorialShelf("À regarder dans vos sources", titles: selection.wellRated)
-                    }
-                    if kind == nil, featured.isEmpty, !app.catalog.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Aucune recommandation pour ces langues").font(.headline)
-                            Text("Vous pouvez retrouver le catalogue complet dans Films, Séries et Rechercher.")
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, PrismMetrics.contentMargin)
-                    }
-
                     if let kind {
-                        let categories = app.catalog.categoryGroups(kind)
-                        if !categories.isEmpty {
-                            Shelf(title: "Explorer les catégories", items: categories, sizing: .fixed(160), onHeaderTap: {
-                                navigation.push(.collection(.all(kind)))
-                            }) { category in
-                                CategoryShortcut(category: category)
-                            }
-                        }
-                        TitleShelf(title: "Ajouts récents", items: app.catalog.recentlyAdded(kind, limit: 22), action: {
-                            navigation.push(.collection(.recentlyAdded(kind)))
-                        })
-                        TitleShelf(title: "Les mieux notés", items: app.catalog.topRated(kind, limit: 22), action: {
-                            navigation.push(.collection(.topRated(kind)))
-                        })
+                        sectionShelves(kind: kind, selection: selection, discovery: discovery)
+                    } else {
+                        homeShelves(selection: selection)
                     }
                     if app.catalog.isEmpty {
                         ContentUnavailableView("Catalogue vide", systemImage: "rectangle.stack",
@@ -116,10 +100,61 @@ struct BrowseScreen: View {
             .ignoresSafeArea(.container, edges: featured.isEmpty ? [] : .top)
             .onChange(of: app.homeAudioLanguages) { _, _ in selectedHero = 0 }
         }
+        .task(id: request) {
+            if let request { await app.refreshDiscovery(request) }
+        }
     }
 
-    private func editorialShelf(_ title: String, titles: [MediaTitle]) -> some View {
-        TitleShelf(title: title, items: titles.filter { kind == nil || $0.kind == kind })
+    private func browseControls(style: PrismGlassStyle) -> some View {
+        HStack(spacing: 8) {
+            if let kind { BrowseCatalogMenu(kind: kind, style: style) }
+            HomeLanguageMenu(style: style)
+        }
+    }
+
+    @ViewBuilder private func homeShelves(selection: RecommendationSelection) -> some View {
+        SportsHomeShelf()
+        TitleShelf(title: "Le cinéma et les séries d’ici", items: selection.french)
+        TitleShelf(title: "Les incontournables américains", items: selection.american)
+        TitleShelf(title: "À découvrir", items: selection.discoveries)
+        if !selection.hasEditorialTitles {
+            TitleShelf(title: "À regarder dans vos sources", items: selection.wellRated)
+        }
+        if selection.highlights.isEmpty, !app.catalog.isEmpty {
+            ContentUnavailableView(
+                "Aucune recommandation pour ces langues",
+                systemImage: "character.bubble",
+                description: Text("Parcourez le catalogue dans Films, Séries ou Rechercher.")
+            )
+        }
+    }
+
+    @ViewBuilder private func sectionShelves(
+        kind: MediaKind, selection: RecommendationSelection, discovery: DiscoveryShelves?
+    ) -> some View {
+        let trending = discovery?.trending ?? []
+        let recentPicks = discovery?.localHighlights ?? []
+        let recommended = discovery?.recommended ?? []
+        let suggested = Set((trending + recommended + recentPicks).map(\.id))
+        let curated = (selection.french + selection.american + selection.discoveries).filter {
+            $0.kind == kind && !suggested.contains($0.id)
+        }
+        if !trending.isEmpty {
+            RankedTitleShelf(items: trending)
+        }
+        TitleShelf(title: "Recommandés pour vous", items: recommended)
+        TitleShelf(title: "En vue dans vos sources", items: recentPicks)
+        TitleShelf(title: "Sélection de Prism", items: curated)
+
+        let categories = app.catalog.categoryGroups(kind)
+        if !categories.isEmpty {
+            Shelf(title: "Explorer les catégories", items: categories, sizing: .fixed(158)) { category in
+                CategoryShortcut(category: category)
+            }
+        }
+        TitleShelf(title: "Ajouts dans vos sources", items: app.catalog.recentlyAdded(kind, limit: 18), action: {
+            navigation.push(.collection(.recentlyAdded(kind)))
+        })
     }
 
     private struct Preload: Equatable {
@@ -137,6 +172,7 @@ struct BrowseScreen: View {
 
 private struct HomeLanguageMenu: View {
     @Environment(AppModel.self) private var app
+    let style: PrismGlassStyle
 
     private var languageLabel: String {
         switch app.homeAudioLanguages {
@@ -158,15 +194,39 @@ private struct HomeLanguageMenu: View {
             }
             .pickerStyle(.inline)
         } label: {
-            Label(languageLabel, systemImage: "character.bubble")
-                .font(.subheadline.weight(.medium))
+            GlassCapsuleLabel(title: languageLabel, systemImage: "character.bubble")
         }
         .menuStyle(.button)
-        .buttonStyle(.glass)
-        .controlSize(.regular)
+        .menuIndicator(.hidden)
+        .buttonStyle(GlassCapsuleStyle(style: style))
         .accessibilityLabel("Langues des recommandations")
         .accessibilityValue(languageLabel)
         .help("Choisir les langues de lecture des recommandations")
+    }
+}
+
+private struct BrowseCatalogMenu: View {
+    @Environment(NavigationModel.self) private var navigation
+    let kind: MediaKind
+    let style: PrismGlassStyle
+
+    var body: some View {
+        Menu {
+            Button(kind == .movie ? "Tous les films" : "Toutes les séries", systemImage: "square.grid.2x2") {
+                navigation.push(.collection(.all(kind)))
+            }
+            Button("Ajouts récents", systemImage: "clock") {
+                navigation.push(.collection(.recentlyAdded(kind)))
+            }
+            Button("Les mieux notés", systemImage: "star") {
+                navigation.push(.collection(.topRated(kind)))
+            }
+        } label: {
+            GlassCapsuleLabel(title: "Catalogue", systemImage: "square.grid.2x2")
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(GlassCapsuleStyle(style: style))
     }
 }
 
@@ -174,42 +234,91 @@ private struct Spotlight: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
     @Environment(\.isPageActive) private var isActive
+    @State private var metadata: TMDBMetadata?
+    @State private var synopsis: String?
     let title: MediaTitle
     let size: CGSize
 
+    private var leadVariants: ArraySlice<MediaVariant> { title.variants.prefix(12) }
+
+    private var backdropURLs: [URL] {
+        [metadata?.images.backdropURL, title.backdropURL].compactMap { $0 }
+            + leadVariants.compactMap { $0.movie?.backdropURL ?? $0.series?.backdropURL }
+    }
+
+    private var posterURLs: [URL] {
+        [metadata?.images.posterURL, title.posterURL].compactMap { $0 }
+            + leadVariants.compactMap { $0.movie?.posterURL ?? $0.series?.posterURL }
+    }
+
+    private var facts: String {
+        let genres = (metadata?.genres ?? title.genres).prefix(2).map(DetailPresentation.genreLabel)
+        return ([title.kind == .series ? "Série" : "Film"] + (title.year.map { [String($0)] } ?? []) + genres)
+            .joined(separator: "  ·  ")
+    }
+
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            HeroBackdrop(imageURL: title.backdropURL, seed: title.title, fallbackPosterURL: title.posterURL,
-                         leadingScrim: 0.83, animates: isActive, artSize: size)
-            VStack(alignment: .leading, spacing: 10) {
-                Text(title.title)
-                    .font(.system(size: 52, weight: .bold))
-                    .tracking(-1.8)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.58)
-                    .accessibilityAddTraits(.isHeader)
-                Text(([title.kind == .series ? "Série" : "Film"] + (title.year.map { [String($0)] } ?? []) + Array(title.genres.prefix(2))).joined(separator: "  ·  "))
+            HeroBackdrop(
+                backdropURLs: backdropURLs, seed: title.id.rawValue, fallbackPosterURLs: posterURLs,
+                leadingScrim: 0.67, animates: isActive, artSize: size
+            )
+            VStack(alignment: .leading, spacing: 9) {
+                TitleLogo(
+                    url: metadata?.images.logoURL, fallbackTitle: metadata?.title ?? title.title,
+                    maxSize: CGSize(width: min(400, size.width * 0.42), height: min(104, size.height * 0.22))
+                )
+                Text(facts)
                     .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.white.opacity(0.82))
-                if let plot = ProviderSynopsis.cleaned(title.plot) {
-                    Text(plot).font(.callout).foregroundStyle(.white.opacity(0.86)).lineLimit(2)
+                    .foregroundStyle(PrismColors.onArtworkSecondary)
+                if let synopsis {
+                    Text(synopsis).font(.callout)
+                        .foregroundStyle(.white.opacity(0.94))
+                        .lineLimit(2)
+                        .lineSpacing(2)
                 }
                 HStack(spacing: 9) {
-                    PrimaryCapsuleButton("Voir la fiche", height: 37, minWidth: 125) {
+                    PrimaryCapsuleButton("Voir la fiche", systemImage: "info.circle", height: 38, minWidth: 126) {
                         navigation.push(.title(title.id))
                     }
-                    WatchlistButton(isAdded: app.library.isInWatchlist(title.id), size: 37) {
+                    WatchlistButton(isAdded: app.library.isInWatchlist(title.id), size: 38) {
                         app.library.toggleWatchlist(title.id)
                     }
                 }
                 .padding(.top, 4)
             }
-            .frame(maxWidth: 420, alignment: .leading)
+            .frame(maxWidth: min(488, size.width * 0.47), alignment: .leading)
             .foregroundStyle(.white)
-            .padding(.leading, 40)
+            .padding(.leading, PrismMetrics.contentMargin - 12)
             .padding(.trailing, 24)
-            .padding(.bottom, 48)
+            .padding(.bottom, size.height >= 440 ? 58 : 50)
         }
+        .task(id: ArtworkRequest(active: isActive, enrichmentEnabled: app.isMetadataEnabled, revision: app.catalogRevision)) {
+            guard isActive else { return }
+            let candidates = [title.plot] + leadVariants.map { $0.movie?.plot ?? $0.series?.plot }
+            let initial = await Self.preferredSynopsis(candidates)
+            guard !Task.isCancelled else { return }
+            synopsis = initial
+            guard app.isMetadataEnabled else {
+                metadata = nil
+                return
+            }
+            let newMetadata = await app.metadataRepository.metadata(for: title)
+            let enrichedSynopsis = await Self.preferredSynopsis([newMetadata?.overview] + candidates)
+            guard !Task.isCancelled else { return }
+            metadata = newMetadata
+            synopsis = enrichedSynopsis
+        }
+    }
+
+    private struct ArtworkRequest: Equatable {
+        let active: Bool
+        let enrichmentEnabled: Bool
+        let revision: Int
+    }
+
+    @concurrent private static func preferredSynopsis(_ candidates: [String?]) async -> String? {
+        ProviderSynopsis.preferredFrenchOrEnglish(from: candidates)
     }
 }
 
@@ -247,16 +356,37 @@ struct TitleShelf: View {
     }
 }
 
+private struct RankedTitleShelf: View {
+    let items: [MediaTitle]
+
+    private struct Entry: Identifiable {
+        let rank: Int
+        let title: MediaTitle
+        var id: TitleID { title.id }
+    }
+
+    var body: some View {
+        Shelf(
+            title: "Tendances de la semaine",
+            subtitle: "Classement TMDB des titres disponibles",
+            items: items.prefix(10).enumerated().map { Entry(rank: $0.offset + 1, title: $0.element) }
+        ) { entry in
+            BrowsePoster(item: entry.title, rank: entry.rank)
+        }
+    }
+}
+
 struct BrowsePoster: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
     let item: MediaTitle
     var width: CGFloat? = nil
+    var rank: Int? = nil
 
     var body: some View {
-        let name = app.recommendations.named(item).title
+        let name = rank == nil ? app.recommendations.named(item).title : item.title
         PosterCard(imageURL: item.posterURL, seed: name, title: name,
-                   subtitle: item.year.map(String.init), showsTitle: true, width: width,
+                   subtitle: item.year.map(String.init), showsTitle: true, rank: rank, width: width,
                    action: { navigation.push(.title(item.id)) }) {
             Button(app.library.isInWatchlist(item.id) ? "Retirer de Ma liste" : "Ajouter à Ma liste") {
                 app.library.toggleWatchlist(item.id)

@@ -7,6 +7,31 @@ import Testing
 /// measured numbers are printed.
 @Suite("Performance", .serialized)
 struct PerformanceTests {
+    @Test func discoveryRanksAvailableLanguagesInLargeCatalog() async throws {
+        let (sources, generated) = Synthetic.catalogs(movies: 100_000, series: 0, channels: 0)
+        let catalogs = generated.map { source -> SourceCatalog in
+            var source = source
+            for index in source.movies.indices {
+                source.movies[index].tags = index.isMultiple(of: 3) ? ["VF"] : ["EN"]
+            }
+            return source
+        }
+        let catalog = await CatalogBuilder.build(sources: sources, catalogs: catalogs)
+        let watched = try #require(catalog.movies.first { !$0.genres.isEmpty })
+        let (shelves, elapsed) = await measureMilliseconds {
+            await DiscoveryBuilder.local(
+                for: .movie, in: catalog, recommendations: .empty, languages: [.french],
+                profile: DiscoveryProfile(watched: [watched.id]), now: Fixture.reference
+            )
+        }
+        print("[perf] Discover 100k movies with language signals: \(Int(elapsed)) ms")
+        #expect(elapsed < 1_500)
+        #expect(shelves.recommended.count == 18)
+        #expect(shelves.localHighlights.count == 18)
+        #expect(shelves.recommended.allSatisfy { !$0.variants.isEmpty && $0.id != watched.id })
+        #expect(Set(shelves.recommended.map(\.id)).isDisjoint(with: shelves.localHighlights.map(\.id)))
+    }
+
     @Test func buildLargeCatalogAndSearch() async throws {
         let (sources, catalogs) = Synthetic.catalogs(movies: 150_000, series: 20_000, channels: 30_000)
         let (catalog, buildMS) = await measureMilliseconds {

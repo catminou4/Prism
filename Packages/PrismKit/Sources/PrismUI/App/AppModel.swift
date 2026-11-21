@@ -5,6 +5,15 @@ import SwiftUI
 import PrismCore
 import PrismData
 
+public struct DiscoveryRequest: Hashable, Sendable {
+    public let kind: MediaKind
+    let catalogRevision: Int
+    let metadataRevision: Int
+    let usesTMDB: Bool
+    let languages: Set<HomeAudioLanguage>
+    let profile: DiscoveryProfile
+}
+
 /// App-wide state: sources, the merged catalog, the EPG guide, the search index and the
 /// user's library. Heavy work (refresh, grouping, indexing) runs off the main actor in
 /// PrismData; only the finished immutable snapshots are assigned here.
@@ -49,6 +58,8 @@ public final class AppModel {
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
     public private(set) var isRefreshingGuide = false
     public private(set) var isMetadataEnabled = false
+    private var discoveryMetadataRevision = 0
+    private var discoveryShelves: [MediaKind: DiscoveryResult] = [:]
     private var hiddenCategoriesBySource: [String: [String]] = [:]
     /// Bumped every time `catalog` is replaced (cheap change token for views/tasks).
     public private(set) var catalogRevision = 0
@@ -145,6 +156,60 @@ public final class AppModel {
         guard !languages.isEmpty, languages != homeAudioLanguages else { return }
         homeAudioLanguages = languages
         if !isEphemeral { settings.homeAudioLanguages = languages }
+    }
+
+    private struct DiscoveryResult {
+        let request: DiscoveryRequest
+        let shelves: DiscoveryShelves
+    }
+
+    public func discoveryRequest(for kind: MediaKind) -> DiscoveryRequest {
+        let watched = library.history.lazy.compactMap { entry -> TitleID? in
+            if case .title(let id) = entry.target { return id }
+            return nil
+        }.prefix(24)
+        return DiscoveryRequest(
+            kind: kind, catalogRevision: catalogRevision, metadataRevision: discoveryMetadataRevision,
+            usesTMDB: isMetadataEnabled, languages: homeAudioLanguages,
+            profile: DiscoveryProfile(watchlist: library.watchlist, watched: Array(watched))
+        )
+    }
+
+    public func discovery(for kind: MediaKind) -> DiscoveryShelves {
+        guard let result = discoveryShelves[kind],
+              result.request.catalogRevision == catalogRevision, result.request.languages == homeAudioLanguages,
+              result.request.usesTMDB == isMetadataEnabled, result.request.metadataRevision == discoveryMetadataRevision
+        else { return .empty }
+        return result.shelves
+    }
+
+    public func refreshDiscovery(_ request: DiscoveryRequest) async {
+        guard request.kind == .movie || request.kind == .series,
+              request == discoveryRequest(for: request.kind), !Task.isCancelled else { return }
+        let catalog = self.catalog, recommendations = self.recommendations
+        async let chart = request.usesTMDB ? metadataRepository.weeklyTrending(for: request.kind) : []
+        let local: DiscoveryShelves
+        if let loaded = discoveryShelves[request.kind], loaded.request == request {
+            local = loaded.shelves
+        } else {
+            local = await DiscoveryBuilder.local(
+                for: request.kind, in: catalog, recommendations: recommendations,
+                languages: request.languages, profile: request.profile
+            )
+            guard !Task.isCancelled, request == discoveryRequest(for: request.kind) else { return }
+            // Library edits affect the personal score, not a chart in the same catalogue/language.
+            let charts = discovery(for: request.kind).trending
+            let shelves = DiscoveryShelves(recommended: local.recommended, trending: charts, localHighlights: local.localHighlights)
+            discoveryShelves[request.kind] = DiscoveryResult(request: request, shelves: shelves)
+        }
+        guard request.usesTMDB else { return }
+        let trending = await DiscoveryBuilder.trending(
+            chart, for: request.kind, in: catalog, recommendations: recommendations, languages: request.languages
+        )
+        guard !Task.isCancelled, request == discoveryRequest(for: request.kind),
+              discoveryShelves[request.kind]?.shelves.trending != trending else { return }
+        let shelves = DiscoveryShelves(recommended: local.recommended, trending: trending, localHighlights: local.localHighlights)
+        discoveryShelves[request.kind] = DiscoveryResult(request: request, shelves: shelves)
     }
 
     // MARK: Lifecycle
@@ -332,6 +397,7 @@ public final class AppModel {
         Task {
             await metadataRepository.reload()
             isMetadataEnabled = await metadataRepository.isEnabled
+            discoveryMetadataRevision &+= 1
         }
     }
 
@@ -466,6 +532,7 @@ public final class AppModel {
         searchIndex = nil
         self.recommendations = recommendations
         catalogRevision &+= 1
+        discoveryShelves.removeAll(keepingCapacity: true)
         searchTask = Task { [weak self] in
             let index = await SearchIndex.build(from: built, recommendations: recommendations)
             guard !Task.isCancelled else { return }

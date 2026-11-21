@@ -12,6 +12,30 @@ public struct TMDBImageSet: Sendable, Hashable {
     }
 }
 
+/// One work from a TMDB weekly chart, in the order delivered by the service.
+public struct TMDBTrend: Sendable, Hashable {
+    public let id: Int
+    public let title: String
+    public let originalTitle: String?
+    public let year: Int?
+    public let originalLanguage: HomeAudioLanguage?
+    public let overview: String?
+    public let images: TMDBImageSet
+
+    public init(
+        id: Int, title: String, originalTitle: String? = nil, year: Int? = nil,
+        originalLanguage: HomeAudioLanguage? = nil, overview: String? = nil, images: TMDBImageSet = .init()
+    ) {
+        self.id = id
+        self.title = title
+        self.originalTitle = originalTitle
+        self.year = year
+        self.originalLanguage = originalLanguage
+        self.overview = overview
+        self.images = images
+    }
+}
+
 public struct TMDBPerson: Sendable, Hashable, Identifiable {
     public var id: Int
     public var name: String
@@ -69,14 +93,21 @@ public struct TMDBEpisodeInfo: Sendable, Hashable {
     public var overview: String?
     public var stillURL: URL?
     public var runtimeMinutes: Int?
+    public var voteAverage: Double?
+    public var voteCount: Int?
 
-    public init(season: Int, number: Int, title: String? = nil, overview: String? = nil, stillURL: URL? = nil, runtimeMinutes: Int? = nil) {
+    public init(
+        season: Int, number: Int, title: String? = nil, overview: String? = nil, stillURL: URL? = nil,
+        runtimeMinutes: Int? = nil, voteAverage: Double? = nil, voteCount: Int? = nil
+    ) {
         self.season = season
         self.number = number
         self.title = title
         self.overview = overview
         self.stillURL = stillURL
         self.runtimeMinutes = runtimeMinutes
+        self.voteAverage = voteAverage
+        self.voteCount = voteCount
     }
 }
 
@@ -179,6 +210,18 @@ public actor TMDBClient {
 
     // MARK: - Networking
 
+    /// Weekly trending results for a single kind. No catalogue data is sent to TMDB.
+    public func weeklyTrending(for kind: MediaKind) async throws -> [TMDBTrend] {
+        let type: TMDBMediaType
+        switch kind {
+        case .movie: type = .movie
+        case .series: type = .tv
+        case .live, .episode: return []
+        }
+        guard let data = try await get("/trending/\(type.rawValue)/week", query: [("language", language)]) else { return [] }
+        return try Self.decodeTrends(data)
+    }
+
     private nonisolated var languageCode: String {
         String(language.split(separator: "-").first ?? "fr").lowercased()
     }
@@ -242,6 +285,30 @@ public actor TMDBClient {
                 originalTitle: obj.string("original_title", "original_name"),
                 year: obj.year("release_date", "first_air_date"),
                 popularity: obj.double("popularity") ?? 0
+            )
+        }
+    }
+
+    static func decodeTrends(_ data: Data) throws -> [TMDBTrend] {
+        guard let results = try json(data).value(["results"]) as? [Any] else {
+            throw TMDBError.decoding("classement TMDB manquant")
+        }
+        var seen: Set<Int> = []
+        return results.compactMap { element in
+            guard let item = JSONObject(element), item.bool("adult") != true,
+                  let id = item.int("id"), id > 0,
+                  let title = item.string("title", "name", "original_title", "original_name"),
+                  seen.insert(id).inserted else { return nil }
+            return TMDBTrend(
+                id: id, title: title,
+                originalTitle: item.string("original_title", "original_name"),
+                year: item.year("release_date", "first_air_date"),
+                originalLanguage: item.string("original_language").flatMap(HomeAudioLanguage.init(rawValue:)),
+                overview: item.string("overview"),
+                images: TMDBImageSet(
+                    backdropURL: imageURL(path: item.string("backdrop_path"), size: "w1280"),
+                    posterURL: imageURL(path: item.string("poster_path"), size: "w500")
+                )
             )
         }
     }
@@ -343,7 +410,9 @@ public actor TMDBClient {
                 title: ep.string("name"),
                 overview: ep.string("overview"),
                 stillURL: imageURL(path: ep.string("still_path"), size: "w500"),
-                runtimeMinutes: ep.int("runtime").flatMap { $0 > 0 ? $0 : nil }
+                runtimeMinutes: ep.int("runtime").flatMap { $0 > 0 ? $0 : nil },
+                voteAverage: ep.double("vote_average").flatMap { $0 > 0 && $0 <= 10 ? $0 : nil },
+                voteCount: ep.int("vote_count").flatMap { $0 >= 0 ? $0 : nil }
             )
         }.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
     }

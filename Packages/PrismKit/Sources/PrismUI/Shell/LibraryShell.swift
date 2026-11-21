@@ -21,11 +21,14 @@ struct LibraryShell: View {
 
     private var sidebarText: Color { Color(white: colorScheme == .dark ? 0.92 : 0.12) }
     private var sidebarSecondary: Color { Color(white: colorScheme == .dark ? 0.69 : 0.38) }
+    private var sidebarAccent: Color {
+        colorScheme == .dark ? Color(red: 0.46, green: 0.72, blue: 1) : Color(red: 0.07, green: 0.33, blue: 0.68)
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $visibility) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 200, ideal: 228, max: 290)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 290)
         } detail: {
             GeometryReader { layout in
                 ZStack {
@@ -93,12 +96,9 @@ struct LibraryShell: View {
             PrismLogoLockup(size: 20)
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
-                .padding(.bottom, 9)
+                .padding(.bottom, 14)
 
-            List(selection: Binding<SidebarItem?>(
-                get: { navigation.selection },
-                set: { if let item = $0, item != navigation.selection { navigation.select(item) } }
-            )) {
+            List {
                 Section {
                     row("Accueil", symbol: "house", item: .home)
                     row("Rechercher", symbol: "magnifyingglass", item: .search)
@@ -106,8 +106,6 @@ struct LibraryShell: View {
                     row("Sport", symbol: "sportscourt", item: .sports)
                     row("Films", symbol: "film.stack", item: .movies)
                     row("Séries", symbol: "rectangle.stack", item: .series)
-                } header: {
-                    Text("Explorer").foregroundStyle(sidebarSecondary)
                 }
                 Section {
                     row("Ma liste", symbol: "bookmark", item: .watchlist)
@@ -119,25 +117,26 @@ struct LibraryShell: View {
                 Section {
                     ForEach(app.sources) { source in
                         let item = SidebarItem.source(source.id)
-                        HStack(spacing: 9) {
-                            Image(systemName: source.id == DemoContent.sourceID ? "play.rectangle" : "rectangle.connected.to.line.below")
-                                .foregroundStyle(rowSymbol(item))
-                                .frame(width: 17)
-                                .accessibilityHidden(true)
-                            Text(source.name).lineLimit(1).foregroundStyle(rowText(item))
-                            Spacer(minLength: 3)
-                            if app.isImporting(source.id) {
-                                ProgressView().controlSize(.mini).accessibilityLabel("Importation")
-                            } else if app.errors[source.id] != nil {
-                                Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
-                                    .accessibilityLabel("Erreur d’actualisation")
-                            } else if !source.isEnabled {
-                                Image(systemName: "pause.circle").foregroundStyle(rowSymbol(item))
-                                    .accessibilityLabel("Source inactive")
+                        sidebarButton(item) {
+                            HStack(spacing: 9) {
+                                Image(systemName: source.id == DemoContent.sourceID ? "play.rectangle" : "rectangle.connected.to.line.below")
+                                    .foregroundStyle(rowSymbol(item))
+                                    .frame(width: 17)
+                                    .accessibilityHidden(true)
+                                Text(source.name).lineLimit(1).foregroundStyle(sidebarText)
+                                    .fontWeight(navigation.selection == item ? .semibold : .regular)
+                                Spacer(minLength: 3)
+                                if app.isImporting(source.id) {
+                                    ProgressView().controlSize(.mini).accessibilityLabel("Importation")
+                                } else if app.errors[source.id] != nil {
+                                    Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
+                                        .accessibilityLabel("Erreur d’actualisation")
+                                } else if !source.isEnabled {
+                                    Image(systemName: "pause.circle").foregroundStyle(rowSymbol(item))
+                                        .accessibilityLabel("Source inactive")
+                                }
                             }
                         }
-                        .tag(item)
-                        .listRowBackground(selectionBackground(item))
                         .contextMenu {
                             Button(source.isEnabled ? "Désactiver" : "Activer") {
                                 app.setEnabled(!source.isEnabled, for: source.id)
@@ -174,26 +173,47 @@ struct LibraryShell: View {
     }
 
     private func row(_ title: String, symbol: String, item: SidebarItem) -> some View {
-        Label {
-            Text(title).foregroundStyle(rowText(item))
-        } icon: {
-            Image(systemName: symbol).foregroundStyle(rowSymbol(item))
+        sidebarButton(item) {
+            Label {
+                Text(title)
+                    .foregroundStyle(sidebarText)
+                    .fontWeight(navigation.selection == item ? .semibold : .regular)
+            } icon: {
+                Image(systemName: symbol).foregroundStyle(rowSymbol(item))
+            }
         }
-        .tag(item)
+    }
+
+    private func sidebarButton(_ item: SidebarItem, @ViewBuilder label: () -> some View) -> some View {
+        Button {
+            navigation.select(item)
+        } label: {
+            label()
+                .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(navigation.selection == item ? .isSelected : [])
         .listRowBackground(selectionBackground(item))
     }
 
-    private func rowText(_ item: SidebarItem) -> Color {
-        navigation.selection == item ? .white : sidebarText
-    }
-
     private func rowSymbol(_ item: SidebarItem) -> Color {
-        navigation.selection == item ? .white.opacity(0.87) : sidebarSecondary
+        navigation.selection == item ? sidebarAccent : sidebarSecondary
     }
 
     private func selectionBackground(_ item: SidebarItem) -> some View {
-        RoundedRectangle(cornerRadius: PrismMetrics.listRowRadius)
-            .fill(navigation.selection == item ? Color(white: colorScheme == .dark ? 0.28 : 0.30) : .clear)
+        ZStack {
+            if navigation.selection == item {
+                Capsule()
+                    .fill(sidebarAccent.opacity(colorScheme == .dark ? 0.16 : 0.105))
+                    .overlay {
+                        Capsule().strokeBorder(sidebarAccent.opacity(colorScheme == .dark ? 0.22 : 0.12), lineWidth: 1)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 3)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder private func root(for section: SidebarItem) -> some View {

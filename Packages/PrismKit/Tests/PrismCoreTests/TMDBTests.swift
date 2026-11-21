@@ -70,8 +70,12 @@ struct TMDBTests {
         #expect(episodes.map(\.number) == [1, 2])
         #expect(episodes[0].title == "System")
         #expect(episodes[0].runtimeMinutes == 28)
+        #expect(episodes[0].voteAverage == 8)
+        #expect(episodes[0].voteCount == 126)
         #expect(episodes[0].stillURL?.absoluteString == "https://image.tmdb.org/t/p/w500/e1.jpg")
         #expect(episodes[1].overview == nil)
+        #expect(episodes[1].voteAverage == nil)
+        #expect(episodes[1].voteCount == nil)
         #expect(episodes[1].stillURL == nil)
         #expect(episodes[1].season == 1)
     }
@@ -79,6 +83,42 @@ struct TMDBTests {
     @Test func invalidPayload() {
         #expect(throws: TMDBError.self) { try TMDBClient.decodeMetadata(Data("[]".utf8), kind: .movie) }
         #expect(throws: TMDBError.self) { try TMDBClient.decodeSearch(Data("oops".utf8)) }
+    }
+
+    @Test func weeklyTrendsPreserveProviderRankingAndMediaType() async throws {
+        let host = "api.themoviedb.org"
+        let tvPath = "/3/trending/tv/week"
+        let moviePath = "/3/trending/movie/week"
+        let tv = """
+            {"results":[
+                {"id":7,"name":"La série","original_name":"The Show","first_air_date":"2024-06-01",
+                 "original_language":"en","backdrop_path":"/wide.jpg"},
+                {"id":2,"name":"Autre","original_language":"fr","poster_path":"/cover.jpg"},
+                {"id":7,"name":"Doublon"},
+                {"id":4,"name":"Adulte","adult":true}
+            ]}
+            """
+        let movies = """
+            {"results":[{"id":9,"title":"Le film","original_title":"Der Film","release_date":"2021-03-25",
+                         "original_language":"de"}]}
+            """
+        StubURLProtocol.register(host: host, path: tvPath, body: Data(tv.utf8))
+        StubURLProtocol.register(host: host, path: moviePath, body: Data(movies.utf8))
+        let client = TMDBClient(credential: "example-token", session: StubURLProtocol.session())
+        let tvChart = try await client.weeklyTrending(for: .series)
+        let filmChart = try await client.weeklyTrending(for: .movie)
+        #expect(tvChart.map(\.id) == [7, 2])
+        #expect(tvChart.first?.originalLanguage == .english)
+        #expect(tvChart.first?.year == 2024)
+        #expect(tvChart.first?.images.backdropURL?.absoluteString == "https://image.tmdb.org/t/p/w1280/wide.jpg")
+        #expect(filmChart.first?.id == 9)
+        #expect(filmChart.first?.originalLanguage == nil)
+        #expect(filmChart.first?.year == 2021)
+        let requests = StubURLProtocol.recordedRequests(host: host).filter { request in
+            request.url?.path().hasPrefix("/3/trending/") == true
+        }
+        #expect(requests.count == 2)
+        #expect(requests.allSatisfy { $0.url?.query() == "language=fr-FR" })
     }
 
     @Test func endToEndWithStubbedSession() async throws {

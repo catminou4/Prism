@@ -1,21 +1,21 @@
 import SwiftUI
 
-/// Auto-advancing hero carousel: 0.8 s cross-fade with a slight parallax, thin `‹ ›` chevrons
-/// on hover, page dots, ←/→ when focused. Auto-advance pauses on hover, when the window is
-/// inactive or occluded, and under Reduce Motion.
+/// A hero carousel with horizontal scrolling, arrow keys, page dots and explicit controls.
+/// Auto-advance pauses on hover, when inactive or occluded, and under Reduce Motion.
 public struct HeroCarousel<Item: Identifiable, Content: View>: View {
     private let items: [Item]
     private let interval: Double
     private let height: CGFloat?
     private let showsDots: Bool
+    private let isInteractive: Bool
     private let content: (Item) -> Content
     @Binding private var externalIndex: Int?
 
     @State private var index = 0
+    @State private var visibleID: Item.ID?
     @State private var direction: Edge = .trailing
     @State private var hovering = false
     @State private var isWindowVisible = true
-    @Environment(\.prismSnapshotHover) private var forcedHover
     @Environment(\.appearsActive) private var appearsActive
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -25,22 +25,29 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         height: CGFloat? = nil,
         showsDots: Bool = true,
         index: Binding<Int?> = .constant(nil),
+        isInteractive: Bool = true,
         @ViewBuilder content: @escaping (Item) -> Content
     ) {
         self.items = items
         self.interval = interval
         self.height = height
         self.showsDots = showsDots
+        self.isInteractive = isInteractive
         self.content = content
         _externalIndex = index
+        let initial = min(max(index.wrappedValue ?? 0, 0), max(items.count - 1, 0))
+        _index = State(initialValue: initial)
+        _visibleID = State(initialValue: items.indices.contains(initial) ? items[initial].id : nil)
     }
 
-    private var isHovered: Bool { hovering || forcedHover }
+    private var currentIndex: Int {
+        if let visibleID, let current = items.firstIndex(where: { $0.id == visibleID }) { return current }
+        return min(max(index, 0), max(items.count - 1, 0))
+    }
 
-    private var currentIndex: Int { items.isEmpty ? 0 : min(index, items.count - 1) }
-
+    private var canPage: Bool { isInteractive && items.count > 1 }
     private var isAutoAdvancing: Bool {
-        items.count > 1 && !isHovered && appearsActive && isWindowVisible && !reduceMotion && interval > 0
+        canPage && !hovering && appearsActive && isWindowVisible && !reduceMotion && interval > 0
     }
 
     public var body: some View {
@@ -56,33 +63,45 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         .frame(height: height)
         .frame(maxWidth: .infinity)
         .clipped()
-        .overlay(alignment: .bottom) {
-            if showsDots && items.count > 1 {
-                PageDots(count: items.count, index: currentIndex) { go(to: $0) }
-                    .padding(.bottom, 20)
-            }
+        .overlay(alignment: .bottom) { navigationControls }
+        .background {
+            WindowOcclusionReader(isVisible: $isWindowVisible)
+            if canPage { HeroHorizontalScrollReader { go(to: currentIndex + $0) } }
         }
-        .overlay { chevrons }
-        .background { WindowOcclusionReader(isVisible: $isWindowVisible) }
-        .onHover { inside in withAnimation(PrismMotion.quickFade) { hovering = inside } }
-        .focusable()
+        .onHover { hovering = $0 }
+        .focusable(canPage)
         .focusEffectDisabled()
-        .onKeyPress(.leftArrow) { go(to: currentIndex - 1); return .handled }
-        .onKeyPress(.rightArrow) { go(to: currentIndex + 1); return .handled }
+        .onKeyPress(.leftArrow) {
+            guard canPage else { return .ignored }
+            go(to: currentIndex - 1)
+            return .handled
+        }
+        .onKeyPress(.rightArrow) {
+            guard canPage else { return .ignored }
+            go(to: currentIndex + 1)
+            return .handled
+        }
         .task(id: TimerKey(index: currentIndex, running: isAutoAdvancing)) {
             guard isAutoAdvancing else { return }
             try? await Task.sleep(for: .seconds(interval))
             guard !Task.isCancelled else { return }
-            go(to: currentIndex + 1)
+            go(to: currentIndex + 1, automatic: true)
         }
         .onChange(of: externalIndex) { _, newValue in
             if let newValue, newValue != currentIndex { go(to: newValue) }
         }
+        .onChange(of: items.map(\.id)) { _, _ in
+            let current = currentIndex
+            index = current
+            visibleID = items.indices.contains(current) ? items[current].id : nil
+            if externalIndex != nil { externalIndex = current }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityScrollAction { edge in
             switch edge {
-            case .leading, .top: go(to: currentIndex - 1)
-            default: go(to: currentIndex + 1)
+            case .leading: go(to: currentIndex - 1)
+            case .trailing: go(to: currentIndex + 1)
+            default: break
             }
         }
     }
@@ -94,56 +113,48 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
 
     private var pageTransition: AnyTransition {
         if reduceMotion { return .opacity }
-        let shift: CGFloat = 36
+        let shift: CGFloat = 24
         let insertion = AnyTransition.opacity.combined(with: .offset(x: direction == .trailing ? shift : -shift))
         let removal = AnyTransition.opacity.combined(with: .offset(x: direction == .trailing ? -shift * 0.5 : shift * 0.5))
         return .asymmetric(insertion: insertion, removal: removal)
     }
 
-    private func go(to target: Int) {
-        guard items.count > 1 else { return }
+    private func go(to target: Int, automatic: Bool = false) {
+        guard canPage else { return }
         let wrapped = (target % items.count + items.count) % items.count
         guard wrapped != currentIndex else { return }
         let forward = target > currentIndex
         direction = forward ? .trailing : .leading
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.4) : PrismMotion.heroFade) {
+        let animation: Animation = reduceMotion ? .easeOut(duration: 0.16) : automatic ? PrismMotion.heroFade : .smooth(duration: 0.32)
+        withAnimation(animation) {
             index = wrapped
+            visibleID = items[wrapped].id
         }
         if externalIndex != nil { externalIndex = wrapped }
     }
 
-    private var chevrons: some View {
-        HStack {
-            HeroChevron(systemName: "chevron.compact.left", label: "Précédent") { go(to: currentIndex - 1) }
-            Spacer()
-            HeroChevron(systemName: "chevron.compact.right", label: "Suivant") { go(to: currentIndex + 1) }
+    @ViewBuilder private var navigationControls: some View {
+        if items.count > 1 {
+            ZStack(alignment: .trailing) {
+                if showsDots {
+                    PageDots(count: items.count, index: currentIndex) { go(to: $0) }
+                        .frame(maxWidth: .infinity)
+                }
+                HStack(spacing: 8) {
+                    GlassCircleButton(systemName: "chevron.left", size: 32, style: .dark, accessibilityLabel: "Sélection précédente") {
+                        go(to: currentIndex - 1)
+                    }
+                    .help("Précédent (←)")
+                    GlassCircleButton(systemName: "chevron.right", size: 32, style: .dark, accessibilityLabel: "Sélection suivante") {
+                        go(to: currentIndex + 1)
+                    }
+                    .help("Suivant (→)")
+                }
+                .padding(.trailing, 22)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.bottom, 15)
         }
-        .padding(.horizontal, 10)
-        .opacity(isHovered && items.count > 1 ? 1 : 0)
-        .allowsHitTesting(isHovered && items.count > 1)
-    }
-}
-
-/// Very thin, large, background-less chevron used at the hero edges.
-struct HeroChevron: View {
-    let systemName: String
-    let label: String
-    let action: () -> Void
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.white.opacity(isHovered ? 1 : 0.75))
-                .shadow(color: .black.opacity(0.35), radius: 6)
-                .frame(width: 36, height: 80)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.pressable)
-        .onHover { isHovered = $0 }
-        .focusEffectDisabled()
-        .accessibilityLabel(Text(label))
     }
 }
 

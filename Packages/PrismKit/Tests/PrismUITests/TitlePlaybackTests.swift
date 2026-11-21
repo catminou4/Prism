@@ -14,6 +14,30 @@ struct TitlePlaybackTests {
         #expect(PlaybackEdition(tags: ["USA", "CA", "HDR"]).key == "unknown")
     }
 
+    @MainActor @Test func languageFiltersIncludeSharedAudioButKeepSubtitleVersionsSeparate() throws {
+        let url = try #require(URL(string: "https://example.invalid/edition.mkv"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let tags = [["FR", "IT"], ["VFQ"], ["VOSTFR"], ["MULTI"], ["FR"], ["EN", "FR"], ["FR"]]
+        let options = tags.enumerated().compactMap { index, tags in
+            let variant = Movie(sourceID: source.id, nativeID: "\(index)", title: "Film", streamURL: url, tags: tags)
+            return TitlePlaybackOption(edition: TitleEdition(variant: .movie(variant), source: source))
+        }
+        var choices = PlaybackSheetChoices(Array(options.prefix(2)))
+        choices.append(options)
+
+        let french = try #require(choices.filters.first { $0.id == "audio-FR" })
+        let italian = try #require(choices.filters.first { $0.id == "audio-IT" })
+        let subtitled = try #require(choices.filters.first { $0.id == "version-VOSTFR" })
+        #expect(choices.filters.prefix(2).map(\.id) == ["audio-FR", "audio-EN"])
+        #expect(french.title == "Français")
+        #expect(choices[french].map(\.id) == [options[0].id, options[1].id, options[4].id, options[5].id, options[6].id])
+        #expect(choices[italian].map(\.id) == [options[0].id])
+        #expect(choices[subtitled].map(\.id) == [options[2].id])
+        #expect(choices[.all].map(\.id) == options.map(\.id))
+        let group = try #require(PlaybackSourceGroup.grouped(choices[french]).first)
+        #expect(group.duplicateNumbers == [options[4].id: 1, options[6].id: 2])
+    }
+
     @Test func selectingAnEditionPreservesItsStreamAndHeaders() throws {
         let url = try #require(URL(string: "https://example.invalid/edition.mkv"))
         let source = Source(name: "Source", kind: .m3uURL, userAgent: "Source UA")

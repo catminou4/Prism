@@ -18,10 +18,23 @@ public actor MetadataRepository {
     private var memory: [String: CacheEntry] = [:]
     private var inFlight: [String: Task<Lookup, Never>] = [:]
     private var episodeMemory: [String: [TMDBEpisodeInfo]] = [:]
+    private var trendMemory: [MediaKind: TrendCache] = [:]
+    private var trendTasks: [MediaKind: TrendRequest] = [:]
 
     private struct CacheEntry {
         var metadata: TMDBMetadata?
         var savedAt: Date
+    }
+
+    private struct TrendCache {
+        let items: [TMDBTrend]
+        let loadedAt: Date?
+        let refreshAfter: Date
+    }
+
+    private struct TrendRequest {
+        let id = UUID()
+        let task: Task<[TMDBTrend]?, Never>
     }
 
     enum Lookup: Sendable {
@@ -55,6 +68,7 @@ public actor MetadataRepository {
         episodeMemory.removeAll()
         for task in inFlight.values { task.cancel() }
         inFlight.removeAll()
+        clearTrends()
     }
 
     public func metadata(for title: MediaTitle) async -> TMDBMetadata? {
@@ -100,27 +114,73 @@ public actor MetadataRepository {
     public func episodes(tmdbID: Int, season: Int) async -> [TMDBEpisodeInfo] {
         let key = "tv-\(tmdbID)-s\(season)"
         if let cached = episodeMemory[key] { return cached }
-        if let stored = readEpisodes(key) {
-            episodeMemory[key] = stored
-            return stored
+        let stored = readEpisodes(key)
+        if let stored, stored.formatVersion == Self.episodeFormatVersion {
+            let episodes = stored.episodes.map(\.value)
+            episodeMemory[key] = episodes
+            return episodes
         }
-        guard let client = currentClient() else { return [] }
-        guard let episodes = try? await client.seasonEpisodes(tmdbID: tmdbID, season: season) else { return [] }
+        guard let client = currentClient(),
+              let episodes = try? await client.seasonEpisodes(tmdbID: tmdbID, season: season)
+        else { return stored?.episodes.map(\.value) ?? [] }
         episodeMemory[key] = episodes
         writeEpisodes(key, episodes)
         return episodes
+    }
+
+    /// One shared request per chart. A transient error may reuse that week's chart for at most one day.
+    public func weeklyTrending(for kind: MediaKind) async -> [TMDBTrend] {
+        guard kind == .movie || kind == .series, let client = currentClient() else { return [] }
+        let cached = trendMemory[kind]
+        if let cached, cached.refreshAfter > .now { return cached.items }
+        let request: TrendRequest
+        if let pending = trendTasks[kind] {
+            request = pending
+        } else {
+            request = TrendRequest(task: Task { try? await client.weeklyTrending(for: kind) })
+            trendTasks[kind] = request
+        }
+        let items = await request.task.value
+        guard !request.task.isCancelled else { return [] }
+        // A second awaiting caller can arrive after the first has published this request.
+        guard trendTasks[kind]?.id == request.id else { return trendMemory[kind]?.items ?? [] }
+        trendTasks[kind] = nil
+        let now = Date.now
+        let entry: TrendCache
+        if let items {
+            entry = TrendCache(items: items, loadedAt: now, refreshAfter: now.addingTimeInterval(6 * 3_600))
+        } else {
+            let recent = cached?.loadedAt.map { now.timeIntervalSince($0) < 86_400 } == true
+            entry = TrendCache(
+                items: recent ? cached?.items ?? [] : [],
+                loadedAt: recent ? cached?.loadedAt : nil, refreshAfter: now.addingTimeInterval(15 * 60)
+            )
+        }
+        trendMemory[kind] = entry
+        return entry.items
+    }
+
+    private func clearTrends() {
+        for request in trendTasks.values { request.task.cancel() }
+        trendTasks.removeAll()
+        trendMemory.removeAll()
     }
 
     // MARK: - Internals
 
     private func currentClient() -> TMDBClient? {
         guard let key = credentials.tmdbKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+            if clientKey != nil { clearTrends() }
             client = nil
             clientKey = nil
             return nil
         }
         if let client, clientKey == key { return client }
-        if clientKey != nil, clientKey != key { memory.removeAll(); episodeMemory.removeAll() }
+        if clientKey != key {
+            memory.removeAll()
+            episodeMemory.removeAll()
+            clearTrends()
+        }
         let created = TMDBClient(credential: key, language: language, session: session)
         client = created
         clientKey = key
@@ -157,22 +217,27 @@ public actor MetadataRepository {
         try? data.write(to: file(key), options: [.atomic])
     }
 
+    private static let episodeFormatVersion = 2
+
     private struct StoredEpisodes: Codable {
+        var formatVersion: Int?
         var savedAt: Date
         var language: String
         var episodes: [StoredEpisode]
     }
 
-    private func readEpisodes(_ key: String) -> [TMDBEpisodeInfo]? {
+    private func readEpisodes(_ key: String) -> StoredEpisodes? {
         guard let data = try? Data(contentsOf: file(key)),
               let stored = try? Self.decoder.decode(StoredEpisodes.self, from: data),
               stored.language == language,
               Date.now.timeIntervalSince(stored.savedAt) < Self.positiveTTL else { return nil }
-        return stored.episodes.map(\.value)
+        return stored
     }
 
     private func writeEpisodes(_ key: String, _ episodes: [TMDBEpisodeInfo]) {
-        let stored = StoredEpisodes(savedAt: .now, language: language, episodes: episodes.map(StoredEpisode.init))
+        let stored = StoredEpisodes(
+            formatVersion: Self.episodeFormatVersion, savedAt: .now, language: language, episodes: episodes.map(StoredEpisode.init)
+        )
         guard let data = try? Self.encoder.encode(stored) else { return }
         try? data.write(to: file(key), options: [.atomic])
     }
@@ -252,6 +317,8 @@ struct StoredEpisode: Codable {
     var overview: String?
     var stillURL: URL?
     var runtimeMinutes: Int?
+    var voteAverage: Double?
+    var voteCount: Int?
 
     init(_ value: TMDBEpisodeInfo) {
         season = value.season
@@ -260,9 +327,14 @@ struct StoredEpisode: Codable {
         overview = value.overview
         stillURL = value.stillURL
         runtimeMinutes = value.runtimeMinutes
+        voteAverage = value.voteAverage
+        voteCount = value.voteCount
     }
 
     var value: TMDBEpisodeInfo {
-        TMDBEpisodeInfo(season: season, number: number, title: title, overview: overview, stillURL: stillURL, runtimeMinutes: runtimeMinutes)
+        TMDBEpisodeInfo(
+            season: season, number: number, title: title, overview: overview, stillURL: stillURL,
+            runtimeMinutes: runtimeMinutes, voteAverage: voteAverage, voteCount: voteCount
+        )
     }
 }
