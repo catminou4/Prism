@@ -150,6 +150,7 @@ public final class PlayerController {
     @ObservationIgnored private var autoHide: ControlsAutoHide
     @ObservationIgnored private var progressThrottle = ProgressThrottle()
     @ObservationIgnored private var feedbackCounter = 0
+    @ObservationIgnored private var volumeNeedsSave = false
 
     @ObservationIgnored private var loadTimeoutTask: Task<Void, Never>?
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
@@ -239,6 +240,7 @@ public final class PlayerController {
     /// Stops playback and releases the engines (window closed).
     public func stop() {
         reportProgress(force: true)
+        saveVolume()
         cancelTasks()
         playRequested = false
         tearDownEngines()
@@ -272,7 +274,8 @@ public final class PlayerController {
             return
         }
         loadTimeoutTask?.cancel()
-        stallTask?.cancel()
+        stopStallWatch()
+        cancelPendingSeek()
         let attempt = plan[index]
         let previous = engine
         let previousRendered = attemptRendered
@@ -318,16 +321,16 @@ public final class PlayerController {
         routingPlayer = newEngine.routingPlayer
         supportsAspectRatioOverride = newEngine.supportsAspectRatioOverride
 
-        newEngine.load(
-            url: attempt.url, headers: item.httpHeaders, startPosition: startPosition, isLive: item.isLive)
-        if playRequested { newEngine.play() }
-
         let timeout = loadTimeout
         loadTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
             self?.handleLoadTimeout(generation: generation)
         }
+        newEngine.load(
+            url: attempt.url, headers: item.httpHeaders, startPosition: startPosition, isLive: item.isLive)
+        // An engine can fail synchronously in load(), after which it has already been replaced.
+        if generation == engineGeneration, playRequested { newEngine.play() }
     }
 
     private func advanceAttempt(startPosition: TimeInterval?) {
@@ -351,6 +354,7 @@ public final class PlayerController {
     private func handleFailure(_ message: String) {
         lastErrorMessage = message
         loadTimeoutTask?.cancel()
+        stopStallWatch()
         if isReconnecting {
             scheduleReconnect()
         } else if attemptRendered {
@@ -366,6 +370,7 @@ public final class PlayerController {
     }
 
     private func scheduleReconnect() {
+        guard reconnectTask == nil else { return }
         guard let delay = reconnectPolicy.delay(forAttempt: reconnectCount) else {
             fail(lastErrorMessage ?? "La diffusion a été interrompue.")
             return
@@ -374,10 +379,10 @@ public final class PlayerController {
         isReconnecting = true
         statusMessage = "Reconnexion…"
         if phase != .loading { setPhase(.buffering) }
-        reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled else { return }
+            self.reconnectTask = nil
             let position: TimeInterval? = self.item.isLive ? nil : self.currentTime
             self.beginAttempt(at: self.planIndex, startPosition: position)
         }
@@ -453,8 +458,9 @@ public final class PlayerController {
         {
             reconnectCount = 0
         }
-        if phase == .playing, !item.isLive, let duration, progressThrottle.shouldReport(at: now) {
-            onProgress?(current, duration)
+        if phase == .playing, !item.isLive, !autoHide.isScrubbing, seekTask == nil,
+           let duration, progressThrottle.shouldReport(at: now) {
+            onProgress?(currentTime, duration)
         }
     }
 
@@ -465,18 +471,16 @@ public final class PlayerController {
         case .playing:
             guard playRequested else { return }
             if playingSince == nil { playingSince = uptime() }
-            stallTask?.cancel()
+            stopStallWatch()
             if !isSwitchingStream { statusMessage = nil }
             setPhase(.playing)
-        case .paused:
-            if playRequested {
-                setPhase(attemptRendered ? .buffering : .loading)
-                watchForStall()
-            } else {
-                setPhase(.paused)
-            }
-        case .buffering:
+        case .paused, .buffering:
             playingSince = nil
+            guard playRequested else {
+                stopStallWatch()
+                setPhase(.paused)
+                return
+            }
             setPhase(attemptRendered ? .buffering : .loading)
             watchForStall()
         }
@@ -508,18 +512,33 @@ public final class PlayerController {
     }
 
     private func watchForStall() {
-        guard attemptRendered, playRequested else { return }
-        stallTask?.cancel()
+        guard attemptRendered, playRequested, stallTask == nil else { return }
         let threshold = item.isLive ? reconnectPolicy.stallThreshold : vodStallThreshold
+        let beganWaitingAt = uptime()
         stallTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(threshold))
-            guard let self, !Task.isCancelled, self.playRequested else { return }
-            guard self.phase == .buffering || self.phase == .loading,
-                self.uptime() - self.lastProgressAt >= threshold - 0.5
-            else { return }
-            self.lastErrorMessage = "Le flux ne répond plus."
-            self.scheduleReconnect()
+            while !Task.isCancelled {
+                guard let delay = self.map({ controller in
+                    max(beganWaitingAt, controller.lastProgressAt) + threshold - controller.uptime()
+                }) else { return }
+                if delay > 0 {
+                    try? await Task.sleep(for: .seconds(delay))
+                    continue
+                }
+                guard let self else { return }
+                self.stallTask = nil
+                guard self.playRequested, self.phase == .buffering || self.phase == .loading else {
+                    return
+                }
+                self.lastErrorMessage = "Le flux ne répond plus."
+                self.scheduleReconnect()
+                return
+            }
         }
+    }
+
+    private func stopStallWatch() {
+        stallTask?.cancel()
+        stallTask = nil
     }
 
     private func retireOldEngines() {
@@ -553,7 +572,12 @@ public final class PlayerController {
     private func cancelTasks() {
         loadTimeoutTask?.cancel()
         reconnectTask?.cancel()
-        stallTask?.cancel()
+        reconnectTask = nil
+        stopStallWatch()
+        cancelPendingSeek()
+    }
+
+    private func cancelPendingSeek() {
         seekTask?.cancel()
         seekTask = nil
     }
@@ -614,6 +638,7 @@ public final class PlayerController {
 
     public func pause() {
         playRequested = false
+        stopStallWatch()
         engine?.pause()
         if phase == .playing || phase == .buffering { setPhase(.paused) }
         reportProgress(force: true)
@@ -664,15 +689,28 @@ public final class PlayerController {
     // MARK: - Audio
 
     public func setVolume(_ value: Float, showHUD: Bool = false) {
+        setVolume(value, showHUD: showHUD, save: true)
+    }
+
+    func setVolume(_ value: Float, showHUD: Bool = false, save: Bool) {
         let clamped = min(1, max(0, value))
-        volume = clamped
-        engine?.volume = clamped
-        preferences.volume = clamped
+        if volume != clamped {
+            volume = clamped
+            engine?.volume = clamped
+            volumeNeedsSave = true
+        }
+        if save { saveVolume() }
         if clamped > 0, isMuted {
             isMuted = false
             engine?.isMuted = false
         }
         if showHUD { showFeedback(.volume(clamped, muted: isMuted)) }
+    }
+
+    func saveVolume() {
+        guard volumeNeedsSave else { return }
+        preferences.volume = volume
+        volumeNeedsSave = false
     }
 
     public func toggleMute() {

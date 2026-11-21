@@ -30,6 +30,7 @@ struct TitlePlaybackSheet: View {
     @State private var selectedID: ContentID?
     @State private var isLoading = false
     @State private var loadingRevision = 0
+    @State private var isClosing = false
     @FocusState private var focusedOption: ContentID?
 
     init(
@@ -44,11 +45,12 @@ struct TitlePlaybackSheet: View {
         self.repository = repository
         self.resumePosition = resumePosition
         self.onPlay = onPlay
-        _choices = State(initialValue: PlaybackSheetChoices(selection.options))
+        _choices = State(initialValue: PlaybackSheetChoices(selection.options, followedBy: selection.otherEditions))
     }
 
     var body: some View {
-        let visible = choices[language]
+        let section = choices.section(for: language)
+        let visible = section.options
         let selected = visible.first { $0.id == selectedID }
             ?? visible.first { $0.id == selection.preferred }
             ?? visible.first
@@ -56,7 +58,7 @@ struct TitlePlaybackSheet: View {
             header
             VStack(alignment: .leading, spacing: 14) {
                 if choices.filters.count > 1 { languageFilters }
-                editionList(visible, activeID: selected?.id)
+                editionList(section, activeID: selected?.id)
                 if selected?.titleEdition.edition.key == "MULTI" {
                     Label("Les pistes audio se choisissent dans le lecteur.", systemImage: "waveform")
                         .foregroundStyle(.secondary)
@@ -182,12 +184,13 @@ struct TitlePlaybackSheet: View {
     private func setFilter(_ filter: PlaybackSheetFilter) {
         guard language != filter else { return }
         language = filter
-        selectedID = nil
+        if !choices[filter].contains(where: { $0.id == selectedID }) { selectedID = nil }
+        focusedOption = nil
     }
 
-    private func editionList(_ visible: [TitlePlaybackOption], activeID: ContentID?) -> some View {
-        let groups = PlaybackSourceGroup.grouped(visible)
-        let ordered = groups.flatMap(\.options)
+    private func editionList(_ section: PlaybackSheetChoices.Section, activeID: ContentID?) -> some View {
+        let visible = section.options
+        let groups = section.groups
         let expected = selection.options.count + selection.otherEditions.count
         let rows = min(max(visible.count, expected > 0 && language == .all ? expected : 1), 5)
         return VStack(alignment: .leading, spacing: 8) {
@@ -231,8 +234,8 @@ struct TitlePlaybackSheet: View {
                                         focusedOption = option.id
                                     }
                                     .focused($focusedOption, equals: option.id)
-                                    .onKeyPress(.upArrow) { moveSelection(from: option.id, by: -1, options: ordered, proxy: proxy) }
-                                    .onKeyPress(.downArrow) { moveSelection(from: option.id, by: 1, options: ordered, proxy: proxy) }
+                                    .onKeyPress(.upArrow) { moveSelection(from: option.id, by: -1, options: section.ordered, proxy: proxy) }
+                                    .onKeyPress(.downArrow) { moveSelection(from: option.id, by: 1, options: section.ordered, proxy: proxy) }
                                     .id(option.id)
                                 }
                             }
@@ -284,7 +287,11 @@ struct TitlePlaybackSheet: View {
                 Label("Certaines sources sont indisponibles.", systemImage: "exclamationmark.circle")
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Réessayer") { loadingRevision += 1 }
+                Button("Réessayer") {
+                    guard !isLoading else { return }
+                    isLoading = true
+                    loadingRevision += 1
+                }
                     .buttonStyle(.glass)
                     .controlSize(.small)
             }
@@ -295,13 +302,17 @@ struct TitlePlaybackSheet: View {
     private func footer(_ selected: TitlePlaybackOption?) -> some View {
         let position = selected.flatMap(resumePosition)
         return HStack(spacing: 8) {
-            Button("Annuler", role: .cancel) { dismiss() }
+            Button("Annuler", role: .cancel) {
+                isClosing = true
+                dismiss()
+            }
                 .buttonStyle(.glass)
                 .keyboardShortcut(.cancelAction)
             Spacer(minLength: 8)
             if position != nil, let selected {
                 Button("Depuis le début") { confirm(selected, position: nil) }
                     .buttonStyle(.glass)
+                    .disabled(isClosing)
             }
             Button {
                 if let selected { confirm(selected, position: position) }
@@ -311,7 +322,7 @@ struct TitlePlaybackSheet: View {
             .buttonStyle(.glassProminent)
             .tint(Color(white: 0.28))
             .keyboardShortcut(.defaultAction)
-            .disabled(selected == nil)
+            .disabled(selected == nil || isClosing)
         }
         .controlSize(.large)
         .padding(.horizontal, 22)
@@ -319,54 +330,29 @@ struct TitlePlaybackSheet: View {
     }
 
     private func confirm(_ option: TitlePlaybackOption, position: TimeInterval?) {
+        guard !isClosing else { return }
+        isClosing = true
         dismiss()
         onPlay(option, position)
     }
 
     private func resolveEditions() async {
-        guard let episode = selection.episode else { return }
-        let repository = repository
-        let editions = loadingRevision == 0 ? selection.otherEditions : failures
-        guard !editions.isEmpty else { return }
-        let coordinate = EpisodeCoordinate(episode)
+        let revision = loadingRevision
+        let editions = revision == 0 ? selection.otherEditions : failures
+        guard let episode = selection.episode, !editions.isEmpty, !Task.isCancelled else { return }
         isLoading = true
         failures = []
-        defer { isLoading = false }
-        // Bound remote requests and retain catalog/source order as results arrive.
-        for start in stride(from: 0, to: editions.count, by: 4) {
-            guard !Task.isCancelled else { return }
-            let end = min(start + 4, editions.count)
-            let results = await withTaskGroup(of: EditionResult.self) { group in
-                for index in start..<end {
-                    let edition = editions[index]
-                    group.addTask {
-                        guard let series = edition.variant.series else { return .init(index: index) }
-                        do {
-                            let detail = try await repository.seriesDetail(series, source: edition.source)
-                            let match = detail.seasons.lazy
-                                .filter { $0.number == coordinate.season }
-                                .flatMap(\.episodes)
-                                .first { EpisodeCoordinate($0) == coordinate }
-                            let option = match.flatMap { TitlePlaybackOption(edition: edition, episode: $0) }
-                            return .init(index: index, option: option)
-                        } catch {
-                            return .init(index: index, failed: true)
-                        }
-                    }
-                }
-                var values: [EditionResult] = []
-                for await result in group { values.append(result) }
-                return values.sorted { $0.index < $1.index }
+        await AlternateEditionResolver.resolve(editions, episode: episode, load: { [repository] series, source in
+            try await repository.seriesDetail(series, source: source)
+        }) { result in
+            guard revision == loadingRevision, !isClosing, !Task.isCancelled else { return false }
+            if let option = result.option {
+                choices.append([option])
+            } else if result.failed {
+                failures.append(editions[result.index])
             }
-            guard !Task.isCancelled else { return }
-            choices.append(results.compactMap(\.option))
-            failures.append(contentsOf: results.filter(\.failed).map { editions[$0.index] })
+            return true
         }
-    }
-
-    private nonisolated struct EditionResult: Sendable {
-        let index: Int
-        var option: TitlePlaybackOption?
-        var failed = false
+        if revision == loadingRevision, !Task.isCancelled { isLoading = false }
     }
 }

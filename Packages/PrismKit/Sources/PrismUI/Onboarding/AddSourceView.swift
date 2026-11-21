@@ -45,7 +45,7 @@ struct AddSourceView: View {
     private static let allowedFiles = [UTType(filenameExtension: "m3u"), UTType(filenameExtension: "m3u8")].compactMap { $0 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 19) {
+        VStack(alignment: .leading, spacing: 0) {
             header
             Group {
                 if let progress {
@@ -57,17 +57,19 @@ struct AddSourceView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 22)
             .transition(.opacity)
             if let error {
                 Label(error, systemImage: "exclamationmark.circle.fill")
                     .font(.callout)
                     .foregroundStyle(.red)
                     .accessibilityAddTraits(.updatesFrequently)
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, 12)
             }
             footer
         }
-        .padding(30)
-        .frame(width: 546, height: 508)
+        .frame(width: 552, height: 470)
         .fileImporter(isPresented: $showsFileImporter, allowedContentTypes: Self.allowedFiles, onCompletion: importFile)
         .interactiveDismissDisabled(importTask != nil || progress?.stage == .finished)
         .onDisappear { importTask?.cancel() }
@@ -79,27 +81,13 @@ struct AddSourceView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            let finished = progress?.stage == .finished
-            let importing = progress != nil && !finished
-            Image(systemName: finished ? "checkmark.seal.fill" : importing ? "arrow.down.circle" : kind?.setupIcon ?? "square.stack.3d.up.badge.plus")
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 45, height: 45)
-                .background(Color.accentColor.opacity(0.12), in: .rect(cornerRadius: PrismMetrics.listRowRadius))
-                .contentTransition(.symbolEffect(.replace))
-                .accessibilityHidden(true)
-            Text(finished ? "Tout est prêt" : importing ? "Importation de la source" : kind?.setupTitle ?? "Ajouter une source")
-                .font(.system(size: 29, weight: .bold))
-                .tracking(-0.8)
-                .accessibilityAddTraits(.isHeader)
-            if progress == nil {
-                Text(kind?.setupHelp ?? "Choisissez le format fourni par votre service IPTV.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
+        let finished = progress?.stage == .finished
+        let importing = progress != nil && !finished
+        return SourceSheetHeading(
+            title: finished ? "Tout est prêt" : importing ? "Importation de la source" : kind?.setupTitle ?? "Ajouter une source",
+            subtitle: progress == nil ? kind?.setupHelp ?? "Choisissez le format fourni par votre service IPTV." : nil,
+            symbol: finished ? "checkmark.seal.fill" : importing ? "arrow.down.circle" : kind?.setupIcon ?? "rectangle.connected.to.line.below"
+        )
     }
 
     private var choices: some View {
@@ -107,7 +95,6 @@ struct AddSourceView: View {
             ForEach(SourceKind.allCases, id: \.self) { option in
                 Button {
                     changeStep { kind = option }
-                    focus = option == .m3uFile ? .name : .address
                 } label: {
                     HStack(spacing: 13) {
                         Image(systemName: option.setupIcon)
@@ -129,7 +116,7 @@ struct AddSourceView: View {
                     .padding(.vertical, 13)
                     .contentShape(.rect(cornerRadius: PrismMetrics.listRowRadius))
                 }
-                .buttonStyle(.pressable)
+                .buttonStyle(.plain)
                 if option != SourceKind.allCases.last {
                     Divider().padding(.leading, 49).padding(.trailing, 14)
                 }
@@ -145,6 +132,7 @@ struct AddSourceView: View {
                 if kind == .m3uFile {
                     HStack(spacing: 10) {
                         Button("Choisir le fichier…", systemImage: "folder") { showsFileImporter = true }
+                            .buttonStyle(.glass)
                         if let file {
                             Text(file.url.lastPathComponent)
                                 .lineLimit(1)
@@ -156,6 +144,7 @@ struct AddSourceView: View {
                 } else {
                     formField(kind == .xtream ? "Adresse du serveur" : "URL de la playlist") {
                         TextField(kind == .xtream ? "https://iptv.exemple.com:8080" : "https://exemple.com/playlist.m3u", text: $address)
+                            .autocorrectionDisabled()
                             .focused($focus, equals: .address)
                     }
                     if showsValidation, sourceURL == nil { validationText("Saisissez une adresse HTTP ou HTTPS valide.") }
@@ -164,6 +153,7 @@ struct AddSourceView: View {
                     HStack(alignment: .top, spacing: 12) {
                         formField("Identifiant") {
                             TextField("Nom d’utilisateur", text: $username)
+                                .autocorrectionDisabled()
                                 .focused($focus, equals: .username)
                         }
                         formField("Mot de passe") {
@@ -177,6 +167,7 @@ struct AddSourceView: View {
                             guard let message = values.first else { return }
                             fillXtreamFields(from: message)
                         }
+                        .buttonStyle(.glass)
                         .accessibilityLabel("Coller les codes Xtream")
                         Text("Depuis un lien ou un message de votre fournisseur")
                             .font(.caption)
@@ -191,6 +182,7 @@ struct AddSourceView: View {
                     VStack(alignment: .leading, spacing: 13) {
                         formField("Guide TV XMLTV · facultatif") {
                             TextField("https://exemple.com/guide.xml", text: $guideAddress)
+                                .autocorrectionDisabled()
                                 .focused($focus, equals: .guide)
                         }
                         if showsValidation, !trimmed(guideAddress).isEmpty, remoteURL(guideAddress) == nil {
@@ -209,8 +201,11 @@ struct AddSourceView: View {
                 .padding(.vertical, 10)
                 .background(PrismColors.panelFill, in: .rect(cornerRadius: PrismMetrics.panelRadius))
             }
-            .padding(.trailing, 8)
+            .padding(.horizontal, 4)
+            .padding(.bottom, 12)
         }
+        .defaultFocus($focus, kind == .m3uFile ? .name : .address)
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
         .onSubmit(startSelectedImport)
     }
 
@@ -280,13 +275,15 @@ struct AddSourceView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 12) {
+        SourceSheetFooter {
             if progress?.stage == .finished {
                 Spacer()
-                PrimaryCapsuleButton(allowsDemo ? "Ouvrir Prism" : "Terminer", style: .accent, height: PrismMetrics.largeButtonHeight, action: onImported)
+                Button(allowsDemo ? "Ouvrir Prism" : "Terminer", action: onImported)
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
             } else if importTask != nil {
                 Button("Annuler l’importation") { importTask?.cancel() }
+                    .buttonStyle(.glass)
                     .keyboardShortcut(.cancelAction)
                 Spacer()
             } else if kind != nil {
@@ -300,17 +297,20 @@ struct AddSourceView: View {
                         password = ""
                     }
                 }
+                .buttonStyle(.glass)
                 .keyboardShortcut(.cancelAction)
                 Spacer()
-                PrimaryCapsuleButton("Se connecter", systemImage: "arrow.right", style: .accent, height: PrismMetrics.largeButtonHeight, action: startSelectedImport)
+                Button("Se connecter", systemImage: "arrow.right", action: startSelectedImport)
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
             } else {
-                Button("Annuler", action: { dismiss() })
+                Button("Annuler", role: .cancel, action: { dismiss() })
+                    .buttonStyle(.glass)
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 if allowsDemo {
                     Button("Essayer la démo") { runImport { model.importDemo() } }
-                        .buttonStyle(.link)
+                        .buttonStyle(.glass)
                 }
             }
         }
@@ -413,6 +413,8 @@ struct AddSourceView: View {
             let bookmark = try selected.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess], includingResourceValuesForKeys: nil, relativeTo: nil)
             file = SelectedFile(url: selected, bookmark: bookmark)
             error = nil
+        } catch let cancelled as CocoaError where cancelled.code == .userCancelled {
+            return
         } catch {
             self.error = "Prism n’a pas pu ouvrir ce fichier. Sélectionnez une playlist M3U accessible."
         }

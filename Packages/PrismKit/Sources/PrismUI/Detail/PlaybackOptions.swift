@@ -28,15 +28,6 @@ nonisolated struct PrismPlaybackAction: Equatable, Sendable {
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.owner == rhs.owner }
 }
 
-extension DetailEpisodeInventory {
-    /// Continue in the selected edition and in episode order, including across seasons.
-    nonisolated func nextAvailableEpisode(after id: ContentID) -> Episode? {
-        guard let index = orderedEpisodes.firstIndex(where: { $0.id == id }) else { return nil }
-        let next = orderedEpisodes.index(after: index)
-        return orderedEpisodes.indices.contains(next) ? orderedEpisodes[next] : nil
-    }
-}
-
 extension EnvironmentValues {
     @Entry var playPrismItem: PrismPlaybackAction = .none
 }
@@ -164,7 +155,9 @@ nonisolated struct TitlePlaybackOption: Identifiable, Sendable {
     /// Different cuts and streams with unknown runtimes keep independent positions.
     func resumePosition(exact: PlaybackProgress?, equivalent: PlaybackProgress?) -> TimeInterval? {
         if let exact {
-            return exact.position >= 5 && !exact.isFinished ? exact.position : nil
+            guard exact.position >= 5, !exact.isFinished,
+                  duration.map({ $0 <= 0 || exact.position < Double($0) }) != false else { return nil }
+            return exact.position
         }
         guard let equivalent, equivalent.position >= 5, !equivalent.isFinished, let duration,
               abs(Double(duration) - equivalent.duration) <= min(60, equivalent.duration * 0.03),

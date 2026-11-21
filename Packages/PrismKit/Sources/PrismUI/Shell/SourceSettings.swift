@@ -53,6 +53,7 @@ struct SourceDetailView: View {
                                 Button("Filtrer les catégories…", systemImage: "line.3.horizontal.decrease") {
                                     filteringCategories = true
                                 }
+                                .buttonStyle(.glass)
                             }
                             HStack {
                                 Button("Actualiser", systemImage: "arrow.clockwise") { Task { await app.refresh(sourceID) } }
@@ -61,6 +62,7 @@ struct SourceDetailView: View {
                                 Spacer()
                                 Button("Supprimer…", role: .destructive) { removing = true }
                             }
+                            .buttonStyle(.glass)
                             .disabled(app.isImporting(sourceID))
                         }
                     }
@@ -109,6 +111,12 @@ private struct SourceCategorySheet: View {
     let categories: [PrismCore.Category]
     @State private var hiddenIDs: Set<String>
     @State private var query = ""
+    @State private var filtered: [MediaKind: [PrismCore.Category]]?
+
+    private struct SearchKey: Equatable {
+        let term: String
+        let catalogRevision: Int
+    }
 
     init(source: Source, categories: [PrismCore.Category], hiddenIDs: Set<String>) {
         self.source = source
@@ -118,51 +126,78 @@ private struct SourceCategorySheet: View {
 
     var body: some View {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let matches = categories.filter { term.isEmpty || $0.name.localizedStandardContains(term) }
-        let groups = Dictionary(grouping: matches, by: \.kind)
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Catégories de \(source.name)").font(.title2.bold())
+        VStack(alignment: .leading, spacing: 0) {
+            SourceSheetHeading(title: "Catégories visibles", subtitle: source.name, symbol: "line.3.horizontal.decrease")
             if categories.isEmpty {
                 ContentUnavailableView("Catégories indisponibles", systemImage: "line.3.horizontal.decrease")
                     .frame(maxHeight: .infinity)
             } else {
-                Text("Cochez les catégories à afficher dans votre catalogue.")
-                    .foregroundStyle(.secondary)
-                TextField("Rechercher une catégorie", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                if matches.isEmpty {
-                    ContentUnavailableView.search(text: term)
-                        .frame(maxHeight: .infinity)
-                } else {
-                    List {
-                        ForEach([MediaKind.live, .movie, .series], id: \.self) { kind in
-                            if let categories = groups[kind], !categories.isEmpty {
-                                Section(kind.sectionTitle) {
-                                    ForEach(categories) { category in
-                                        Toggle(category.name, isOn: visibility(for: category.id))
-                                            .toggleStyle(.checkbox)
-                                    }
-                                }
-                            }
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Rechercher une catégorie", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.large)
+                    if let filtered {
+                        if filtered.isEmpty {
+                            ContentUnavailableView.search(text: term)
+                                .frame(maxHeight: .infinity)
+                        } else {
+                            results(filtered)
                         }
+                    } else {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .accessibilityLabel("Chargement des catégories")
                     }
-                    .listStyle(.inset)
                 }
+                .padding(.horizontal, 22)
+                .padding(.bottom, 12)
             }
-            HStack {
+            SourceSheetFooter {
                 Button("Tout afficher") { hiddenIDs.removeAll() }
+                    .buttonStyle(.glass)
                     .disabled(hiddenIDs.isEmpty)
                 Spacer()
-                Button("Annuler") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Annuler", role: .cancel) { dismiss() }
+                    .buttonStyle(.glass)
+                    .keyboardShortcut(.cancelAction)
                 Button("Appliquer") {
                     app.setHiddenCategoryIDs(hiddenIDs, for: source.id)
                     dismiss()
                 }
+                .buttonStyle(.glassProminent)
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(20)
-        .frame(width: 500, height: 490)
+        .frame(width: 552, height: 490)
+        .task(id: SearchKey(term: term, catalogRevision: app.catalogRevision)) {
+            if !term.isEmpty { try? await Task.sleep(for: .milliseconds(130)) }
+            guard !Task.isCancelled else { return }
+            let groups = await Self.matchingCategories(categories, term: term)
+            if !Task.isCancelled { filtered = groups }
+        }
+    }
+
+    private func results(_ groups: [MediaKind: [PrismCore.Category]]) -> some View {
+        List {
+            ForEach([MediaKind.live, .movie, .series], id: \.self) { kind in
+                if let categories = groups[kind] {
+                    Section(kind.sectionTitle) {
+                        ForEach(categories) { category in
+                            Toggle(category.name, isOn: visibility(for: category.id))
+                                .toggleStyle(.checkbox)
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.inset)
+        .clipShape(.rect(cornerRadius: PrismMetrics.panelRadius))
+    }
+
+    @concurrent private static func matchingCategories(
+        _ categories: [PrismCore.Category], term: String
+    ) async -> [MediaKind: [PrismCore.Category]] {
+        Dictionary(grouping: categories.lazy.filter { term.isEmpty || $0.name.localizedStandardContains(term) }, by: \.kind)
     }
 
     private func visibility(for id: String) -> Binding<Bool> {
@@ -196,6 +231,7 @@ private struct EditSourceSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SourceSheetHeading(title: "Modifier la source", subtitle: source.kind.displayLabel, symbol: "pencil")
             Form {
                 Section("Source") {
                     TextField("Nom", text: $source.name)
@@ -205,10 +241,13 @@ private struct EditSourceSheet: View {
                     }
                     if source.kind == .xtream {
                         TextField("Identifiant", text: Binding(get: { source.username ?? "" }, set: { source.username = $0 }))
+                            .autocorrectionDisabled()
                         SecureField("Nouveau mot de passe (facultatif)", text: $password)
                     }
-                    TextField("URL du guide XMLTV", text: $guideURL)
-                    TextField("User-Agent", text: $userAgent)
+                }
+                Section("Options avancées") {
+                    TextField("URL du guide XMLTV", text: $guideURL).autocorrectionDisabled()
+                    TextField("User-Agent", text: $userAgent).autocorrectionDisabled()
                     if source.kind == .xtream {
                         Toggle("Préférer le flux HLS en direct", isOn: $source.preferHLSForLive)
                     }
@@ -217,9 +256,11 @@ private struct EditSourceSheet: View {
                 }
             }
             .formStyle(.grouped)
-            HStack {
+            SourceSheetFooter {
                 Spacer()
-                Button("Annuler") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Annuler", role: .cancel) { dismiss() }
+                    .buttonStyle(.glass)
+                    .keyboardShortcut(.cancelAction)
                 Button("Enregistrer") {
                     source.name = source.name.trimmingCharacters(in: .whitespacesAndNewlines)
                     if source.kind != .m3uFile { source.serverURL = httpURL(server) }
@@ -229,15 +270,15 @@ private struct EditSourceSheet: View {
                     app.update(source, password: password.nilIfEmpty)
                     dismiss()
                 }
+                .buttonStyle(.glassProminent)
                 .keyboardShortcut(.defaultAction)
                 .disabled(source.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                           (source.kind != .m3uFile && httpURL(server) == nil) ||
                           (source.kind == .xtream && source.username?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false) ||
                           (!guideURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && httpURL(guideURL) == nil))
             }
-            .padding()
         }
-        .frame(width: 500, height: source.kind == .xtream ? 430 : 320)
+        .frame(width: 552, height: 490)
         .onAppear {
             server = source.serverURL?.absoluteString ?? ""
             guideURL = source.epgURL?.absoluteString ?? ""
@@ -247,7 +288,10 @@ private struct EditSourceSheet: View {
 }
 
 struct PrismSettingsView: View {
+    enum Page: Hashable { case general, player, services }
+
     @Environment(AppModel.self) private var app
+    @State private var page: Page
     @State private var metadataKey = ""
     @State private var sportsAPIKey = ""
     @State private var sportsKeySaved = false
@@ -255,104 +299,20 @@ struct PrismSettingsView: View {
     @State private var showAddSource = false
     @State private var preferences = PlayerPreferences.standard
 
-    var body: some View {
-        @Bindable var app = app
-        @Bindable var preferences = preferences
-        TabView {
-            Form {
-                Section("Catalogue") {
-                    Toggle("Masquer les contenus pour adultes", isOn: $app.hideAdultContent)
-                    Button("Actualiser toutes les sources") { Task { await app.refreshAll() } }
-                        .disabled(app.sources.isEmpty || app.isImportingAnything)
-                    Button("Ajouter une source…", systemImage: "plus.circle") { showAddSource = true }
-                }
-                Section {
-                    Picker("Langues audio", selection: Binding(
-                        get: { app.homeAudioLanguages },
-                        set: { app.setHomeAudioLanguages($0) }
-                    )) {
-                        Text("Français").tag(Set([HomeAudioLanguage.french]))
-                        Text("Anglais").tag(Set([HomeAudioLanguage.english]))
-                        Text("Français et anglais").tag(HomeAudioLanguage.defaults)
-                    }
-                    .pickerStyle(.segmented)
-                } header: {
-                    Text("Recommandations")
-                } footer: {
-                    Text("Langues audio des titres suggérés dans Accueil, Films et Séries.")
-                }
-                Section("Métadonnées") {
-                    SecureField("Clé TMDB", text: $metadataKey)
-                    Button("Enregistrer la clé") { app.setTMDBKey(metadataKey) }
-                    Text("La clé enrichit les fiches et affiche les tendances TMDB disponibles dans vos sources.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section {
-                    SecureField("Clé TheSportsDB", text: $sportsAPIKey)
-                    Button("Enregistrer la clé") { saveSportsKey(sportsAPIKey) }
-                        .disabled(sportsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    if sportsKeySaved {
-                        Button("Retirer la clé", role: .destructive) { saveSportsKey(nil) }
-                    }
-                    if let sportsKeyError {
-                        Text(sportsKeyError).foregroundStyle(.red)
-                    }
-                } header: {
-                    Text("Scores sportifs")
-                } footer: {
-                    Text("Pour suivre les scores en direct, ajoutez une clé TheSportsDB Premium.")
-                }
-                Section("Crédits") {
-                    if let website = URL(string: "https://www.themoviedb.org") {
-                        Link(destination: website) {
-                            if let file = Bundle.module.url(forResource: "TMDBLogo", withExtension: "svg"),
-                               let logo = NSImage(contentsOf: file) {
-                                Image(nsImage: logo)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(width: 110)
-                                    .accessibilityLabel("TMDB")
-                            } else {
-                                Text("TMDB")
-                            }
-                        }
-                    }
-                    Text(verbatim: "This product uses the TMDB API but is not endorsed or certified by TMDB.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Général", systemImage: "gearshape") }
+    private static let tmdbLogo: NSImage? = Bundle.module.url(forResource: "TMDBLogo", withExtension: "svg")
+        .flatMap { NSImage(contentsOf: $0) }
 
-            Form {
-                Section("Lecture") {
-                    Picker("Moteur vidéo", selection: $preferences.defaultEngine) {
-                        ForEach(PlaybackEngineKind.allCases, id: \.self) { engine in
-                            Text(engine.displayName).tag(engine)
-                        }
-                    }
-                    Toggle("Conserver les proportions de la fenêtre", isOn: $preferences.keepsWindowAspectRatio)
-                }
-                Section("Langues") {
-                    Picker("Audio préféré", selection: $preferences.preferredAudioLanguage) {
-                        Text("Par défaut").tag(nil as String?)
-                        Text("Français").tag("fr" as String?)
-                        Text("Anglais").tag("en" as String?)
-                    }
-                    Toggle("Activer les sous-titres", isOn: $preferences.subtitlesEnabled)
-                    Picker("Langue des sous-titres", selection: $preferences.preferredSubtitleLanguage) {
-                        Text("Par défaut").tag(nil as String?)
-                        Text("Français").tag("fr" as String?)
-                        Text("Anglais").tag("en" as String?)
-                    }
-                    .disabled(!preferences.subtitlesEnabled)
-                }
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Lecteur", systemImage: "play.rectangle") }
+    init(initialPage: Page = .general) {
+        _page = State(initialValue: initialPage)
+    }
+
+    var body: some View {
+        TabView(selection: $page) {
+            Tab("Général", systemImage: "gearshape", value: .general) { catalogPreferences }
+            Tab("Lecteur", systemImage: "play.rectangle", value: .player) { playerPreferences }
+            Tab("Services", systemImage: "network", value: .services) { services }
         }
-        .frame(width: 500, height: 365)
+        .frame(width: 552, height: 440)
         .task {
             metadataKey = app.tmdbKey ?? ""
             sportsKeySaved = app.hasSportsAPIKey
@@ -363,6 +323,118 @@ struct PrismSettingsView: View {
                 showAddSource = false
             })
         }
+    }
+
+    private var catalogPreferences: some View {
+        @Bindable var app = app
+        return Form {
+            Section("Catalogue") {
+                Toggle("Masquer les contenus pour adultes", isOn: $app.hideAdultContent)
+                HStack {
+                    Button("Actualiser les sources", systemImage: "arrow.clockwise") { Task { await app.refreshAll() } }
+                        .disabled(app.sources.isEmpty || app.isImportingAnything)
+                    Button("Ajouter une source…", systemImage: "plus") { showAddSource = true }
+                }
+                .buttonStyle(.glass)
+            }
+            Section {
+                Picker("Langues audio", selection: Binding(
+                    get: { app.homeAudioLanguages },
+                    set: { app.setHomeAudioLanguages($0) }
+                )) {
+                    Text("Français").tag(Set([HomeAudioLanguage.french]))
+                    Text("Anglais").tag(Set([HomeAudioLanguage.english]))
+                    Text("Français et anglais").tag(HomeAudioLanguage.defaults)
+                }
+                .pickerStyle(.menu)
+            } header: {
+                Text("Recommandations")
+            } footer: {
+                Text("Langues audio des titres suggérés dans Accueil, Films et Séries.")
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var playerPreferences: some View {
+        @Bindable var preferences = preferences
+        return Form {
+            Section("Lecture") {
+                Picker("Moteur vidéo", selection: $preferences.defaultEngine) {
+                    ForEach(PlaybackEngineKind.allCases, id: \.self) { engine in
+                        Text(engine.displayName).tag(engine)
+                    }
+                }
+                Toggle("Conserver les proportions de la fenêtre", isOn: $preferences.keepsWindowAspectRatio)
+            }
+            Section("Langues") {
+                Picker("Audio préféré", selection: $preferences.preferredAudioLanguage) {
+                    Text("Par défaut").tag(nil as String?)
+                    Text("Français").tag("fr" as String?)
+                    Text("Anglais").tag("en" as String?)
+                }
+                Toggle("Activer les sous-titres", isOn: $preferences.subtitlesEnabled)
+                Picker("Langue des sous-titres", selection: $preferences.preferredSubtitleLanguage) {
+                    Text("Par défaut").tag(nil as String?)
+                    Text("Français").tag("fr" as String?)
+                    Text("Anglais").tag("en" as String?)
+                }
+                .disabled(!preferences.subtitlesEnabled)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var services: some View {
+        Form {
+            Section {
+                SecureField("Clé TMDB", text: $metadataKey)
+                Button("Enregistrer la clé TMDB") { app.setTMDBKey(metadataKey) }
+                    .buttonStyle(.glass)
+            } header: {
+                Text("Films et séries")
+            } footer: {
+                Text("TMDB enrichit les fiches et affiche les tendances disponibles dans vos sources.")
+            }
+            Section {
+                SecureField("Clé TheSportsDB", text: $sportsAPIKey)
+                HStack(spacing: 8) {
+                    Button("Enregistrer la clé TheSportsDB") { saveSportsKey(sportsAPIKey) }
+                        .disabled(sportsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if sportsKeySaved {
+                        Button("Retirer la clé", role: .destructive) { saveSportsKey(nil) }
+                    }
+                }
+                .buttonStyle(.glass)
+                if let sportsKeyError {
+                    Label(sportsKeyError, systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Scores sportifs")
+            } footer: {
+                Text("Pour suivre les scores en direct, ajoutez une clé TheSportsDB Premium.")
+            }
+            Section("Crédits") {
+                if let website = URL(string: "https://www.themoviedb.org") {
+                    Link(destination: website) {
+                        if let logo = Self.tmdbLogo {
+                            Image(nsImage: logo)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 110)
+                                .accessibilityLabel("TMDB")
+                        } else {
+                            Text("TMDB")
+                        }
+                    }
+                }
+                Text(verbatim: "This product uses the TMDB API but is not endorsed or certified by TMDB.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 
     private func saveSportsKey(_ value: String?) {

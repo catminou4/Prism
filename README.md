@@ -14,7 +14,7 @@ Avec une clé TMDB dans les réglages, Films et Séries peuvent afficher le clas
 
 ## Données sportives
 
-Les calendriers et résultats proviennent de l’API publique TheSportsDB. L’accès gratuit fournit la prochaine rencontre et la plus récente par compétition. Pour les scores en direct selon la couverture du fournisseur, enregistrez une clé TheSportsDB Premium dans **Réglages → Général → Scores sportifs**. La boxe affiche les combats et les résultats en texte lorsque le fournisseur les renseigne. Les horaires s’affichent dans le fuseau de votre Mac. [Documentation TheSportsDB](https://api.thesportsdb.com/docs/api)
+Les calendriers et résultats proviennent de l’API publique TheSportsDB. L’accès gratuit fournit la prochaine rencontre et la plus récente par compétition. Pour les scores en direct selon la couverture du fournisseur, enregistrez une clé TheSportsDB Premium dans **Réglages → Services → Scores sportifs**. La boxe affiche les combats et les résultats en texte lorsque le fournisseur les renseigne. Les horaires s’affichent dans le fuseau de votre Mac. [Documentation TheSportsDB](https://api.thesportsdb.com/docs/api)
 
 La clé sportive est conservée dans le Trousseau de macOS. Les requêtes à TheSportsDB n’incluent aucun identifiant IPTV.
 

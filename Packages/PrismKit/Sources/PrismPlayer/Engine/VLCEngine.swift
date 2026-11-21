@@ -35,6 +35,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var didReportReady = false
     private var reportedDuration: TimeInterval?
     private var didReportFirstFrame = false
+    private var didReportTerminalEvent = false
     private var lastState: EnginePlaybackState?
     private var lastTimeMs: Int32 = -1
     private var lastTimeChange = Date.distantPast
@@ -68,6 +69,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         didReportReady = false
         reportedDuration = nil
         didReportFirstFrame = false
+        didReportTerminalEvent = false
         lastState = nil
         lastTimeMs = -1
         trackSignature = ""
@@ -90,12 +92,14 @@ final class VLCEngine: NSObject, PlaybackEngine {
         if let startPosition, !isLive, startPosition > 1 {
             media.addOption(":start-time=\(Int(startPosition))")
         }
-        player.media = media
-        // MPEG-TS broadcast streams are frequently interlaced.
+        // Keep deinterlacing per input. VLCKit's setDeinterlace writes global config,
+        // which can block the main thread while a failed or retiring input holds it.
         let ext = url.pathExtension.lowercased()
         if isLive || ext == "ts" || ext.isEmpty {
-            player.setDeinterlace(.auto, withFilter: "yadif")
+            media.addOption(":deinterlace=-1")
+            media.addOption(":deinterlace-mode=yadif")
         }
+        player.media = media
         applyAudio()
     }
 
@@ -370,13 +374,23 @@ final class VLCEngine: NSObject, PlaybackEngine {
         case .esAdded:
             refreshTracksIfNeeded()
         case .ended:
-            eventHandler?(.ended)
+            reportTerminal(.ended)
         case .error:
-            eventHandler?(.failed("VLC n’a pas pu ouvrir ce flux."))
+            reportTerminal(.failed("VLC n’a pas pu ouvrir ce flux."))
         case .stopped:
-            if wantsPlay, didReportReady { eventHandler?(.ended) }
+            if wantsPlay, didReportReady { reportTerminal(.ended) }
         @unknown default:
             break
+        }
+    }
+
+    private func reportTerminal(_ event: EngineEvent) {
+        guard !didReportTerminalEvent else { return }
+        didReportTerminalEvent = true
+        // The controller can replace and stop this player in response. Wait for the delegate to return.
+        Task { [weak self] in
+            guard let self, !self.isStopped else { return }
+            self.eventHandler?(event)
         }
     }
 

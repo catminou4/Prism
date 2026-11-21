@@ -17,6 +17,7 @@ final class MockEngine: PlaybackEngine {
     private(set) var isStopped = false
     private(set) var seeks: [TimeInterval] = []
     private(set) var completedSeeks: [TimeInterval] = []
+    var onLoad: (() -> Void)?
     var onSeek: ((TimeInterval) async -> Void)?
     var rate: Float = 1
     var volume: Float = 1
@@ -40,6 +41,7 @@ final class MockEngine: PlaybackEngine {
     func load(url: URL, headers: [String: String], startPosition: TimeInterval?, isLive: Bool) {
         loadedURL = url
         loadedStart = startPosition
+        onLoad?()
     }
     func play() { playCount += 1 }
     func pause() { pauseCount += 1 }
@@ -151,6 +153,115 @@ final class MockFactory {
         #expect(failure == "Le serveur a refusé la connexion.")
         #expect(factory.engines.allSatisfy { $0.isStopped })
         #expect(controller.controlsVisible)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func synchronousLoadFailureDoesNotRestartTheRetiredEngine() throws {
+        let factory = MockFactory()
+        factory.onCreate = { engine in
+            if engine.kind == .vlc {
+                engine.onLoad = { [weak engine] in engine?.emit(.failed("Échec immédiat")) }
+            }
+        }
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        try #require(factory.engines.count == 2)
+        #expect(factory.engines[0].isStopped)
+        #expect(factory.engines[0].playCount == 0)
+        #expect(factory.engines[1].playCount == 1)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func repeatedErrorsShareOnePendingReconnect() async throws {
+        let factory = MockFactory()
+        let policy = ReconnectPolicy(delays: [0.15], maxAttempts: 1, stallThreshold: 0.2)
+        let controller = makeController(Self.live, factory: factory, policy: policy)
+        controller.start()
+        factory.last?.start(duration: nil)
+        factory.last?.emit(.ended)
+        factory.last?.emit(.failed("Flux interrompu"))
+        #expect(controller.reconnectCount == 1)
+        #expect(controller.phase == .buffering)
+        try await waitForState { factory.engines.count == 2 }
+        #expect(factory.engines.count == 2)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func recurringBufferingEventsDoNotPostponeTheWatchdog() async throws {
+        let factory = MockFactory()
+        let policy = ReconnectPolicy(delays: [0.01], maxAttempts: 1, stallThreshold: 0.15)
+        let controller = makeController(Self.live, factory: factory, policy: policy)
+        controller.start()
+        let current = try #require(factory.last)
+        current.start(duration: nil)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while factory.engines.count == 1, ContinuousClock.now < deadline {
+            current.emit(.state(.buffering))
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(factory.engines.count == 2)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func bufferingNotificationDoesNotUndoPauseAndScrubbingDoesNotSaveOldTime() {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        var progress: [TimeInterval] = []
+        controller.onProgress = { position, _ in progress.append(position) }
+        controller.start()
+        factory.last?.start()
+        controller.setScrubbing(true)
+        factory.last?.emit(.time(current: 2, buffered: 30))
+        #expect(progress.isEmpty)
+        controller.setScrubbing(false)
+        factory.last?.emit(.time(current: 3, buffered: 30))
+        #expect(progress == [3])
+        controller.pause()
+        factory.last?.emit(.state(.buffering))
+        #expect(controller.phase == .paused)
+        #expect(controller.controlsVisible)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func volumeAdjustmentsUpdateImmediatelyAndSaveOnceFinished() {
+        preferences.volume = 0.8
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        controller.setVolume(0.4, save: false)
+        controller.setVolume(0.5, save: false)
+        #expect(factory.last?.volume == 0.5)
+        #expect(controller.volume == 0.5)
+        #expect(preferences.volume == 0.8)
+        controller.saveVolume()
+        #expect(preferences.volume == 0.5)
+        controller.setVolume(0.25, save: false)
+        controller.stop()
+        #expect(preferences.volume == 0.25)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func lateSeekFromPreviousEngineDoesNotBlockFallbackClock() async throws {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        let first = try #require(factory.last)
+        first.start()
+        first.onSeek = { _ in try? await Task.sleep(for: .seconds(2)) }
+        controller.seek(to: 50)
+        try await waitForState { first.seeks == [50] }
+        try #require(first.seeks == [50])
+        first.emit(.failed("Flux interrompu"))
+        let replacement = try #require(factory.last)
+        #expect(replacement.loadedStart == 50)
+        replacement.start()
+        replacement.emit(.time(current: 55, buffered: 60))
+        #expect(controller.currentTime == 55)
+        controller.stop()
         defaults.removePersistentDomain(forName: suiteName)
     }
 

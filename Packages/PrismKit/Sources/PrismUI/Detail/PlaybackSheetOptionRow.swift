@@ -3,7 +3,7 @@ import PrismCore
 import PrismDesign
 import SwiftUI
 
-struct PlaybackSourceGroup: Identifiable {
+nonisolated struct PlaybackSourceGroup: Identifiable {
     let source: Source
     var options: [TitlePlaybackOption]
     var duplicateNumbers: [ContentID: Int] = [:]

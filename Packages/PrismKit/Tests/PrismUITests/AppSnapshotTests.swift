@@ -27,6 +27,18 @@ struct AppSnapshotTests {
 
         try await write(OnboardingView().environment(app), label: "onboarding", size: CGSize(width: 1320, height: 820), settle: .seconds(2))
         try await write(
+            AddSourceView(allowsDemo: true, onImported: {}).environment(app),
+            label: "sources", size: CGSize(width: 560, height: 490), scheme: .light
+        )
+        try await write(
+            PrismSettingsView().environment(app),
+            label: "reglages", size: CGSize(width: 560, height: 470), scheme: .light
+        )
+        try await write(
+            PrismSettingsView(initialPage: .services).environment(app),
+            label: "reglages-services", size: CGSize(width: 560, height: 470)
+        )
+        try await write(
             LibraryShell().environment(demo),
             label: "home", size: CGSize(width: 1440, height: 900), scheme: .light
         )

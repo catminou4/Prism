@@ -19,8 +19,8 @@ struct LibraryShell: View {
         return visited.contains(selection) ? visited : visited + [selection]
     }
 
-    private var sidebarText: Color { Color(white: colorScheme == .dark ? 0.92 : 0.12) }
-    private var sidebarSecondary: Color { Color(white: colorScheme == .dark ? 0.69 : 0.38) }
+    private let sidebarText = Color.primary
+    private let sidebarSecondary = Color.secondary
     private var sidebarAccent: Color {
         colorScheme == .dark ? Color(red: 0.46, green: 0.72, blue: 1) : Color(red: 0.07, green: 0.33, blue: 0.68)
     }
@@ -87,7 +87,6 @@ struct LibraryShell: View {
         }
         .sheet(isPresented: $isAddingSource) {
             AddSourceView(onImported: { isAddingSource = false })
-                .frame(minWidth: 540, minHeight: 460)
         }
     }
 
@@ -154,6 +153,8 @@ struct LibraryShell: View {
                         } icon: {
                             Image(systemName: "plus.circle").foregroundStyle(sidebarSecondary)
                         }
+                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                        .contentShape(.rect)
                     }
                     .buttonStyle(.plain)
                 } header: {
@@ -162,13 +163,11 @@ struct LibraryShell: View {
             }
             .listStyle(.sidebar)
 
-            VStack(alignment: .leading, spacing: 11) {
-                Button("Réglages", systemImage: "gearshape") { openSettings() }
-            }
-            .buttonStyle(.plain)
-            .font(.callout.weight(.medium))
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            Button("Réglages", systemImage: "gearshape") { openSettings() }
+                .buttonStyle(.glass)
+                .help("Ouvrir les réglages de Prism")
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
         }
     }
 

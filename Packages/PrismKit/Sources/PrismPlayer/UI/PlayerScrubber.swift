@@ -190,47 +190,34 @@ struct PlayerScrubber: View {
     }
 }
 
-/// Custom volume slider (white 4 pt track, pill knob) + mute toggle.
+/// Native volume slider and mute toggle inside the transport glass.
 struct PlayerVolumeControl: View {
     let controller: PlayerController
+    @State private var isAdjusting = false
+
+    private var volume: Binding<Float> {
+        Binding(
+            get: { controller.isMuted ? 0 : controller.volume },
+            set: { value in
+                controller.noteUserActivity()
+                controller.setVolume(value, save: !isAdjusting)
+            }
+        )
+    }
 
     var body: some View {
         HStack(spacing: 11) {
-            GeometryReader { geo in
-                let width = max(1, geo.size.width - PlayerMetrics.knobSize.width)
-                let value = Double(controller.isMuted ? 0 : controller.volume)
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.18))
-                        .frame(height: PlayerMetrics.trackHeight)
-                    Capsule().fill(.white)
-                        .frame(width: value * width + PlayerMetrics.knobSize.width / 2, height: PlayerMetrics.trackHeight)
-                    Capsule().fill(Color(white: 0.87))
-                        .frame(width: PlayerMetrics.knobSize.width, height: PlayerMetrics.knobSize.height)
-                        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-                        .offset(x: value * width)
-                }
-                .frame(height: geo.size.height)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { drag in
-                            controller.noteUserActivity()
-                            let fraction = (drag.location.x - PlayerMetrics.knobSize.width / 2) / width
-                            controller.setVolume(Float(min(1, max(0, fraction))))
-                        }
-                )
+            Slider(value: volume, in: 0...1) { adjusting in
+                isAdjusting = adjusting
+                if !adjusting { controller.saveVolume() }
+            } label: {
+                Text("Volume")
             }
-            .frame(width: PlayerMetrics.volumeSliderWidth, height: 20)
-            .accessibilityElement()
-            .accessibilityLabel("Volume")
-            .accessibilityValue("\(Int(controller.volume * 100)) %")
-            .accessibilityAdjustableAction { direction in
-                switch direction {
-                case .increment: controller.setVolume(controller.volume + 0.1)
-                case .decrement: controller.setVolume(controller.volume - 0.1)
-                @unknown default: break
-                }
-            }
+            .labelsHidden()
+            .controlSize(.small)
+            .tint(.white)
+            .frame(width: PlayerMetrics.volumeSliderWidth)
+            .accessibilityValue(controller.isMuted ? "Muet" : "\(Int(controller.volume * 100)) %")
 
             Button {
                 controller.toggleMute()

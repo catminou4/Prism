@@ -102,7 +102,10 @@ private struct TitleDetailContent: View {
             ?? inventory?.seasons.first
     }
     private var heroEpisode: Episode? {
-        inventory?.nextEpisode(after: app.library.latestProgress(forTitle: title.id), isWatched: app.library.isWatched)
+        guard let inventory else { return nil }
+        let library = app.library
+        let latest = inventory.latestProgress(in: library.progress)
+        return inventory.nextEpisode(after: latest, isWatched: library.isWatched)
     }
     private var seasonLookup: SeasonLookup {
         let tmdbID = enriched?.tmdbID ?? inventory?.detail.tmdbID ?? inventory?.edition.variant.series?.tmdbID
@@ -197,7 +200,7 @@ private struct TitleDetailContent: View {
                 title: title,
                 selection: selection,
                 repository: app.detailRepository,
-                resumePosition: { position(for: $0) },
+                resumePosition: { position(for: $0, equivalentEpisode: selection.episode) },
                 onPlay: { option, position in play(option, from: position) }
             )
         }
@@ -206,10 +209,9 @@ private struct TitleDetailContent: View {
     private func masthead(viewportHeight: CGFloat) -> some View {
         let episode = heroEpisode
         let edition = title.kind == .series ? inventory?.edition ?? activeEdition : activeEdition
-        let progress = title.kind == .series
-            ? episode.flatMap { app.library.progress(for: $0.id) }
-            : app.library.latestProgress(forTitle: title.id)
-        let resuming = progress.map { !$0.isFinished && $0.position >= 5 } ?? false
+        let option = edition.flatMap { TitlePlaybackOption(edition: $0, episode: episode) }
+        let progress = option.flatMap { resumeProgress(for: $0) }
+        let resuming = progress != nil
         let facts = [
             title.kind == .series ? "Série" : "Film",
             year.map(String.init),
@@ -287,7 +289,11 @@ private struct TitleDetailContent: View {
                 Menu {
                     ForEach(editions) { candidate in
                         Button {
-                            browseEditionID = candidate.id
+                            if browseEditionID == candidate.id, inventory?.edition.id != candidate.id {
+                                retryCount += 1
+                            } else {
+                                browseEditionID = candidate.id
+                            }
                         } label: {
                             if candidate.id == edition.id {
                                 Label(Self.editionLabel(candidate), systemImage: "checkmark")
@@ -504,17 +510,23 @@ private struct TitleDetailContent: View {
         }
     }
 
-    private func position(for option: TitlePlaybackOption) -> TimeInterval? {
+    private func position(for option: TitlePlaybackOption, equivalentEpisode: Episode? = nil) -> TimeInterval? {
+        resumeProgress(for: option, equivalentEpisode: equivalentEpisode)?.position
+    }
+
+    private func resumeProgress(for option: TitlePlaybackOption, equivalentEpisode: Episode? = nil) -> PlaybackProgress? {
         let library = app.library
+        let exact = library.progress(for: option.contentID)
         let equivalent: PlaybackProgress?
-        if let requested = playbackSelection?.episode, option.episode != nil {
+        if let requested = equivalentEpisode, option.episode != nil {
             equivalent = library.progress(for: requested.id)
         } else if title.kind == .movie {
             equivalent = library.latestProgress(forTitle: title.id)
         } else {
             equivalent = nil
         }
-        return option.resumePosition(exact: library.progress(for: option.contentID), equivalent: equivalent)
+        guard option.resumePosition(exact: exact, equivalent: equivalent) != nil else { return nil }
+        return exact ?? equivalent
     }
 
     private func play(_ option: TitlePlaybackOption, from position: TimeInterval?) {

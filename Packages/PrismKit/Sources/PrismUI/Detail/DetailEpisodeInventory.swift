@@ -7,7 +7,7 @@ nonisolated struct DetailEpisodeInventory: Sendable {
     let detail: SeriesDetail
     let seasons: [Season]
     let orderedEpisodes: [Episode]
-    let episodesByID: [ContentID: Episode]
+    private let episodeIndices: [ContentID: Int]
 
     @concurrent static func build(edition: TitleEdition, detail: SeriesDetail) async -> Self {
         var detail = detail
@@ -26,16 +26,31 @@ nonisolated struct DetailEpisodeInventory: Sendable {
         let episodes = seasons.flatMap(\.episodes)
         return Self(
             edition: edition, detail: detail, seasons: seasons, orderedEpisodes: episodes,
-            episodesByID: Dictionary(episodes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            episodeIndices: Dictionary(episodes.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
         )
+    }
+
+    func latestProgress(in progress: [ContentID: PlaybackProgress]) -> PlaybackProgress? {
+        let older: (PlaybackProgress, PlaybackProgress) -> Bool = { first, second in
+            first.updatedAt == second.updatedAt ? first.contentID < second.contentID : first.updatedAt < second.updatedAt
+        }
+        if progress.count < orderedEpisodes.count {
+            return progress.values.lazy.filter { episodeIndices[$0.contentID] != nil }.max(by: older)
+        }
+        return orderedEpisodes.lazy.compactMap { progress[$0.id] }.max(by: older)
+    }
+
+    func nextAvailableEpisode(after id: ContentID) -> Episode? {
+        guard let index = episodeIndices[id], orderedEpisodes.indices.contains(index + 1) else { return nil }
+        return orderedEpisodes[index + 1]
     }
 
     func nextEpisode(after progress: PlaybackProgress?, isWatched: (ContentID) -> Bool) -> Episode? {
         guard let first = orderedEpisodes.first else { return nil }
-        if let progress, let previous = episodesByID[progress.contentID] {
+        if let progress, let index = episodeIndices[progress.contentID] {
+            let previous = orderedEpisodes[index]
             if !progress.isFinished { return previous }
-            let coordinate = EpisodeCoordinate(previous)
-            if let next = orderedEpisodes.first(where: { EpisodeCoordinate($0) > coordinate && !isWatched($0.id) }) {
+            if let next = orderedEpisodes.dropFirst(index + 1).first(where: { !isWatched($0.id) }) {
                 return next
             }
         }

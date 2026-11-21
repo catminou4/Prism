@@ -52,16 +52,18 @@ struct LiveGuide<ChannelMenu: View>: View {
     private func controls(_ timeline: GuideTimeline) -> some View {
         let controlSize = PrismMetrics.compactButtonSize
         return HStack(spacing: 10) {
-            HStack(spacing: 0) {
-                guideButton("Programmes précédents", symbol: "chevron.left") {
-                    start = timeline.interval.start.addingTimeInterval(-timeline.interval.duration)
-                }
-                Divider().frame(height: 14)
-                guideButton("Programmes suivants", symbol: "chevron.right") {
-                    start = timeline.interval.end
+            GlassEffectContainer(spacing: 6) {
+                HStack(spacing: 6) {
+                    GlassCircleButton(systemName: "chevron.left", size: controlSize, accessibilityLabel: "Programmes précédents") {
+                        start = timeline.interval.start.addingTimeInterval(-timeline.interval.duration)
+                    }
+                    .help("Programmes précédents")
+                    GlassCircleButton(systemName: "chevron.right", size: controlSize, accessibilityLabel: "Programmes suivants") {
+                        start = timeline.interval.end
+                    }
+                    .help("Programmes suivants")
                 }
             }
-            .prismGlass(.regular, in: .capsule)
             DatePicker("Jour du programme", selection: Binding(
                 get: { timeline.interval.start },
                 set: { start = Calendar.current.startOfDay(for: $0) }
@@ -70,18 +72,9 @@ struct LiveGuide<ChannelMenu: View>: View {
             .datePickerStyle(.compact)
             .environment(\.locale, Locale(identifier: "fr_FR"))
             Spacer(minLength: 10)
-            Button {
+            GlassCapsuleButton(title: "Maintenant", systemImage: "clock", trailingChevron: false, style: .regular) {
                 start = nil
-            } label: {
-                Label("Maintenant", systemImage: "clock")
-                    .font(PrismFont.capsuleButton)
-                    .foregroundStyle(start == nil ? Color.secondary : Color.primary)
-                    .padding(.horizontal, 12)
-                    .frame(height: controlSize)
-                    .prismGlass(.regular, in: .capsule, interactive: start != nil)
-                    .contentShape(.capsule)
             }
-            .buttonStyle(.pressable)
             .disabled(start == nil)
             if isRefreshing {
                 ProgressView().controlSize(.small)
@@ -94,18 +87,6 @@ struct LiveGuide<ChannelMenu: View>: View {
             }
         }
         .frame(minHeight: controlSize)
-    }
-
-    private func guideButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 13, weight: .medium))
-                .frame(width: PrismMetrics.compactButtonSize, height: PrismMetrics.compactButtonSize)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.pressable)
-        .help(title)
-        .accessibilityLabel(title)
     }
 
     private func timelineHeader(_ timeline: GuideTimeline, channelWidth: CGFloat) -> some View {

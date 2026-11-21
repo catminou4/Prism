@@ -52,23 +52,15 @@ public struct RemoteImage: View {
     }
 
     private struct Loaded: Equatable {
-        let key: LoadKey
+        let key: ImagePipeline.Key
         let image: CGImage
         static func == (lhs: Loaded, rhs: Loaded) -> Bool { lhs.key == rhs.key && lhs.image === rhs.image }
     }
 
-    private struct LoadKey: Hashable {
-        let url: URL?
-        let pixelWidth: Int
-        let pixelHeight: Int
-        let fitting: ImagePipeline.Fitting
-    }
-
-    private var pointSize: CGSize { size ?? measuredSize }
-
-    private var loadKey: LoadKey {
-        let pixels = Self.pixelSize(forPointSize: pointSize, scale: displayScale)
-        return LoadKey(url: url, pixelWidth: Int(pixels.width), pixelHeight: Int(pixels.height), fitting: fitting)
+    private var loadKey: ImagePipeline.Key? {
+        guard let url else { return nil }
+        let pixels = Self.pixelSize(forPointSize: size ?? measuredSize, scale: displayScale)
+        return ImagePipeline.key(url: url, pixelSize: pixels, fitting: fitting, blurRadius: blurRadius)
     }
 
     /// The pixel size `RemoteImage` requests for a slot — use it with
@@ -79,19 +71,14 @@ public struct RemoteImage: View {
         return CGSize(width: quantise(size.width), height: quantise(size.height))
     }
 
-    private var pixelSize: CGSize {
-        let key = loadKey
-        return CGSize(width: key.pixelWidth, height: key.pixelHeight)
-    }
-
     private var fitting: ImagePipeline.Fitting { decodingFitting ?? (contentMode == .fill ? .fill : .fit) }
 
     public var body: some View {
         let key = loadKey
-        let image: CGImage? = if let loaded, loaded.key.url == key.url, loaded.key.fitting == key.fitting {
+        let image: CGImage? = if let key, let loaded, loaded.key.showsSameArtwork(as: key) {
             loaded.image
-        } else if let url, key.pixelWidth > 0 {
-            ImagePipeline.shared.cachedImage(for: url, pixelSize: pixelSize, fitting: key.fitting, blurRadius: blurRadius)
+        } else if let key {
+            ImagePipeline.shared.cachedImage(for: key)
         } else {
             nil
         }
@@ -116,21 +103,21 @@ public struct RemoteImage: View {
             .frame(width: size?.width, height: size?.height)
             .clipped()
             .modifier(MeasureIfNeeded(enabled: size == nil, size: $measuredSize))
-            .task(id: key) { await load(key) }
+            .task(id: key) {
+                if let key { await load(key) }
+            }
     }
 
-    private func load(_ key: LoadKey) async {
-        guard let url = key.url, key.pixelWidth > 0, key.pixelHeight > 0 else { return }
-        if let loaded, loaded.key == key { return }
-        let target = CGSize(width: key.pixelWidth, height: key.pixelHeight)
-        if let cached = ImagePipeline.shared.cachedImage(for: url, pixelSize: target, fitting: key.fitting, blurRadius: blurRadius) {
+    private func load(_ key: ImagePipeline.Key) async {
+        guard loaded?.key != key else { return }
+        if let cached = ImagePipeline.shared.cachedImage(for: key) {
             loaded = Loaded(key: key, image: cached)
             return
         }
-        let image = await ImagePipeline.shared.image(for: url, pixelSize: target, fitting: key.fitting, blurRadius: blurRadius)
+        let image = await ImagePipeline.shared.image(for: key)
         guard !Task.isCancelled else { return }
         guard let image else {
-            if loaded?.key.url != url || loaded?.key.fitting != key.fitting { onLoadFailure?() }
+            if loaded?.key.showsSameArtwork(as: key) != true { onLoadFailure?() }
             return
         }
         withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) {

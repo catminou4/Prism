@@ -50,6 +50,7 @@ public enum DiscoveryBuilder {
                 .compactMap { catalog.title($0) }.filter { $0.kind == kind }
         }
         let currentYear = Calendar(identifier: .gregorian).component(.year, from: now)
+        var genreScores: [String: Double] = [:]
         var ranked: [RankedTitle] = []
         for (index, title) in titles.enumerated() {
             if index.isMultiple(of: 2_048), Task.isCancelled { return .empty }
@@ -62,7 +63,8 @@ public enum DiscoveryBuilder {
                 else { continue }
             }
             let local = localScore(for: title, now: now, currentYear: currentYear)
-            let matchingGenres = affinity.isEmpty || known.contains(title.id) ? 0 : genreAffinity(for: title, from: affinity)
+            let matchingGenres = affinity.isEmpty || known.contains(title.id) ? 0
+                : genreAffinity(for: title, from: affinity, scores: &genreScores)
             let personal = matchingGenres > 0 ? matchingGenres * 4 + local : nil
             ranked.append(RankedTitle(index: Int32(index), local: local, personal: personal))
         }
@@ -163,9 +165,21 @@ public enum DiscoveryBuilder {
         return affinity
     }
 
-    private static func genreAffinity(for title: MediaTitle, from affinity: [String: Double]) -> Double {
-        guard !title.genres.isEmpty else { return 0 }
-        return title.genres.lazy.map { affinity[genreKey($0)] ?? 0 }.max() ?? 0
+    private static func genreAffinity(
+        for title: MediaTitle, from affinity: [String: Double], scores: inout [String: Double]
+    ) -> Double {
+        var best = 0.0
+        for genre in title.genres {
+            if let score = scores[genre] {
+                best = max(best, score)
+                continue
+            }
+            let score = affinity[genreKey(genre)] ?? 0
+            // Most titles reuse the same provider labels. Keep memory bounded for noisy feeds.
+            if scores.count < 256 { scores[genre] = score }
+            best = max(best, score)
+        }
+        return best
     }
 
     private static func genreKey(_ name: String) -> String {

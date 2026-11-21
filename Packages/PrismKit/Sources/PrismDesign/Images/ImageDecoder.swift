@@ -59,11 +59,13 @@ nonisolated enum ImageDecoder {
         } else if fitting.needsSourceDimensions {
             return nil
         }
+        // Filling with an unusually wide or tall source can otherwise decode far beyond the slot.
+        let decodeLimit: CGFloat = fillsForBlur ? 384 : 4_096
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixel)),
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(min(decodeLimit, maxPixel))),
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }

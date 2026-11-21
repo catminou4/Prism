@@ -46,6 +46,44 @@ struct HeroBehaviorTests {
         #expect(await pipeline.image(for: rotated, pixelSize: target, fitting: .portraitFit) == nil)
     }
 
+    @Test func fitKeepsDifferentSlotDimensionsAndBlurReusesOneThumbnail() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let artwork = try writeImage(at: directory.appending(path: "artwork.jpg"), width: 1000, height: 560)
+        let pipeline = ImagePipeline(diskDirectory: directory.appending(path: "cache", directoryHint: .isDirectory))
+        let narrow = CGSize(width: 120, height: 600)
+        let wide = CGSize(width: 600, height: 220)
+
+        let smaller = try #require(await pipeline.image(for: artwork, pixelSize: narrow, fitting: .fit))
+        let larger = try #require(await pipeline.image(for: artwork, pixelSize: wide, fitting: .fit))
+        #expect(smaller.width <= 192)
+        #expect(larger.width >= 380)
+
+        let firstBlur = try #require(await pipeline.image(for: artwork, pixelSize: narrow, blurRadius: 24))
+        let secondBlur = try #require(await pipeline.image(for: artwork, pixelSize: wide, blurRadius: 24))
+        #expect(firstBlur === secondBlur)
+    }
+
+    @Test func extremeArtworkStaysSmallAndInvalidSizesDoNotStartARequest() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let artwork = try writeImage(at: directory.appending(path: "panorama.jpg"), width: 6144, height: 96)
+        let pipeline = ImagePipeline(diskDirectory: directory.appending(path: "cache", directoryHint: .isDirectory))
+        let square = CGSize(width: 150, height: 150)
+        let thumbnail = try #require(await pipeline.image(for: artwork, pixelSize: square))
+        #expect(thumbnail.width <= 4096)
+        let blur = try #require(await pipeline.image(for: artwork, pixelSize: square, blurRadius: 24))
+        #expect(blur.width <= 384)
+
+        let invalid = CGSize(width: CGFloat.infinity, height: 150)
+        #expect(pipeline.cachedImage(for: artwork, pixelSize: invalid) == nil)
+        #expect(await pipeline.image(for: artwork, pixelSize: invalid) == nil)
+    }
+
     private func writeImage(at url: URL, width: Int, height: Int, orientation: Int = 1) throws -> URL {
         let context = try #require(CGContext(
             data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,

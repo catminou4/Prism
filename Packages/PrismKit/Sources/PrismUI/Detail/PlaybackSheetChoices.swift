@@ -29,11 +29,15 @@ nonisolated struct PlaybackSheetFilter: Identifiable, Hashable {
 /// Index newly resolved editions once so picking a language only reads the matching options.
 nonisolated struct PlaybackSheetChoices {
     private var discoveredFilters: [PlaybackSheetFilter] = []
-    private var options: [PlaybackSheetFilter: [TitlePlaybackOption]] = [:]
+    private var sections: [PlaybackSheetFilter: Section] = [:]
     private var ids: Set<ContentID> = []
+    private var ranks: [ContentID: Int] = [:]
     private var filtersByEdition: [PlaybackEdition: [PlaybackSheetFilter]] = [:]
 
-    init(_ initial: [TitlePlaybackOption]) {
+    init(_ initial: [TitlePlaybackOption], followedBy editions: [TitleEdition] = []) {
+        for id in initial.map(\.id) + editions.map(\.id) where ranks[id] == nil {
+            ranks[id] = ranks.count
+        }
         append(initial)
     }
 
@@ -44,7 +48,9 @@ nonisolated struct PlaybackSheetChoices {
     }
 
     mutating func append(_ batch: [TitlePlaybackOption]) {
+        var pending: [PlaybackSheetFilter: [TitlePlaybackOption]] = [:]
         for option in batch where ids.insert(option.id).inserted {
+            if ranks[option.id] == nil { ranks[option.id] = ranks.count }
             let edition = option.titleEdition.edition
             let matches: [PlaybackSheetFilter]
             if let existing = filtersByEdition[edition] {
@@ -54,12 +60,33 @@ nonisolated struct PlaybackSheetChoices {
                 filtersByEdition[edition] = matches
             }
             for filter in matches {
-                if options[filter] == nil { discoveredFilters.append(filter) }
-                options[filter, default: []].append(option)
+                if sections[filter] == nil, pending[filter] == nil { discoveredFilters.append(filter) }
+                pending[filter, default: []].append(option)
             }
-            options[.all, default: []].append(option)
+            pending[.all, default: []].append(option)
+        }
+        for (filter, batch) in pending {
+            let options = (sections[filter]?.options ?? []) + batch
+            sections[filter] = Section(options: options.sorted {
+                ranks[$0.id, default: .max] < ranks[$1.id, default: .max]
+            })
         }
     }
 
-    subscript(filter: PlaybackSheetFilter) -> [TitlePlaybackOption] { options[filter, default: []] }
+    subscript(filter: PlaybackSheetFilter) -> [TitlePlaybackOption] { section(for: filter).options }
+
+    func section(for filter: PlaybackSheetFilter) -> Section { sections[filter] ?? .empty }
+
+    struct Section {
+        static let empty = Section(options: [])
+        let options: [TitlePlaybackOption]
+        let groups: [PlaybackSourceGroup]
+        let ordered: [TitlePlaybackOption]
+
+        init(options: [TitlePlaybackOption]) {
+            self.options = options
+            groups = PlaybackSourceGroup.grouped(options)
+            ordered = groups.flatMap(\.options)
+        }
+    }
 }

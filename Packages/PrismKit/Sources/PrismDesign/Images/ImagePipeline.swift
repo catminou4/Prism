@@ -44,11 +44,17 @@ public actor ImagePipeline {
 
     nonisolated struct Key: Hashable, Sendable {
         let url: URL
-        let bucket: Int
+        let width: Int
+        let height: Int
         let fitting: Fitting
         let blur: Int
 
-        var cacheKey: NSString { "\(bucket)|\(fitting.rawValue)|\(blur)|\(url.absoluteString)" as NSString }
+        var target: CGSize { CGSize(width: width, height: height) }
+        var cacheKey: NSString { "\(width)x\(height)|\(fitting.rawValue)|\(blur)|\(url.absoluteString)" as NSString }
+
+        func showsSameArtwork(as other: Key) -> Bool {
+            url == other.url && fitting == other.fitting && blur == other.blur
+        }
     }
 
     /// A shared task with a count of interested callers (cancelled when nobody waits anymore).
@@ -91,14 +97,19 @@ public actor ImagePipeline {
     /// Image decoded for a `pixelSize` target (pass points × display scale).
     /// `blurRadius > 0` returns a pre-blurred low-resolution version (cheap to display upscaled).
     public func image(for url: URL, pixelSize: CGSize, fitting: Fitting = .fill, blurRadius: CGFloat = 0) async -> CGImage? {
-        let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: blurRadius)
+        guard let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: blurRadius) else { return nil }
+        return await image(for: key)
+    }
+
+    func image(for key: Key) async -> CGImage? {
+        guard !Task.isCancelled else { return nil }
         if let hit = memory.image(for: key) { return hit }
 
         let entry: InFlight<CGImage?>
         if let existing = inFlight[key] {
             entry = existing
         } else {
-            entry = InFlight(task: makeTask(for: key, pixelSize: pixelSize))
+            entry = InFlight(task: makeTask(for: key))
             inFlight[key] = entry
         }
         entry.waiters += 1
@@ -109,13 +120,16 @@ public actor ImagePipeline {
             Task { await self.release(key, token: token, finished: false) }
         }
         release(key, token: token, finished: true)
-        return result
+        return Task.isCancelled ? nil : result
     }
 
     /// Synchronous memory-cache lookup (use from `body` to avoid placeholder flashes).
     public nonisolated func cachedImage(for url: URL, pixelSize: CGSize, fitting: Fitting = .fill, blurRadius: CGFloat = 0) -> CGImage? {
-        memory.image(for: Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: blurRadius))
+        guard let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: blurRadius) else { return nil }
+        return cachedImage(for: key)
     }
+
+    nonisolated func cachedImage(for key: Key) -> CGImage? { memory.image(for: key) }
 
     /// Warms the caches for upcoming items (low priority, de-duplicated).
     public nonisolated func prefetch(_ urls: [URL], maxPixelSize: CGFloat) {
@@ -166,31 +180,30 @@ public actor ImagePipeline {
 
     // MARK: Internals
 
-    nonisolated static func bucket(for pixels: CGFloat) -> Int {
-        let value = Int(pixels.rounded(.up))
-        for step in [32, 64, 96, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 2048, 2560, 3072] where value <= step {
+    private static let pixelBuckets = [32, 64, 96, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 2048, 2560, 3072]
+
+    private nonisolated static func bucket(for pixels: CGFloat) -> Int {
+        let value = Int(min(4096, pixels.rounded(.up)))
+        for step in pixelBuckets where value <= step {
             return step
         }
         return 4096
     }
 
-    nonisolated static func key(url: URL, pixelSize: CGSize, fitting: Fitting, blurRadius: CGFloat) -> Key {
-        // Blurred variants are always small: they are displayed upscaled.
-        let longest = blurRadius > 0 ? 96 : max(pixelSize.width, pixelSize.height)
-        // Fill targets are bucketed on both sides' aspect so 2:3 and 16:9 slots don't collide.
-        let aspectTag = fitting.fillsTarget && pixelSize.height > 0 ? Int((pixelSize.width / pixelSize.height * 8).rounded()) : 0
-        return Key(url: url, bucket: bucket(for: longest) * 100 + aspectTag, fitting: fitting, blur: Int(blurRadius.rounded()))
+    nonisolated static func key(url: URL, pixelSize: CGSize, fitting: Fitting, blurRadius: CGFloat) -> Key? {
+        guard pixelSize.width.isFinite, pixelSize.height.isFinite, blurRadius.isFinite,
+              pixelSize.width > 0, pixelSize.height > 0 else { return nil }
+        // Blurs are rendered at 96 px and reused at any display size.
+        let blur = blurRadius > 0 ? Int(min(384, max(1, blurRadius.rounded()))) : 0
+        let width = blur > 0 ? 96 : bucket(for: pixelSize.width)
+        let height = blur > 0 ? 96 : bucket(for: pixelSize.height)
+        return Key(url: url, width: width, height: height, fitting: fitting, blur: blur)
     }
 
-    private func makeTask(for key: Key, pixelSize: CGSize) -> Task<CGImage?, Never> {
+    private func makeTask(for key: Key) -> Task<CGImage?, Never> {
         let memory = memory
         let blur = CGFloat(key.blur)
-        // Target in pixels, rounded up to the bucket so cached images serve slightly bigger slots.
-        let longest = max(pixelSize.width, pixelSize.height)
-        let bucketScale = blur > 0 ? 1 : CGFloat(key.bucket / 100) / max(longest, 1)
-        let target = blur > 0
-            ? CGSize(width: 96, height: 96)
-            : CGSize(width: (pixelSize.width * bucketScale).rounded(.up), height: (pixelSize.height * bucketScale).rounded(.up))
+        let target = key.target
         return Task.detached(priority: .userInitiated) {
             var image: CGImage?
             if key.url.isFileURL {
@@ -280,9 +293,10 @@ public actor ImagePipeline {
 
     private func startPrefetch(_ urls: [URL], pixelSize: CGSize, fitting: Fitting) {
         for url in urls where prefetches[url] == nil {
-            if memory.image(for: Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: 0)) != nil { continue }
+            guard let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: 0),
+                  memory.image(for: key) == nil else { continue }
             prefetches[url] = Task(priority: .utility) {
-                _ = await self.image(for: url, pixelSize: pixelSize, fitting: fitting)
+                _ = await self.image(for: key)
                 self.prefetchFinished(url)
             }
         }

@@ -85,10 +85,12 @@ struct TitlePlaybackTests {
         let equivalent = PlaybackProgress(contentID: movie.id, position: 1_800, duration: 5_380)
         let alternateCut = PlaybackProgress(contentID: movie.id, position: 1_800, duration: 6_000)
         let completed = PlaybackProgress(contentID: movie.id, position: 5_400, duration: 5_400)
+        let olderLongerVersion = PlaybackProgress(contentID: movie.id, position: 5_500, duration: 6_000)
 
         #expect(option.resumePosition(exact: nil, equivalent: equivalent) == 1_800)
         #expect(option.resumePosition(exact: nil, equivalent: alternateCut) == nil)
         #expect(option.resumePosition(exact: completed, equivalent: equivalent) == nil)
+        #expect(option.resumePosition(exact: olderLongerVersion, equivalent: equivalent) == nil)
     }
 
     @Test func episodesStayOrderedAndResumeSkipsWatchedEpisodes() async throws {
@@ -137,5 +139,99 @@ struct TitlePlaybackTests {
         #expect(inventory.nextAvailableEpisode(after: first.id) == next)
         #expect(inventory.nextAvailableEpisode(after: next.id) == nil)
         #expect(inventory.nextAvailableEpisode(after: wrongEdition.id) == nil)
+    }
+
+    @Test func choosingAnEditionResumesItsOwnMostRecentEpisode() async throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let series = Series(sourceID: source.id, nativeID: "series", title: "Série")
+        let episodes = (1...3).map { number in
+            Episode(
+                seriesID: series.id, sourceID: source.id, nativeID: "e\(number)",
+                season: 1, number: number, title: "Épisode \(number)", streamURL: url
+            )
+        }
+        let inventory = await DetailEpisodeInventory.build(
+            edition: TitleEdition(variant: .series(series), source: source),
+            detail: SeriesDetail(seriesID: series.id, seasons: [Season(number: 1, episodes: episodes)])
+        )
+        let other = PlaybackProgress(contentID: ContentID(rawValue: "another-edition"), position: 200, duration: 1_000)
+        let here = PlaybackProgress(contentID: episodes[2].id, position: 300, duration: 1_000, updatedAt: .distantPast)
+        let candidate = inventory.latestProgress(in: [other.contentID: other, here.contentID: here])
+        #expect(candidate == here)
+        #expect(inventory.nextEpisode(after: candidate, isWatched: { _ in false }) == episodes[2])
+    }
+
+    @Test func alternateEditionDiscardsWrongSourcesAndResolvesDuplicatesDeterministically() throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .xtream)
+        let series = Series(sourceID: source.id, nativeID: "series", title: "Série")
+        let alternate = Series(sourceID: source.id, nativeID: "alternate", title: "Série")
+        let edition = TitleEdition(variant: .series(alternate), source: source)
+        let wrong = Episode(
+            seriesID: series.id, sourceID: source.id, nativeID: "0", season: 1, number: 2,
+            title: "Autre édition", streamURL: url
+        )
+        let valid = Episode(
+            seriesID: alternate.id, sourceID: source.id, nativeID: "1", season: 1, number: 2,
+            title: "Épisode valide", streamURL: url
+        )
+        let duplicate = Episode(
+            seriesID: alternate.id, sourceID: source.id, nativeID: "2", season: 1, number: 2,
+            title: "Doublon", streamURL: url
+        )
+        let detail = SeriesDetail(seriesID: alternate.id, seasons: [
+            Season(number: 1, episodes: [wrong, duplicate, valid]),
+        ])
+        let option = AlternateEditionResolver.option(in: detail, edition: edition, coordinate: EpisodeCoordinate(wrong))
+        #expect(option?.episode == valid)
+    }
+
+    @Test func alternateOptionsKeepCatalogOrderAcrossOutOfOrderResultsAndRetries() throws {
+        let url = try #require(URL(string: "https://example.invalid/edition.mkv"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let options = (0..<5).compactMap { index in
+            let movie = Movie(sourceID: source.id, nativeID: "\(index)", title: "Film", streamURL: url, tags: ["FR"])
+            return TitlePlaybackOption(edition: TitleEdition(variant: .movie(movie), source: source))
+        }
+        let initial = Array(options.prefix(1))
+        var choices = PlaybackSheetChoices(initial, followedBy: options.dropFirst().map(\.titleEdition))
+        choices.append([options[3], options[1], options[4]])
+        choices.append([options[2], options[3]])
+        #expect(choices[.all].map(\.id) == options.map(\.id))
+        let french = try #require(choices.filters.first)
+        #expect(choices.section(for: french).ordered.map(\.id) == options.map(\.id))
+        #expect(choices.section(for: .all).groups.first?.duplicateNumbers[options[3].id] == 4)
+    }
+
+    @MainActor @Test func closingAnEditionPickerDoesNotStartMoreProviderQueries() async throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .xtream)
+        let original = Series(sourceID: source.id, nativeID: "original", title: "Série")
+        let episode = Episode(
+            seriesID: original.id, sourceID: source.id, nativeID: "e1", season: 1, number: 1,
+            title: "Épisode", streamURL: url
+        )
+        let editions = (0..<36).map { index in
+            TitleEdition(
+                variant: .series(Series(sourceID: source.id, nativeID: "v\(index)", title: "Série")), source: source
+            )
+        }
+        let counter = Requests()
+        var updates = 0
+        await AlternateEditionResolver.resolve(editions, episode: episode, load: { series, _ in
+            await counter.started()
+            return SeriesDetail(seriesID: series.id)
+        }) { _ in
+            updates += 1
+            return false
+        }
+        #expect(updates == 1)
+        #expect(await counter.count <= 4)
+    }
+
+    private actor Requests {
+        private(set) var count = 0
+        func started() { count += 1 }
     }
 }

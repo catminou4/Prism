@@ -42,15 +42,17 @@ struct OnboardingView: View {
                         .foregroundStyle(.white.opacity(0.75))
                 }
                 .multilineTextAlignment(.center)
-                VStack(spacing: 13) {
-                    PrimaryCapsuleButton("Ajouter une source", systemImage: "plus", height: 41, minWidth: 188) {
+                HStack(spacing: 9) {
+                    Button("Essayer la démo") { entry = .demo }
+                        .buttonStyle(.glass)
+                    Button("Ajouter une source", systemImage: "plus") {
                         entry = .source
                     }
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
-                    Button("Essayer la démo") { entry = .demo }
-                        .buttonStyle(.link)
-                        .tint(.white.opacity(0.82))
                 }
+                .controlSize(.large)
+                .environment(\.colorScheme, .dark)
             }
             .foregroundStyle(.white)
             .padding(40)
