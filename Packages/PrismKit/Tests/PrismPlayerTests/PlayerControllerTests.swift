@@ -94,6 +94,14 @@ final class MockFactory {
             reconnectPolicy: policy, uptime: { ProcessInfo.processInfo.systemUptime })
     }
 
+    private func waitForState(_ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(3)
+        while !condition(), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
     static let vod = PlaybackItem(
         id: "vod", url: URL(string: "http://h/movie/u/p/1.mkv")!,
         fallbackURLs: [URL(string: "http://backup/1.mp4")!], title: "Film")
@@ -144,8 +152,8 @@ final class MockFactory {
         let factory = MockFactory()
         let controller = makeController(Self.vod, factory: factory, timeout: .milliseconds(100))
         controller.start()
-        try await Task.sleep(for: .milliseconds(150))
-        #expect(factory.engines.count == 2)
+        try await waitForState { factory.engines.count >= 2 }
+        try #require(factory.engines.count == 2)
         #expect(factory.engines[1].kind == .avFoundation)
         // Rendering cancels the timeout.
         factory.last?.start()
@@ -178,18 +186,18 @@ final class MockFactory {
         #expect(controller.duration == nil)
         factory.last?.emit(.ended)
         #expect(controller.statusMessage == "Reconnexion…")
-        try await Task.sleep(for: .milliseconds(60))
-        #expect(factory.engines.count == 2)
+        try await waitForState { factory.engines.count >= 2 }
+        try #require(factory.engines.count == 2)
         #expect(factory.last?.loadedURL == Self.live.url)
         // The rendered engine keeps its frame until the new one renders.
         #expect(!factory.engines[0].isStopped)
         #expect(controller.isSwitchingStream)
         factory.last?.emit(.failed("x"))
-        try await Task.sleep(for: .milliseconds(80))
-        #expect(factory.engines.count == 3)
+        try await waitForState { factory.engines.count >= 3 }
+        try #require(factory.engines.count == 3)
         factory.last?.emit(.failed("y"))
-        try await Task.sleep(for: .milliseconds(80))
-        #expect(factory.engines.count == 4)
+        try await waitForState { factory.engines.count >= 4 }
+        try #require(factory.engines.count == 4)
         factory.last?.emit(.failed("z"))
         #expect(controller.phase == .failed("z"))
         defaults.removePersistentDomain(forName: suiteName)
@@ -203,19 +211,13 @@ final class MockFactory {
         first.start(duration: nil)
         first.emit(.state(.buffering))
         #expect(controller.phase == .buffering)
-        let clock = ContinuousClock()
-        var deadline = clock.now + .seconds(3)
-        while factory.engines.count < 2, clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
+        try await waitForState { factory.engines.count >= 2 }
         try #require(factory.engines.count == 2)
-        try #require(factory.last).start(duration: nil)
+        let replacement = try #require(factory.last)
+        replacement.start(duration: nil)
         #expect(controller.phase == .playing)
         #expect(!controller.isSwitchingStream)
-        deadline = clock.now + .seconds(3)
-        while !first.isStopped, clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
+        try await waitForState { first.isStopped }
         #expect(first.isStopped)
         defaults.removePersistentDomain(forName: suiteName)
     }
@@ -237,7 +239,7 @@ final class MockFactory {
         #expect(factory.last?.kind == .avFoundation)
         factory.last?.start(duration: nil)
         #expect(!controller.isSwitchingStream)
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForState { factory.engines[0].isStopped }
         #expect(factory.engines[0].isStopped)
         defaults.removePersistentDomain(forName: suiteName)
     }
