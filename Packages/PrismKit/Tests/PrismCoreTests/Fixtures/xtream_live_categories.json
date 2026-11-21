@@ -1,0 +1,8 @@
+[
+  {"category_id":"1","category_name":"FR | GÉNÉRALISTES","parent_id":0},
+  {"category_id":2,"category_name":"FR | SPORT ⚽","parent_id":0},
+  {"category_id":"3","category_name":"XXX | ADULTS","parent_id":"0"},
+  {"category_name":"Missing ID"},
+  "garbage",
+  {"category_id":"4","category_name":null}
+]

@@ -37,6 +37,12 @@ public enum MediaVariant: Identifiable, Sendable, Hashable {
         case .series(let s): s.rawName
         }
     }
+    public var title: String {
+        switch self {
+        case .movie(let movie): movie.title
+        case .series(let series): series.title
+        }
+    }
     public var movie: Movie? { if case .movie(let m) = self { m } else { nil } }
     public var series: Series? { if case .series(let s) = self { s } else { nil } }
 }

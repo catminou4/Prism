@@ -1,0 +1,7 @@
+[
+  {"num":1,"name":"FR - Avatar (2009) 4K","title":"Avatar","year":"2009","stream_type":"movie","stream_id":"5001","stream_icon":"http:\/\/img.example.com\/avatar.jpg","rating":"7.4","rating_5based":3.7,"tmdb":"19995","trailer":"5PSNL1qE6VY","added":"1704067200","is_adult":0,"category_id":"10","container_extension":"mkv","custom_sid":null,"direct_source":""},
+  {"num":2,"name":"Inception MULTI 1080p","stream_id":5002,"stream_icon":"","rating":8.8,"added":1704153600,"category_id":10,"container_extension":"mp4","releaseDate":"2010-07-16","genre":"Action, Science-Fiction / Thriller","cast":"Leonardo DiCaprio, Joseph Gordon-Levitt","director":"Christopher Nolan","episode_run_time":"148"},
+  {"num":3,"name":"1917 (2019) VOSTFR","stream_id":"5003","rating":"","rating_5based":"4.1","added":"","category_id":"11","container_extension":null,"year":null},
+  {"name":"No id movie"},
+  {"num":5,"name":"Old Movie [1950]","stream_id":"5005","category_ids":["11"],"year":"abcd","releasedate":"1950-01-01"}
+]

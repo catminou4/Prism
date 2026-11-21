@@ -1,0 +1,40 @@
+{"adult":false,"backdrop_path":"/kyeqWdyUXW608qlYkRqosgbbJyK.jpg","belongs_to_collection":{"id":87096,"name":"Avatar - Saga"},"budget":237000000,
+"genres":[{"id":28,"name":"Action"},{"id":12,"name":"Aventure"},{"id":14,"name":"Fantastique"},{"id":878,"name":"Science-Fiction"}],
+"homepage":"https://www.avatar.com","id":19995,"imdb_id":"tt0499549","original_language":"en","original_title":"Avatar",
+"overview":"Malgré sa paralysie, Jake Sully, un ancien marine immobilisé dans un fauteuil roulant, est resté un combattant au plus profond de son être.",
+"popularity":120.5,"poster_path":"/3npygfmEhqnmNTmDWhHLz1LPcbA.jpg","release_date":"2009-12-15","revenue":2923706026,"runtime":162,"status":"Released",
+"tagline":"Entrez dans le monde de Pandora.","title":"Avatar","video":false,"vote_average":7.588,"vote_count":31000,
+"images":{
+ "backdrops":[
+  {"aspect_ratio":1.778,"height":1080,"iso_639_1":"fr","file_path":"/frBackdrop.jpg","vote_average":5.3,"width":1920},
+  {"aspect_ratio":1.778,"height":2160,"iso_639_1":null,"file_path":"/textlessBackdrop.jpg","vote_average":5.6,"width":3840},
+  {"aspect_ratio":1.778,"height":1080,"iso_639_1":"en","file_path":"/enBackdrop.jpg","vote_average":5.4,"width":1920}
+ ],
+ "logos":[
+  {"aspect_ratio":3.2,"height":300,"iso_639_1":"en","file_path":"/enLogo.png","vote_average":5.5,"width":960},
+  {"aspect_ratio":3.2,"height":300,"iso_639_1":"fr","file_path":"/frLogo.svg","vote_average":5.3,"width":960},
+  {"aspect_ratio":3.2,"height":300,"iso_639_1":null,"file_path":"/nullLogo.png","vote_average":5.1,"width":960}
+ ],
+ "posters":[{"aspect_ratio":0.667,"height":3000,"iso_639_1":"fr","file_path":"/frPoster.jpg","vote_average":5.4,"width":2000}]
+},
+"credits":{
+ "cast":[
+  {"adult":false,"gender":2,"id":65731,"known_for_department":"Acting","name":"Sam Worthington","original_name":"Sam Worthington","popularity":20.1,"profile_path":"/mflBcox36s9ZPbsZPVOuhf6axaJ.jpg","cast_id":242,"character":"Jake Sully","credit_id":"5602a8a7c3a3685532001c9a","order":0},
+  {"adult":false,"gender":1,"id":8691,"known_for_department":"Acting","name":"Zoe Saldaña","original_name":"Zoe Saldaña","popularity":40.2,"profile_path":"/iOVbUH20il632nj2v01NCtYYeSg.jpg","cast_id":3,"character":"Neytiri","credit_id":"52fe48009251416c750ac9cb","order":1},
+  {"adult":false,"gender":1,"id":10205,"known_for_department":"Acting","name":"Sigourney Weaver","original_name":"Sigourney Weaver","popularity":30.0,"profile_path":null,"cast_id":25,"character":"Dr. Grace Augustine","credit_id":"52fe48009251416c750aca39","order":2}
+ ],
+ "crew":[
+  {"adult":false,"gender":2,"id":2710,"known_for_department":"Directing","name":"James Cameron","original_name":"James Cameron","profile_path":"/9NAZnTjBQ9WcXAQEzZpKy4vdQto.jpg","credit_id":"52fe48009251416c750aca23","department":"Directing","job":"Director"},
+  {"adult":false,"gender":2,"id":2710,"known_for_department":"Directing","name":"James Cameron","original_name":"James Cameron","profile_path":"/9NAZnTjBQ9WcXAQEzZpKy4vdQto.jpg","credit_id":"52fe48009251416c750ac9ff","department":"Writing","job":"Writer"}
+ ]
+},
+"videos":{"results":[
+ {"iso_639_1":"en","iso_3166_1":"US","name":"Teaser","key":"teaserKey01","site":"YouTube","size":1080,"type":"Teaser","official":true},
+ {"iso_639_1":"en","iso_3166_1":"US","name":"Official Trailer","key":"5PSNL1qE6VY","site":"YouTube","size":1080,"type":"Trailer","official":true},
+ {"iso_639_1":"fr","iso_3166_1":"FR","name":"Bande-annonce VF","key":"frTrailerKey","site":"YouTube","size":1080,"type":"Trailer","official":true},
+ {"iso_639_1":"fr","iso_3166_1":"FR","name":"Vimeo trailer","key":"123","site":"Vimeo","size":1080,"type":"Trailer","official":true}
+]},
+"release_dates":{"results":[
+ {"iso_3166_1":"US","release_dates":[{"certification":"PG-13","iso_639_1":"","note":"","release_date":"2009-12-18T00:00:00.000Z","type":3}]},
+ {"iso_3166_1":"FR","release_dates":[{"certification":"","iso_639_1":"","note":"Premiere","release_date":"2009-12-10T00:00:00.000Z","type":1},{"certification":"TP","iso_639_1":"","note":"","release_date":"2009-12-16T00:00:00.000Z","type":3}]}
+]}}

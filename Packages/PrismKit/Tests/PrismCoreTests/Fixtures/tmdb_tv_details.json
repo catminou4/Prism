@@ -1,0 +1,7 @@
+{"backdrop_path":"/tvBackdrop.jpg","created_by":[{"id":1,"name":"Christopher Storer","profile_path":null}],"episode_run_time":[],"first_air_date":"2022-06-23",
+"genres":[{"id":18,"name":"Drame"},{"id":35,"name":"Comédie"}],"id":136315,"last_episode_to_air":{"runtime":34},"name":"The Bear","original_name":"The Bear",
+"overview":"Un jeune chef cuisinier…","poster_path":"/tvPoster.jpg","vote_average":8.2,
+"images":{"backdrops":[{"iso_639_1":"en","file_path":"/tvEnBackdrop.jpg"}],"logos":[{"iso_639_1":null,"file_path":"/tvNullLogo.png"}],"posters":[]},
+"credits":{"cast":[{"id":1397778,"name":"Jeremy Allen White","character":"Carmen Berzatto","profile_path":"/jeremy.jpg","order":0}],"crew":[]},
+"videos":{"results":[{"iso_639_1":"en","key":"y-cqqAJIXhs","site":"YouTube","type":"Trailer"}]},
+"content_ratings":{"results":[{"iso_3166_1":"US","rating":"TV-MA"},{"iso_3166_1":"FR","rating":"16"}]}}

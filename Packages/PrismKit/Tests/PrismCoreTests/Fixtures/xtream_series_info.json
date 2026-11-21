@@ -1,0 +1,10 @@
+{"seasons":[{"air_date":"2022-06-23","episode_count":2,"id":1001,"name":"Saison 1","overview":"Première saison.","season_number":1,"cover":"http:\/\/img.example.com\/s1.jpg","cover_big":"http:\/\/img.example.com\/s1_big.jpg"},{"season_number":"2","name":"Season 2","cover":""}],
+"info":{"name":"The Bear","cover":"http:\/\/img.example.com\/bear.jpg","plot":"Un jeune chef cuisinier…","cast":"Jeremy Allen White, Ayo Edebiri","director":"Christopher Storer","genre":"Comédie \/ Drame","releaseDate":"2022-06-23","last_modified":"1704067200","rating":"8.6","rating_5based":"4.3","backdrop_path":["http:\/\/img.example.com\/bear_bd.jpg"],"youtube_trailer":"https:\/\/www.youtube.com\/watch?v=y-cqqAJIXhs","episode_run_time":"30","category_id":"20","tmdb":"136315"},
+"episodes":{
+  "2":[{"id":"9003","episode_num":"1","title":"The Bear - S02E01 - Beef","container_extension":"mkv","info":{"movie_image":"http:\/\/img.example.com\/e201.jpg","plot":"Retour en cuisine.","duration_secs":"1800","duration":"00:30:00","releasedate":"2023-06-22","rating":8.1},"season":2,"added":"1704067200"}],
+  "1":[
+    {"id":"9002","episode_num":2,"title":"The Bear - S01E02 - Hands","container_extension":"mp4","info":{"duration":"00:28:10","plot":"Episode two."},"season":1},
+    {"id":9001,"episode_num":1,"title":"The Bear - S01E01","container_extension":"mkv","info":[],"season":"1"},
+    {"title":"broken, no id"}
+  ]
+}}

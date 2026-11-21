@@ -1,0 +1,6 @@
+[
+  {"num":1,"name":"FR - The Bear (2022)","series_id":301,"cover":"http:\/\/img.example.com\/bear.jpg","plot":"Un jeune chef…","cast":"Jeremy Allen White, Ayo Edebiri","director":"Christopher Storer","genre":"Comédie, Drame","releaseDate":"2022-06-23","last_modified":"1704067200","rating":"8.6","rating_5based":4.3,"backdrop_path":["http:\/\/img.example.com\/bear_bd.jpg"],"youtube_trailer":"y-cqqAJIXhs","episode_run_time":"30","category_id":"20","tmdb":"136315"},
+  {"num":2,"name":"Breaking Bad","series_id":"302","cover":"","plot":null,"cast":"","genre":null,"release_date":"2008","last_modified":1704153600,"rating":9,"backdrop_path":"http:\/\/img.example.com\/bb_bd.jpg","category_id":20},
+  {"num":3,"name":"Broken","cover":"x"},
+  {"num":4,"name":"XXX Show","series_id":303,"category_id":"21","backdrop_path":[]}
+]

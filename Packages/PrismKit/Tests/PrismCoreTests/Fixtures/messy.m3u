@@ -1,0 +1,31 @@
+﻿#EXTM3U x-tvg-url="http://epg.example.com/a.xml"
+# A comment line that should be ignored
+
+#EXTINF:-1 tvg-id=tf1.fr group-title=News tvg-logo=http://logos.example.com/tf1.png,TF1, la une
+#EXTVLCOPT:http-user-agent=VLC/3.0.20 LibVLC/3.0.20
+#EXTVLCOPT:http-referrer=http://referer.example.com/
+
+http://live.example.com/tf1.m3u8
+#EXTINF:-1 tvg-name='Canal+' tvg-id='canal.fr' group-title='Cinéma, Séries',Canal+ ᴴᴰ
+http://live.example.com/canal.ts|User-Agent=Mozilla%2F5.0&Referer=http://site.example.com/
+#EXTINF:-1,##### FRANCE #####
+http://live.example.com/dummy.ts
+#EXTINF:-1 tvg-id="arte.fr",|FR| Arte FHD
+#EXTHTTP:{"User-Agent":"Prism-Test","cookie":"a=b"}
+http://live.example.com/arte.ts
+#EXTINF:-1 timeshift="3" tvg-id="lci.fr",LCI
+http://live.example.com/lci.ts
+not a url line
+ftp://unsupported.example.com/file.ts
+#EXTINF:-1 group-title="Séries",Breaking Bad (2008) S01E01
+http://vod.example.com/bb/s01e01.mkv
+#EXTINF:-1 group-title="Séries",Breaking Bad (2008) S01E02
+http://vod.example.com/bb/s01e02.mkv
+#EXTINF:-1 group-title="Séries",Breaking Bad (2008) S02E01
+http://vod.example.com/bb/s02e01.mkv
+#EXTGRP:Films
+#EXTINF:5400,Amélie (2001)
+http://vod.example.com/amelie.mp4
+#KODIPROP:inputstream.adaptive.stream_headers=User-Agent=Kodi%2F20&Origin=http://origin.example.com
+#EXTINF:-1 tvg-id="rtmp.ch",RTMP Channel
+rtmp://stream.example.com/live/channel

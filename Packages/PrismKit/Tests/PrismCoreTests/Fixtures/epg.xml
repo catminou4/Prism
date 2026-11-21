@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE tv SYSTEM "xmltv.dtd">
+<tv generator-info-name="Prism fixture">
+  <channel id="tf1.fr">
+    <display-name lang="fr">TF1</display-name>
+    <display-name>TF1 HD</display-name>
+    <icon src="http://logos.example.com/tf1.png" />
+  </channel>
+  <channel id="m6.fr">
+    <display-name>M6</display-name>
+  </channel>
+  <programme start="20250101120000 +0100" stop="20250101130000 +0100" channel="tf1.fr">
+    <title lang="en">The News</title>
+    <title lang="fr">Le Journal</title>
+    <sub-title lang="fr">Édition de 13h</sub-title>
+    <desc lang="fr">Toute l'actualité &amp; la météo.</desc>
+    <category lang="fr">Information</category>
+    <icon src="http://img.example.com/journal.jpg" />
+    <episode-num system="xmltv_ns">1.4.0/1</episode-num>
+    <episode-num system="onscreen">S02E05</episode-num>
+    <rating system="CSA"><value>16</value></rating>
+    <star-rating><value>3/5</value></star-rating>
+    <new />
+  </programme>
+  <programme start="202501011300 +0100" stop="20250101140000 +0100" channel="tf1.fr">
+    <title>Film</title>
+    <episode-num system="onscreen">Épisode spécial</episode-num>
+  </programme>
+  <programme start="20250101140000" stop="20250101150000" channel="m6.fr">
+    <title><![CDATA[Cuisine & Co]]></title>
+  </programme>
+  <programme start="20250102200000 -0500" stop="20250102210000 -0500" channel="m6.fr">
+    <title>Late Show</title>
+  </programme>
+  <programme start="20250102230000 +0000" channel="m6.fr">
+    <title>No Stop Show</title>
+  </programme>
+  <programme start="20250103000000 +0000" stop="20250103010000 +0000" channel="m6.fr">
+    <title>Night</title>
+  </programme>
+  <programme start="garbage" stop="20250103010000 +0000" channel="m6.fr">
+    <title>Broken</title>
+  </programme>
+</tv>

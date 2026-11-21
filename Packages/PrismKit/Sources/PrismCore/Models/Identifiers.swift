@@ -51,6 +51,9 @@ public struct TitleID: Hashable, Codable, Sendable, CustomStringConvertible {
     public init(kind: MediaKind, normalizedTitle: String, year: Int?) {
         rawValue = "\(kind.rawValue):\(normalizedTitle):\(year.map(String.init) ?? "")"
     }
+    public init(kind: MediaKind, tmdbID: Int) {
+        rawValue = "\(kind.rawValue):#tmdb:\(tmdbID)"
+    }
     public init(from decoder: any Decoder) throws { rawValue = try decoder.singleValueContainer().decode(String.self) }
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.singleValueContainer()

@@ -1,0 +1,267 @@
+import Foundation
+
+/// Extremely lenient accessors over `JSONSerialization` values. IPTV panels return numbers as
+/// strings, `""`/`null` for missing values, booleans as `0/1/"0"/"1"/true`, `[]` instead of `{}`…
+/// Values are only used locally inside decoding functions (not `Sendable`).
+enum LenientValue {
+    static func parse(_ data: Data) throws -> Any {
+        var bytes = data
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
+        return try JSONSerialization.jsonObject(with: bytes, options: [.fragmentsAllowed])
+    }
+
+    static func isNull(_ value: Any?) -> Bool {
+        value == nil || value is NSNull
+    }
+
+    static func string(_ value: Any?) -> String? {
+        switch value {
+        case let s as String:
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == "null" { return nil }
+            return trimmed
+        case let n as NSNumber:
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue ? "1" : "0" }
+            let d = n.doubleValue
+            if d.isFinite, d == d.rounded(), abs(d) < 1e15 { return String(Int64(d)) }
+            return n.stringValue
+        default:
+            return nil
+        }
+    }
+
+    static func int(_ value: Any?) -> Int? {
+        switch value {
+        case let n as NSNumber:
+            let d = n.doubleValue
+            guard d.isFinite, abs(d) < 9e15 else { return nil }
+            return Int(d)
+        case let s as String:
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            if let i = Int(trimmed) { return i }
+            if let d = Double(trimmed.replacingOccurrences(of: ",", with: ".")), d.isFinite, abs(d) < 9e15 { return Int(d) }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    static func double(_ value: Any?) -> Double? {
+        switch value {
+        case let n as NSNumber:
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
+            let d = n.doubleValue
+            return d.isFinite ? d : nil
+        case let s as String:
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+            guard !trimmed.isEmpty, let d = Double(trimmed), d.isFinite else { return nil }
+            return d
+        default:
+            return nil
+        }
+    }
+
+    static func bool(_ value: Any?) -> Bool? {
+        switch value {
+        case let n as NSNumber:
+            return n.doubleValue != 0
+        case let s as String:
+            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "1", "true", "yes", "y", "on": return true
+            case "0", "false", "no", "n", "off", "-1": return false
+            default: return int(s).map { $0 != 0 }
+            }
+        default:
+            return nil
+        }
+    }
+
+    private static let urlAllowed: CharacterSet = {
+        var set = CharacterSet.urlFragmentAllowed
+        set.insert(charactersIn: "%#")
+        return set
+    }()
+
+    /// http(s) URL with a host; spaces percent-encoded; anything else → nil.
+    static func url(_ value: Any?) -> URL? {
+        guard let raw = string(value) else { return nil }
+        let candidate = URL(string: raw) ?? raw.addingPercentEncoding(withAllowedCharacters: urlAllowed).flatMap { URL(string: $0) }
+        guard let url = candidate, let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host(), !host.isEmpty else { return nil }
+        return url
+    }
+
+    /// Array of URLs, a single URL string, or a comma separated list.
+    static func urls(_ value: Any?) -> [URL] {
+        if let array = value as? [Any] { return array.compactMap { url($0) } }
+        guard let raw = string(value) else { return [] }
+        if let single = url(raw) { return [single] }
+        return raw.split(separator: ",").compactMap { url(String($0)) }
+    }
+
+    /// Unix timestamp (seconds, or milliseconds when huge) as number or string; or a calendar date.
+    static func date(_ value: Any?) -> Date? {
+        if let seconds = double(value) {
+            guard seconds > 0 else { return nil }
+            return Date(timeIntervalSince1970: seconds > 1e11 ? seconds / 1000 : seconds)
+        }
+        return day(value)
+    }
+
+    /// "2019-05-02", "2019-05-02 20:30:00", "2019/05/02", "02/05/2019", "2019" → Date (UTC); or a unix timestamp.
+    static func day(_ value: Any?) -> Date? {
+        guard let raw = string(value) else { return nil }
+        let digits = raw.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        guard let first = digits.first else { return nil }
+        if digits.count == 1 {
+            if (1900...2100).contains(first) { return civil(first, 1, 1, 0, 0, 0) }
+            if first > 100_000 { return Date(timeIntervalSince1970: TimeInterval(first)) }
+            return nil
+        }
+        guard digits.count >= 3 else { return nil }
+        var (y, m, d) = (digits[0], digits[1], digits[2])
+        if y < 100, d >= 1900 { (y, d) = (d, y) } // dd/mm/yyyy
+        guard (1800...2200).contains(y), (1...12).contains(m), (1...31).contains(d) else { return nil }
+        let hh = digits.count > 3 ? digits[3] : 0
+        let mm = digits.count > 4 ? digits[4] : 0
+        let ss = digits.count > 5 ? digits[5] : 0
+        return civil(y, m, d, hh, mm, ss)
+    }
+
+    static func year(_ value: Any?) -> Int? {
+        if let i = int(value), (1900...2100).contains(i) { return i }
+        guard let raw = string(value) else { return nil }
+        // First 4-digit run in range ("2019-05-02", "(2019)").
+        var run = 0
+        var current = 0
+        for ch in raw.unicodeScalars {
+            if ch.value >= 0x30, ch.value <= 0x39 {
+                current = current * 10 + Int(ch.value - 0x30)
+                run += 1
+            } else {
+                if run == 4, (1900...2100).contains(current) { return current }
+                run = 0
+                current = 0
+            }
+        }
+        return run == 4 && (1900...2100).contains(current) ? current : nil
+    }
+
+    private static func civil(_ y: Int, _ m: Int, _ d: Int, _ hh: Int, _ mm: Int, _ ss: Int) -> Date {
+        let days = XMLTVParser.daysFromCivil(year: y, month: m, day: d)
+        return Date(timeIntervalSince1970: TimeInterval(days * 86_400 + hh * 3600 + mm * 60 + ss))
+    }
+
+    /// Array of strings or a separated string ("Action, Drame / Thriller").
+    static func list(_ value: Any?, separators: Set<Character> = [","]) -> [String] {
+        var parts: [String] = []
+        if let array = value as? [Any] {
+            parts = array.compactMap { string($0) }
+        } else if let raw = string(value) {
+            parts = raw.split(whereSeparator: { separators.contains($0) }).map { String($0) }
+        }
+        var seen = Set<String>()
+        var result: [String] = []
+        for part in parts {
+            let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed.lowercased()).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
+    }
+
+    /// Array elements; dictionaries become their values ordered by (numeric) key; anything else → [].
+    static func array(_ value: Any?) -> [Any] {
+        if let array = value as? [Any] { return array }
+        if let dict = value as? [String: Any] {
+            return dict.keys.sorted { lhs, rhs in
+                switch (Int(lhs), Int(rhs)) {
+                case let (l?, r?): l < r
+                default: lhs < rhs
+                }
+            }.compactMap { dict[$0] }
+        }
+        return []
+    }
+
+    /// "01:52:33" / "52:33" / "6753" → seconds.
+    static func hms(_ value: Any?) -> Int? {
+        guard let raw = string(value) else { return nil }
+        let parts = raw.split(separator: ":").map { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+        let numbers = parts.compactMap { $0 }
+        let seconds = numbers.reduce(0) { $0 * 60 + $1 }
+        return seconds > 0 ? seconds : nil
+    }
+
+    /// Lenient base64 (missing padding, URL-safe alphabet, embedded whitespace). Falls back to the raw text.
+    static func base64Text(_ value: Any?) -> String? {
+        guard let raw = string(value) else { return nil }
+        var cleaned = raw.filter { !$0.isWhitespace }
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = cleaned.count % 4
+        if remainder > 0 { cleaned += String(repeating: "=", count: 4 - remainder) }
+        if let data = Data(base64Encoded: cleaned), let text = String(data: data, encoding: .utf8),
+           !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return raw
+    }
+}
+
+/// Typed view over a JSON dictionary with multi-key lookups (`obj.string("releaseDate", "releasedate")`).
+struct JSONObject {
+    let raw: [String: Any]
+
+    init?(_ value: Any?) {
+        guard let dict = value as? [String: Any] else { return nil }
+        raw = dict
+    }
+
+    init(raw: [String: Any]) {
+        self.raw = raw
+    }
+
+    static var empty: JSONObject { JSONObject(raw: [:]) }
+
+    func value(_ keys: [String]) -> Any? {
+        for key in keys {
+            if let v = raw[key], !(v is NSNull) {
+                if let s = v as? String, s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                return v
+            }
+        }
+        return nil
+    }
+
+    func string(_ keys: String...) -> String? { LenientValue.string(value(keys)) }
+    func int(_ keys: String...) -> Int? { LenientValue.int(value(keys)) }
+    func double(_ keys: String...) -> Double? { LenientValue.double(value(keys)) }
+    func bool(_ keys: String...) -> Bool? { LenientValue.bool(value(keys)) }
+    func url(_ keys: String...) -> URL? {
+        for key in keys { if let u = LenientValue.url(raw[key]) { return u } }
+        return nil
+    }
+    func urls(_ keys: String...) -> [URL] {
+        for key in keys { let u = LenientValue.urls(raw[key]); if !u.isEmpty { return u } }
+        return []
+    }
+    func date(_ keys: String...) -> Date? { LenientValue.date(value(keys)) }
+    func day(_ keys: String...) -> Date? {
+        for key in keys { if let d = LenientValue.day(raw[key]) { return d } }
+        return nil
+    }
+    func year(_ keys: String...) -> Int? {
+        for key in keys { if let y = LenientValue.year(raw[key]) { return y } }
+        return nil
+    }
+    func list(_ keys: String..., separators: Set<Character> = [","]) -> [String] {
+        for key in keys { let l = LenientValue.list(raw[key], separators: separators); if !l.isEmpty { return l } }
+        return []
+    }
+    func object(_ key: String) -> JSONObject? { JSONObject(raw[key]) }
+    func array(_ key: String) -> [Any] { LenientValue.array(raw[key]) }
+}

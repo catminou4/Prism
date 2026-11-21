@@ -1,0 +1,2 @@
+# Preserve the BOM and CRLF exercise in the M3U parser fixture.
+Packages/PrismKit/Tests/PrismCoreTests/Fixtures/messy.m3u -text whitespace=cr-at-eol

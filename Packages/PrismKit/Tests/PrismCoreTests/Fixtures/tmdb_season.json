@@ -1,0 +1,5 @@
+{"_id":"x","air_date":"2022-06-23","name":"Saison 1","overview":"","id":1,"poster_path":"/s1.jpg","season_number":1,
+"episodes":[
+ {"air_date":"2022-06-23","episode_number":1,"id":10,"name":"System","overview":"Carmy revient à Chicago…","runtime":28,"season_number":1,"still_path":"/e1.jpg","vote_average":8.0},
+ {"air_date":"2022-06-23","episode_number":2,"id":11,"name":"Hands","overview":"","runtime":null,"season_number":1,"still_path":null}
+]}

@@ -409,3 +409,7 @@ public struct SourceCatalog: Codable, Sendable {
         self.fetchedAt = fetchedAt
     }
 }
+
+/// Unambiguous alias for `Category` (which clashes with `ObjectiveC.Category` in modules
+/// importing Foundation). Prefer `ContentCategory` outside PrismCore.
+public typealias ContentCategory = Category

@@ -20,6 +20,7 @@ let package = Package(
         .library(name: "PrismDesign", targets: ["PrismDesign"]),
         .library(name: "PrismPlayer", targets: ["PrismPlayer"]),
         .library(name: "PrismUI", targets: ["PrismUI"]),
+        .executable(name: "prism-tools", targets: ["PrismTools"]),
     ],
     dependencies: [
         .package(url: "https://github.com/tylerjonesio/vlckit-spm", exact: "3.6.0"),
@@ -48,6 +49,11 @@ let package = Package(
             name: "PrismUI",
             dependencies: ["PrismCore", "PrismData", "PrismDesign", "PrismPlayer"],
             resources: [.process("Resources")],
+            swiftSettings: uiSettings
+        ),
+        .executableTarget(
+            name: "PrismTools",
+            dependencies: ["PrismCore", "PrismData", "PrismDesign", "PrismPlayer", "PrismUI"],
             swiftSettings: uiSettings
         ),
         .testTarget(

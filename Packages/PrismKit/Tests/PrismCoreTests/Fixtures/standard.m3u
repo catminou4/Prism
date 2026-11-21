@@ -1,0 +1,21 @@
+#EXTM3U url-tvg="http://epg.example.com/guide.xml.gz,http://epg2.example.com/epg.xml" tvg-shift="1"
+#EXTINF:-1 tvg-id="tf1.fr" tvg-name="TF1" tvg-logo="http://logos.example.com/tf1.png" tvg-chno="1" group-title="FR | GÉNÉRALISTES",FR: TF1 HD
+http://live.example.com/live/user/pass/1001.ts
+#EXTINF:-1 tvg-id="france2.fr" tvg-name="France 2" tvg-logo="http://logos.example.com/f2.png" tvg-chno="2" group-title="FR | GÉNÉRALISTES",FR: France 2 FHD
+http://live.example.com/live/user/pass/1002.m3u8
+#EXTINF:-1 tvg-id="m6.fr" tvg-logo="http://logos.example.com/m6.png" channel-number="6" group-title="FR | GÉNÉRALISTES" catchup="default" catchup-days="7" catchup-source="?utc={utc}&lutc={lutc}",M6
+http://live.example.com/live/user/pass/1006.ts
+#EXTINF:-1 tvg-id="bbcone.uk" tvg-logo="http://logos.example.com/bbc1.png" group-title="UK | ENTERTAINMENT",UK: BBC One HD
+http://live.example.com/live/user/pass/2001.ts
+#EXTINF:-1 tvg-id="" tvg-logo="" group-title="XXX | ADULTS",Hot Channel
+http://live.example.com/live/user/pass/9001.ts
+#EXTINF:-1 tvg-logo="http://img.example.com/avatar.jpg" group-title="FILMS 4K",4K | Avatar (2009) [MULTI] HDR
+http://vod.example.com/movie/user/pass/5001.mkv
+#EXTINF:7620 tvg-logo="http://img.example.com/inception.jpg" group-title="FILMS ACTION",Inception (2010) VF
+http://vod.example.com/movie/user/pass/5002.mp4
+#EXTINF:-1 tvg-logo="http://img.example.com/bear.jpg" group-title="SÉRIES VOSTFR",VOSTFR - The Bear S01 E01
+http://vod.example.com/series/user/pass/7001.mkv
+#EXTINF:-1 tvg-logo="http://img.example.com/bear2.jpg" group-title="SÉRIES VOSTFR",VOSTFR - The Bear S01 E02
+http://vod.example.com/series/user/pass/7002.mkv
+#EXTINF:-1 tvg-logo="http://img.example.com/bear3.jpg" group-title="SÉRIES VOSTFR",VOSTFR - The Bear S02 E01
+http://vod.example.com/series/user/pass/7003.mkv
