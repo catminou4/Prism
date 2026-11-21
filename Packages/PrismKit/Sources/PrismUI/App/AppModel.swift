@@ -42,6 +42,7 @@ public final class AppModel {
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
     public private(set) var isRefreshingGuide = false
     public private(set) var isMetadataEnabled = false
+    private var hiddenCategoriesBySource: [String: [String]] = [:]
     /// Bumped every time `catalog` is replaced (cheap change token for views/tasks).
     public private(set) var catalogRevision = 0
 
@@ -61,6 +62,7 @@ public final class AppModel {
     private enum Keys {
         static let hideAdult = "prism.hideAdultContent"
         static let onboardingDone = "prism.onboardingCompleted"
+        static let hiddenCategories = "prism.hiddenSourceCategories"
     }
 
     /// Catalogs older than this are refreshed in the background at launch.
@@ -86,6 +88,9 @@ public final class AppModel {
         self.sourceStore = SourceStore(directories: directories)
         self.library = library ?? LibraryStore(directories: directories)
         self.hideAdultContent = UserDefaults.standard.object(forKey: Keys.hideAdult) as? Bool ?? true
+        if !isEphemeral {
+            self.hiddenCategoriesBySource = UserDefaults.standard.dictionary(forKey: Keys.hiddenCategories) as? [String: [String]] ?? [:]
+        }
     }
 
     /// Fully populated in-memory model for previews and offscreen snapshots.
@@ -114,6 +119,16 @@ public final class AppModel {
     public func isImporting(_ id: SourceID) -> Bool { imports[id] != nil }
     public var isImportingAnything: Bool { !imports.isEmpty }
     public var hasCompletedOnboarding: Bool { UserDefaults.standard.bool(forKey: Keys.onboardingDone) }
+
+    /// Provider categories come from the full source, including categories filtered from the library.
+    public func sourceCategories(for id: SourceID) -> [PrismCore.Category] {
+        _ = catalogRevision
+        return sourceCatalogs[id]?.categories ?? []
+    }
+
+    public func hiddenCategoryIDs(for id: SourceID) -> Set<String> {
+        Set(hiddenCategoriesBySource[id.rawValue] ?? [])
+    }
 
     // MARK: Lifecycle
 
@@ -253,10 +268,20 @@ public final class AppModel {
         update(source)
     }
 
+    public func setHiddenCategoryIDs(_ categoryIDs: Set<String>, for id: SourceID) {
+        guard source(id) != nil else { return }
+        let categoryIDs = categoryIDs.filter { $0.hasPrefix(id.rawValue + ":") }
+        guard categoryIDs != hiddenCategoryIDs(for: id) else { return }
+        hiddenCategoriesBySource[id.rawValue] = categoryIDs.isEmpty ? nil : categoryIDs.sorted()
+        persistHiddenCategories()
+        Task { await rebuild() }
+    }
+
     public func remove(_ id: SourceID) {
         guard imports[id] == nil else { return }
         pendingSources.remove(id)
         sources.removeAll { $0.id == id }
+        if hiddenCategoriesBySource.removeValue(forKey: id.rawValue) != nil { persistHiddenCategories() }
         persistSources()
         try? credentials.setPassword(nil, for: id)
         sourceCatalogs[id] = nil
@@ -336,6 +361,11 @@ public final class AppModel {
         try? sourceStore.save(sources.filter { !pendingSources.contains($0.id) })
     }
 
+    private func persistHiddenCategories() {
+        guard !isEphemeral else { return }
+        UserDefaults.standard.set(hiddenCategoriesBySource, forKey: Keys.hiddenCategories)
+    }
+
     private func performImport(_ id: SourceID, report: (ImportProgress) -> Void) async throws {
         guard let source = source(id) else { return }
         errors[id] = nil
@@ -383,7 +413,10 @@ public final class AppModel {
         let generation = rebuildGeneration
         let sources = self.sources
         let catalogs = sources.compactMap { sourceCatalogs[$0.id] }
-        let options = CatalogBuildOptions(hideAdult: hideAdultContent)
+        let options = CatalogBuildOptions(
+            hideAdult: hideAdultContent,
+            hiddenCategoryIDs: Set(hiddenCategoriesBySource.values.joined())
+        )
         let built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
         async let index = SearchIndex.build(from: built)
         async let recommendations = RecommendationBuilder.build(for: built)

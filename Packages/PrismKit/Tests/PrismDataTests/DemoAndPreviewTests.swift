@@ -29,12 +29,27 @@ struct DemoAndPreviewTests {
         #expect(catalog.movies.count == raw.movies.count - 2, "Big Buck Bunny and Tears of Steel have two variants each")
         let bunny = catalog.movies.first { $0.title == "Big Buck Bunny" }
         #expect(bunny?.variants.map(\.quality) == [.fhd, .sd])
+        #expect(catalog.movies.allSatisfy { $0.posterURL != nil && $0.backdropURL != nil })
+        #expect(catalog.series.first?.posterURL != nil)
         #expect(catalog.featured(limit: 3).allSatisfy { $0.backdropURL != nil })
         let guide = DemoContent.makeGuide()
         #expect(guide.channelCount == raw.channels.count)
         for group in catalog.channels {
             #expect(guide.nowAndNext(forEPGID: guide.resolveEPGID(for: group) ?? "-", at: .now).now != nil)
         }
+    }
+
+    @Test func builtInDemoIgnoresItsOlderDiskSnapshot() async throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let source = DemoContent.makeSource()
+        let cache = CatalogCache(directories: directories)
+        try await cache.save(SourceCatalog(sourceID: source.id))
+
+        let repository = CatalogRepository(directories: directories, credentials: InMemoryCredentialStore(), cache: cache)
+        let catalogs = await repository.cachedCatalogs(for: [source])
+        let catalog = try #require(catalogs.first)
+        #expect(catalog.movies.contains { $0.nativeID == "agent-327" && $0.posterURL != nil })
     }
 
     @Test func previewDataIsRichAndDeterministic() async {

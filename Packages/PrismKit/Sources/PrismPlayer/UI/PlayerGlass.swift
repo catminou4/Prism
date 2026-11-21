@@ -14,11 +14,11 @@ public enum PlayerMetrics {
     /// Bottom-right menu buttons are packed slightly tighter.
     public static let menuButtonWidth: CGFloat = 35
     public static let capsulePadding: CGFloat = 3
-    public static let skipDiameter: CGFloat = 62
-    public static let playDiameter: CGFloat = 72
-    public static let skipSymbolSize: CGFloat = 23
-    public static let playSymbolSize: CGFloat = 29
-    public static let centerSpacing: CGFloat = 10
+    public static let skipDiameter: CGFloat = 42
+    public static let playDiameter: CGFloat = 56
+    public static let skipSymbolSize: CGFloat = 19
+    public static let playSymbolSize: CGFloat = 24
+    public static let centerSpacing: CGFloat = 16
     public static let scrubberHeight: CGFloat = 32
     public static let scrubberPadding: CGFloat = 16.5
     public static let trackHeight: CGFloat = 6
@@ -114,7 +114,7 @@ private struct PlayerCapsuleButtonBody: View {
     }
 }
 
-/// Round glass button of the centre cluster (skip ±10 s, play/pause).
+/// Individual glass actions for the transport cluster.
 struct PlayerTransportButtonStyle: ButtonStyle {
     let diameter: CGFloat
     var prominent = false
@@ -132,21 +132,13 @@ private struct PlayerTransportButtonBody: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 21)
+        let shape = RoundedRectangle(cornerRadius: prominent ? 18 : diameter / 2)
         configuration.label
             .foregroundStyle(.white)
             .frame(width: diameter, height: diameter)
-            .background {
-                if prominent {
-                    shape.fill(.linearGradient(
-                        colors: [Color(red: 0.39, green: 0.25, blue: 0.83), Color(red: 0.19, green: 0.19, blue: 0.48)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    ))
-                    .overlay { shape.strokeBorder(.white.opacity(0.25), lineWidth: 1) }
-                }
-            }
-            .overlay { shape.fill(.white.opacity(hovering ? 0.10 : 0)).allowsHitTesting(false) }
             .contentShape(shape)
+            .playerGlass(shape, interactive: true)
+            .overlay { shape.fill(.white.opacity(hovering ? 0.10 : 0)).allowsHitTesting(false) }
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.95 : 1)
             .onHover { hovering = $0 }
             .animation(reduceMotion ? nil : .smooth(duration: 0.23), value: hovering)

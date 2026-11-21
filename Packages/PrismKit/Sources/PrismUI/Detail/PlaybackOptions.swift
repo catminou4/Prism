@@ -7,20 +7,34 @@ import SwiftUI
 /// every view that reads this environment value on unrelated SwiftUI updates.
 nonisolated struct PrismPlaybackAction: Equatable, Sendable {
     private let owner: ObjectIdentifier?
-    private let action: @MainActor (PlaybackItem, HistoryEntry.Target, ContentID) -> Void
+    private let action: @MainActor (PlaybackItem, HistoryEntry.Target, ContentID, ContentID?) -> Void
 
-    static let none = Self(owner: nil) { _, _, _ in }
+    static let none = Self(owner: nil) { _, _, _, _ in }
 
-    init(owner: AnyObject?, action: @escaping @MainActor (PlaybackItem, HistoryEntry.Target, ContentID) -> Void) {
+    init(
+        owner: AnyObject?,
+        action: @escaping @MainActor (PlaybackItem, HistoryEntry.Target, ContentID, ContentID?) -> Void
+    ) {
         self.owner = owner.map(ObjectIdentifier.init)
         self.action = action
     }
 
-    @MainActor func callAsFunction(_ item: PlaybackItem, _ target: HistoryEntry.Target, _ contentID: ContentID) {
-        action(item, target, contentID)
+    @MainActor func callAsFunction(
+        _ item: PlaybackItem, _ target: HistoryEntry.Target, _ contentID: ContentID, seriesEditionID: ContentID? = nil
+    ) {
+        action(item, target, contentID, seriesEditionID)
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.owner == rhs.owner }
+}
+
+extension DetailEpisodeInventory {
+    /// Continue in the selected edition and in episode order, including across seasons.
+    nonisolated func nextAvailableEpisode(after id: ContentID) -> Episode? {
+        guard let index = orderedEpisodes.firstIndex(where: { $0.id == id }) else { return nil }
+        let next = orderedEpisodes.index(after: index)
+        return orderedEpisodes.indices.contains(next) ? orderedEpisodes[next] : nil
+    }
 }
 
 extension EnvironmentValues {

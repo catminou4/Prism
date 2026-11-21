@@ -9,10 +9,13 @@ struct SourceDetailView: View {
     let sourceID: SourceID
     @State private var counts = ImportCounts()
     @State private var editing = false
+    @State private var filteringCategories = false
     @State private var removing = false
 
     var body: some View {
         if let source = app.source(sourceID) {
+            let categories = app.sourceCategories(for: sourceID)
+            let hiddenIDs = app.hiddenCategoryIDs(for: sourceID)
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     BrowseHeading(title: source.name, subtitle: source.kind.displayLabel)
@@ -42,6 +45,11 @@ struct SourceDetailView: View {
                             }
                         }
                         Section {
+                            if !categories.isEmpty || !hiddenIDs.isEmpty {
+                                Button("Filtrer les catégories…", systemImage: "line.3.horizontal.decrease") {
+                                    filteringCategories = true
+                                }
+                            }
                             HStack {
                                 Button("Actualiser", systemImage: "arrow.clockwise") { Task { await app.refresh(sourceID) } }
                                     .disabled(!source.isEnabled || app.isImporting(sourceID))
@@ -60,6 +68,11 @@ struct SourceDetailView: View {
             }
             .task(id: app.catalogRevision) { counts = await Self.counts(for: sourceID, in: app.catalog) }
             .sheet(isPresented: $editing) { EditSourceSheet(source: source) }
+            .sheet(isPresented: $filteringCategories) {
+                SourceCategorySheet(
+                    source: source, categories: categories, hiddenIDs: hiddenIDs
+                )
+            }
             .confirmationDialog("Supprimer « \(source.name) » ?", isPresented: $removing) {
                 Button("Supprimer la source", role: .destructive) { app.remove(sourceID) }
             }
@@ -83,6 +96,82 @@ struct SourceDetailView: View {
     @concurrent
     private static func counts(for id: SourceID, in catalog: Catalog) async -> ImportCounts {
         catalog.counts(for: id)
+    }
+}
+
+private struct SourceCategorySheet: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.dismiss) private var dismiss
+    let source: Source
+    let categories: [PrismCore.Category]
+    @State private var hiddenIDs: Set<String>
+    @State private var query = ""
+
+    init(source: Source, categories: [PrismCore.Category], hiddenIDs: Set<String>) {
+        self.source = source
+        self.categories = categories
+        self._hiddenIDs = State(initialValue: hiddenIDs)
+    }
+
+    var body: some View {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches = categories.filter { term.isEmpty || $0.name.localizedStandardContains(term) }
+        let groups = Dictionary(grouping: matches, by: \.kind)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Catégories de \(source.name)").font(.title2.bold())
+            if categories.isEmpty {
+                ContentUnavailableView("Catégories indisponibles", systemImage: "line.3.horizontal.decrease")
+                    .frame(maxHeight: .infinity)
+            } else {
+                Text("Cochez les catégories à afficher dans votre catalogue.")
+                    .foregroundStyle(.secondary)
+                TextField("Rechercher une catégorie", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                if matches.isEmpty {
+                    ContentUnavailableView.search(text: term)
+                        .frame(maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach([MediaKind.live, .movie, .series], id: \.self) { kind in
+                            if let categories = groups[kind], !categories.isEmpty {
+                                Section(kind.sectionTitle) {
+                                    ForEach(categories) { category in
+                                        Toggle(category.name, isOn: visibility(for: category.id))
+                                            .toggleStyle(.checkbox)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.inset)
+                }
+            }
+            HStack {
+                Button("Tout afficher") { hiddenIDs.removeAll() }
+                    .disabled(hiddenIDs.isEmpty)
+                Spacer()
+                Button("Annuler") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Appliquer") {
+                    app.setHiddenCategoryIDs(hiddenIDs, for: source.id)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 500, height: 490)
+    }
+
+    private func visibility(for id: String) -> Binding<Bool> {
+        Binding {
+            !hiddenIDs.contains(id)
+        } set: { isVisible in
+            if isVisible {
+                hiddenIDs.remove(id)
+            } else {
+                hiddenIDs.insert(id)
+            }
+        }
     }
 }
 

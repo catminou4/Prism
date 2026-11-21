@@ -10,6 +10,7 @@ public struct HeroBackdrop: View {
     private let leadingScrim: Double
     private let extendsUnderSidebar: Bool
     private let animates: Bool
+    private let artSize: CGSize?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotRendering) private var snapshot
     @State private var kenBurns = false
@@ -26,7 +27,8 @@ public struct HeroBackdrop: View {
         fadeInto: Color? = nil,
         leadingScrim: Double = 0.75,
         extendsUnderSidebar: Bool = false,
-        animates: Bool = true
+        animates: Bool = true,
+        artSize: CGSize? = nil
     ) {
         self.imageURL = imageURL
         self.seed = seed
@@ -35,6 +37,7 @@ public struct HeroBackdrop: View {
         self.leadingScrim = leadingScrim
         self.extendsUnderSidebar = extendsUnderSidebar
         self.animates = animates
+        self.artSize = artSize
     }
 
     public var body: some View {
@@ -53,7 +56,7 @@ public struct HeroBackdrop: View {
 
     @ViewBuilder private var artwork: some View {
         if imageURL != nil || fallbackPosterURL == nil {
-            RemoteImage(url: imageURL, placeholderSeed: seed, placeholderStyle: .none)
+            RemoteImage(url: imageURL, size: artSize, placeholderSeed: seed, placeholderStyle: .none)
                 .scaleEffect(kenBurns ? 1.06 : 1, anchor: .center)
                 .animation(kenBurns ? .easeInOut(duration: PrismMotion.kenBurnsDuration).repeatForever(autoreverses: true) : nil, value: kenBurns)
         } else {

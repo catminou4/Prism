@@ -4,9 +4,12 @@ import PrismCore
 public struct CatalogBuildOptions: Sendable, Hashable {
     /// Drops adult items and adult categories.
     public var hideAdult: Bool
+    /// Canonical IDs of categories hidden for individual sources, including their variants.
+    public var hiddenCategoryIDs: Set<String>
 
-    public init(hideAdult: Bool = false) {
+    public init(hideAdult: Bool = false, hiddenCategoryIDs: Set<String> = []) {
         self.hideAdult = hideAdult
+        self.hiddenCategoryIDs = hiddenCategoryIDs
     }
 }
 
@@ -85,7 +88,7 @@ public enum CatalogBuilder {
         let catalogs: [SourceCatalog]
         let priority: [SourceID: Int]
         let options: CatalogBuildOptions
-        /// Visible categories (adult ones removed when hiding adult content), by canonical id.
+        /// Visible categories, by canonical ID.
         let categories: [String: PrismCore.Category]
         /// Per catalog and kind: raw category reference (canonical id or native id) → resolution.
         let resolvers: [[MediaKind: [String: ResolvedCategory]]]
@@ -100,16 +103,29 @@ public enum CatalogBuilder {
                 var resolver: [MediaKind: [String: ResolvedCategory]] = [:]
                 for category in catalog.categories {
                     let isAdult = category.isAdult || TitleNormalizer.isAdult(category.rawName)
-                    let hidden = options.hideAdult && isAdult
+                    let hidden = options.hiddenCategoryIDs.contains(category.id) || (options.hideAdult && isAdult)
                     if !hidden {
                         var visible = category
                         visible.isAdult = isAdult
                         categories[category.id] = visible
                     }
-                    let resolved = ResolvedCategory(visibleID: hidden ? nil : category.id, isAdult: isAdult)
+                    let resolved = ResolvedCategory(visibleID: hidden ? nil : category.id, isAdult: isAdult, isHidden: hidden)
                     resolver[category.kind, default: [:]][category.id] = resolved
                     if resolver[category.kind]?[category.nativeID] == nil {
                         resolver[category.kind, default: [:]][category.nativeID] = resolved
+                    }
+                }
+                // Xtream can return items after an incomplete category-list response.
+                // Apply saved preferences to their native or canonical references in that case as well.
+                if !options.hiddenCategoryIDs.isEmpty {
+                    for kind in [MediaKind.live, .movie, .series] {
+                        let prefix = "\(catalog.sourceID.rawValue):\(kind.rawValue):"
+                        for id in options.hiddenCategoryIDs where id.hasPrefix(prefix) {
+                            let nativeID = String(id.dropFirst(prefix.count))
+                            let hidden = ResolvedCategory(visibleID: nil, isAdult: false, isHidden: true)
+                            if resolver[kind]?[id] == nil { resolver[kind, default: [:]][id] = hidden }
+                            if resolver[kind]?[nativeID] == nil { resolver[kind, default: [:]][nativeID] = hidden }
+                        }
                     }
                 }
                 resolvers.append(resolver)
@@ -124,9 +140,10 @@ public enum CatalogBuilder {
     }
 
     struct ResolvedCategory: Sendable {
-        /// Canonical category id, `nil` when the category is hidden (adult).
+        /// Canonical category ID, `nil` when the category is hidden.
         var visibleID: String?
         var isAdult: Bool
+        var isHidden: Bool
     }
 
     // MARK: - Keys
@@ -244,7 +261,7 @@ public enum CatalogBuilder {
             for (itemIndex, item) in list.enumerated() {
                 let category = item.categoryID.flatMap { resolver[$0] }
                 let isAdult = item.isAdult || category?.isAdult == true
-                if isAdult && context.options.hideAdult { continue }
+                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
                 adult[itemIndex] = isAdult
                 cats[itemIndex] = category?.visibleID
                 if !hasTMDBIdentity, let tmdbID = item.tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
@@ -599,7 +616,7 @@ public enum CatalogBuilder {
             for (itemIndex, channel) in list.enumerated() {
                 let category = channel.categoryID.flatMap { resolver[$0] }
                 let isAdult = channel.isAdult || category?.isAdult == true
-                if isAdult && context.options.hideAdult { continue }
+                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
                 let key = keys[catalogIndex][itemIndex]
                 let group: Int
                 if let existing = groupIndex[key] {

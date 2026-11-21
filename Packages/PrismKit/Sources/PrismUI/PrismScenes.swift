@@ -56,8 +56,8 @@ struct PrismRootView: View {
             case .ready: LibraryShell()
             }
         }
-        .environment(\.playPrismItem, PrismPlaybackAction(owner: playback) { item, target, contentID in
-            playback.open(item, target: target, contentID: contentID, app: app)
+        .environment(\.playPrismItem, PrismPlaybackAction(owner: playback) { item, target, contentID, seriesEditionID in
+            playback.open(item, target: target, contentID: contentID, app: app, seriesEditionID: seriesEditionID)
             openWindow(id: PrismPlaybackSession.windowID)
         })
         .animation(reduceMotion ? nil : .smooth(duration: 0.38), value: app.phase)

@@ -1,14 +1,11 @@
 import SwiftUI
 
-/// Geometry of the Prism mark in a unit square: a right-pointing "play" triangle, optically
-/// centred, split into three facets that meet at the centroid.
+/// Geometry of the original rounded playback triangle.
 nonisolated enum PrismGeometry {
     static let a = CGPoint(x: 0.215, y: 0.105) // top-left
     static let b = CGPoint(x: 0.215, y: 0.895) // bottom-left
     static let c = CGPoint(x: 0.900, y: 0.500) // tip
     static let cornerRadius: CGFloat = 0.115
-    static var centroid: CGPoint { CGPoint(x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3) }
-
     static func point(_ p: CGPoint, in rect: CGRect) -> CGPoint {
         CGPoint(x: rect.minX + p.x * rect.width, y: rect.minY + p.y * rect.height)
     }
@@ -34,43 +31,30 @@ nonisolated public struct PrismTriangle: Shape {
     }
 }
 
-/// One facet: centroid + two vertices of the play triangle (extended past the outline;
-/// the mark masks it with `PrismTriangle`).
-nonisolated struct PrismFacet: Shape {
-    enum Kind: CaseIterable {
-        case top, left, bottom
-
-        var vertices: (CGPoint, CGPoint) {
-            switch self {
-            case .top: (PrismGeometry.a, PrismGeometry.c)
-            case .left: (PrismGeometry.b, PrismGeometry.a)
-            case .bottom: (PrismGeometry.c, PrismGeometry.b)
-            }
-        }
-
-        /// Unit direction pushing the facet away from the centroid (assembly animation).
-        var outward: CGVector {
-            let (p, q) = vertices
-            let g = PrismGeometry.centroid
-            let mid = CGPoint(x: (p.x + q.x) / 2, y: (p.y + q.y) / 2)
-            let dx = mid.x - g.x, dy = mid.y - g.y
-            let length = max(sqrt(dx * dx + dy * dy), 0.0001)
-            return CGVector(dx: dx / length, dy: dy / length)
-        }
+/// Two solid planes make up the Prism P. Angled corners leave a wide counter at icon sizes.
+nonisolated struct PrismMonogramPlane: Shape {
+    enum Part {
+        case stem
+        case bowl
     }
 
-    let kind: Kind
+    let part: Part
 
     func path(in rect: CGRect) -> Path {
-        let g = PrismGeometry.point(PrismGeometry.centroid, in: rect)
-        let (p, q) = kind.vertices
-        let pp = PrismGeometry.point(p, in: rect), qq = PrismGeometry.point(q, in: rect)
-        // Extend the outer vertices away from the centroid so the mask defines the outline.
-        func extend(_ v: CGPoint) -> CGPoint { CGPoint(x: g.x + (v.x - g.x) * 1.25, y: g.y + (v.y - g.y) * 1.25) }
+        let corners: [CGPoint] = switch part {
+        case .stem: [
+            .init(x: 0.14, y: 0.13), .init(x: 0.37, y: 0.13), .init(x: 0.37, y: 0.69),
+            .init(x: 0.19, y: 0.87), .init(x: 0.14, y: 0.87)
+        ]
+        case .bowl: [
+            .init(x: 0.35, y: 0.13), .init(x: 0.66, y: 0.13), .init(x: 0.86, y: 0.33),
+            .init(x: 0.86, y: 0.47), .init(x: 0.66, y: 0.67), .init(x: 0.35, y: 0.67),
+            .init(x: 0.35, y: 0.48), .init(x: 0.58, y: 0.48), .init(x: 0.65, y: 0.41),
+            .init(x: 0.65, y: 0.39), .init(x: 0.58, y: 0.32), .init(x: 0.35, y: 0.32)
+        ]
+        }
         var path = Path()
-        path.move(to: g)
-        path.addLine(to: extend(pp))
-        path.addLine(to: extend(qq))
+        path.addLines(corners.map { PrismGeometry.point($0, in: rect) })
         path.closeSubpath()
         return path
     }

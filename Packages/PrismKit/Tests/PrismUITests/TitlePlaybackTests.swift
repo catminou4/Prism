@@ -90,4 +90,28 @@ struct TitlePlaybackTests {
         #expect(inventory.orderedEpisodes.map(\.number) == [1, 2, 3])
         #expect(inventory.nextEpisode(after: completed, isWatched: { $0 == episodes[1].id || $0 == episodes[2].id })?.number == 3)
     }
+
+    @Test func nextEpisodeCrossesSeasonsWithoutReplayingOrSwitchingEdition() async throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let series = Series(sourceID: source.id, nativeID: "series", title: "Série")
+        let alternate = Series(sourceID: source.id, nativeID: "alternate", title: "Série")
+        let first = Episode(seriesID: series.id, sourceID: source.id, nativeID: "s1e2", season: 1, number: 2,
+                            title: "Finale", streamURL: url)
+        let next = Episode(seriesID: series.id, sourceID: source.id, nativeID: "s2e1", season: 2, number: 1,
+                           title: "Première", streamURL: url)
+        let wrongEdition = Episode(seriesID: alternate.id, sourceID: source.id, nativeID: "other", season: 2, number: 1,
+                                   title: "Autre version", streamURL: url)
+        let inventory = await DetailEpisodeInventory.build(
+            edition: TitleEdition(variant: .series(series), source: source),
+            detail: SeriesDetail(seriesID: series.id, seasons: [
+                Season(number: 2, episodes: [wrongEdition, next]),
+                Season(number: 1, episodes: [first]),
+            ])
+        )
+
+        #expect(inventory.nextAvailableEpisode(after: first.id) == next)
+        #expect(inventory.nextAvailableEpisode(after: next.id) == nil)
+        #expect(inventory.nextAvailableEpisode(after: wrongEdition.id) == nil)
+    }
 }

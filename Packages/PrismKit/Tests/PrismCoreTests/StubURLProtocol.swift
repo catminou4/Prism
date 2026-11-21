@@ -7,6 +7,7 @@ final class StubURLProtocol: URLProtocol {
         var status: Int
         var body: Data
         var headers: [String: String] = [:]
+        var errorCode: URLError.Code?
     }
 
     private static let routes = Mutex<[String: Response]>([:])
@@ -20,6 +21,10 @@ final class StubURLProtocol: URLProtocol {
     /// Path route (TMDB style).
     static func register(host: String, path: String, status: Int = 200, body: Data, headers: [String: String] = [:]) {
         routes.withLock { $0[key(host: host, route: path)] = Response(status: status, body: body, headers: headers) }
+    }
+
+    static func registerTransportError(host: String, code: URLError.Code) {
+        routes.withLock { $0[key(host: host, route: "/player_api.php")] = Response(status: 0, body: Data(), errorCode: code) }
     }
 
     static func recordedRequests(host: String) -> [URLRequest] {
@@ -44,6 +49,10 @@ final class StubURLProtocol: URLProtocol {
         let route = Self.routes.withLock { $0[Self.key(host: url.host() ?? "", route: action ?? url.path())] }
         guard let route else {
             client.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+            return
+        }
+        if let code = route.errorCode {
+            client.urlProtocol(self, didFailWithError: URLError(code))
             return
         }
         let response = HTTPURLResponse(url: url, statusCode: route.status, httpVersion: "HTTP/1.1", headerFields: route.headers)!

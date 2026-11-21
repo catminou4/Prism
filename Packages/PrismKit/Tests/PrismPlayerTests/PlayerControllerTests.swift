@@ -16,6 +16,8 @@ final class MockEngine: PlaybackEngine {
     private(set) var pauseCount = 0
     private(set) var isStopped = false
     private(set) var seeks: [TimeInterval] = []
+    private(set) var completedSeeks: [TimeInterval] = []
+    var onSeek: ((TimeInterval) async -> Void)?
     var rate: Float = 1
     var volume: Float = 1
     var isMuted = false
@@ -41,7 +43,11 @@ final class MockEngine: PlaybackEngine {
     }
     func play() { playCount += 1 }
     func pause() { pauseCount += 1 }
-    func seek(to seconds: TimeInterval) async { seeks.append(seconds) }
+    func seek(to seconds: TimeInterval) async {
+        seeks.append(seconds)
+        await onSeek?(seconds)
+        completedSeeks.append(seconds)
+    }
     func stop() {
         isStopped = true
         eventHandler = nil
@@ -309,6 +315,43 @@ final class MockFactory {
         factory.last?.emit(.ended)
         #expect(controller.phase == .ended)
         defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func supersededSeekDoesNotUnblockThePlaybackClock() async throws {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        let engine = try #require(factory.last)
+        engine.start(duration: 120)
+
+        var pending: [TimeInterval: CheckedContinuation<Void, Never>] = [:]
+        engine.onSeek = { position in
+            await withCheckedContinuation { pending[position] = $0 }
+        }
+        defer {
+            controller.stop()
+            for continuation in pending.values { continuation.resume() }
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        controller.seek(to: 20)
+        try await waitForState { pending[20] != nil }
+        try #require(pending[20] != nil)
+        controller.seek(to: 80)
+        try await waitForState { pending[80] != nil }
+        try #require(pending[80] != nil)
+
+        pending.removeValue(forKey: 20)?.resume()
+        try await waitForState { engine.completedSeeks.contains(20) }
+        try #require(engine.completedSeeks.contains(20))
+        engine.emit(.time(current: 21, buffered: 120))
+        #expect(controller.currentTime == 80)
+
+        pending.removeValue(forKey: 80)?.resume()
+        try await waitForState { engine.completedSeeks.contains(80) }
+        try #require(engine.completedSeeks.contains(80))
+        engine.emit(.time(current: 81, buffered: 120))
+        #expect(controller.currentTime == 81)
     }
 
     @Test func liveWithoutTimeshiftCannotSkip() {

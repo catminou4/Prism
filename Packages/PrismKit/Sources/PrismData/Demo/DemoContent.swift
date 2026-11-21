@@ -3,10 +3,9 @@ import PrismCore
 
 /// Built-in demo source ("Essayer la démo"): free, legal, public streams and Blender open movies.
 ///
-/// Every stream and image URL below was checked to respond (Nov 2026). Channels are public
-/// broadcasters' official HLS feeds and Apple's HLS sample streams; movies and the series are
-/// Creative Commons open movies by the Blender Foundation hosted on archive.org / blender.org /
-/// Mux test streams, with artwork from Wikimedia Commons.
+/// Channels are public broadcasters' official HLS feeds and Apple's HLS sample streams.
+/// The films and series are Blender Foundation open movies, hosted by Blender, Internet Archive
+/// or Mux, with artwork from Blender Studio's public press materials and Wikimedia Commons.
 public enum DemoContent {
     public static let sourceID: SourceID = "prism-demo"
     /// Placeholder playlist URL recognised by `CatalogRepository` (no network access needed).
@@ -106,6 +105,7 @@ public enum DemoContent {
     }
 
     private static let commons = "https://upload.wikimedia.org/wikipedia/commons/"
+    private static let studioArt = "https://studio.blender.org/files/public/"
 
     private static let channels: [Channel] = [
         channel("france24", "France 24", number: 1, category: "info", quality: .fhd,
@@ -190,20 +190,22 @@ public enum DemoContent {
               stream: "https://archive.org/download/sprite-fright/Sprite%20Fright%20-%20Open%20Movie%20by%20Blender%20Studio-804p.mp4",
               container: "mp4", category: "comedy",
               poster: commons + "thumb/e/e5/Sprite_Fright-movie_poster.jpg/960px-Sprite_Fright-movie_poster.jpg",
-              backdrop: commons + "thumb/8/82/Sprite_Fright-concept_art-animals_03.jpg/1920px-Sprite_Fright-concept_art-animals_03.jpg",
+              backdrop: studioArt + "header/project/ff/3d/ff3d8a8048e767cbc92d6489404924b2.jpg",
               plot: "Une bande d’adolescents bruyants part faire la fête dans une forêt reculée d’Irlande du Nord. Ils y découvrent les « Sprites », d’adorables petites créatures champignons… qui ne tolèrent pas qu’on manque de respect à la nature. Une comédie horrifique dans l’esprit des années 80.",
               genres: ["Animation", "Horreur", "Comédie"], rating: 7.0, duration: 630,
               director: "Matthew Luhn, Hjalti Hjálmarsson", addedDaysAgo: 2),
         movie("spring", "Spring", year: 2019, quality: .sd,
               stream: "https://archive.org/download/spring_blenderopenmovie/Spring%20-%20Blender%20Open%20Movie%20-%20YouTube.mp4",
               container: "mp4", category: "anim",
-              poster: commons + "thumb/2/25/Spring2019AlphaPosterBlender.jpg/960px-Spring2019AlphaPosterBlender.jpg",
-              backdrop: commons + "thumb/3/30/Blender_Open_Movie_-_Spring_%282019%29.png/1280px-Blender_Open_Movie_-_Spring_%282019%29.png",
+              poster: studioArt + "thumbnail/b5/b9/b5b96c3ca39745d4bc46b62e72c51bf4_o_xs.webp",
+              backdrop: studioArt + "header/project/e5/0f/e50f13c31a485f3a05d4983f1b4ab7ee.png",
               plot: "Une jeune bergère et son chien affrontent d’anciens esprits de la forêt pour que le cycle de la vie puisse continuer. Un conte poétique et lumineux, inspiré par l’enfance du réalisateur dans les montagnes.",
               genres: ["Animation", "Fantastique"], rating: 7.4, duration: 464, director: "Andy Goralczyk", addedDaysAgo: 3),
         movie("agent-327", "Agent 327 : Opération Barbershop", year: 2017, quality: .fhd,
               stream: "https://archive.org/download/agent327operationbarbershop/agent327-1080.mp4", container: "mp4",
-              category: "comedy", poster: nil, backdrop: nil,
+              category: "comedy",
+              poster: studioArt + "thumbnail/00/006f7d937a3540fa9dc4d2be4b73b551/006f7d937a3540fa9dc4d2be4b73b551.png",
+              backdrop: studioArt + "header/blog/da/5e/da5eb81a801bb705301bf5e951dfb43e.jpg",
               plot: "Infiltré dans un salon de coiffure qui sert de façade à un réseau criminel, l’agent 327, le plus célèbre des espions néerlandais, affronte le redoutable Boris Kloris dans une bagarre aussi drôle que spectaculaire. D’après la bande dessinée de Martin Lodewijk.",
               genres: ["Animation", "Action", "Comédie"], rating: 7.4, duration: 232,
               director: "Colin Levy, Hjalti Hjálmarsson", addedDaysAgo: 4),
@@ -236,8 +238,8 @@ public enum DemoContent {
               cast: ["Halina Reijn", "Thom Hoffman"], director: "Colin Levy", addedDaysAgo: 7, tmdbID: 45745),
         movie("elephants-dream", "Elephants Dream", year: 2006, quality: .hd,
               stream: "https://download.blender.org/ED/elephantsdream-720-h264-st-aac.mov", container: "mov", category: "scifi",
-              poster: nil,
-              backdrop: commons + "thumb/e/e8/Elephants_Dream_s5_both.jpg/1280px-Elephants_Dream_s5_both.jpg",
+              poster: studioArt + "thumbnail/f6/d6/f6d66663d511c54caa25595e189768f77ebab3a9_o_xs.webp",
+              backdrop: studioArt + "header/project/8b/d7/8bd7d4c5b572890a86299ff40813a201.png",
               plot: "Dans un monde mécanique sans fin, le vieux Proog guide le jeune Emo à travers une machine labyrinthique dont lui seul semble comprendre les règles. Mais leurs visions du monde divergent… Le tout premier « open movie », réalisé avec Blender.",
               genres: ["Animation", "Science-fiction"], rating: 5.6, duration: 654,
               cast: ["Tygo Gernandt", "Cas Jansen"], director: "Bassam Kurdali", addedDaysAgo: 8, tmdbID: 9761),
@@ -258,12 +260,11 @@ public enum DemoContent {
         )
     }
 
-    private static let llamigosCover = commons + "thumb/a/aa/Blender_Foundation_-_Caminandes_-_Episode_3_-_Llamigos_-_Cover_thumbnail.png/1280px-Blender_Foundation_-_Caminandes_-_Episode_3_-_Llamigos_-_Cover_thumbnail.png"
-
     private static let series: [Series] = [
         Series(
             sourceID: sourceID, nativeID: "caminandes", title: "Caminandes", rawName: "Caminandes (2013) FHD", year: 2013,
-            posterURL: nil, backdropURL: url(llamigosCover),
+            posterURL: url(studioArt + "thumbnail/e5/83/e58372aa0af5e669325a4913a46b12561e7d60a8_o.webp"),
+            backdropURL: url(studioArt + "header/project/2f/89/2f897cfe4d6092c3ce77566de98019e1.jpg"),
             plot: "Dans les paysages arides de Patagonie, Koro, un lama têtu et toujours affamé, est prêt à tout pour atteindre l’herbe plus verte de l’autre côté de la route… ou de la clôture. Une série de courts métrages burlesques réalisés avec Blender.",
             genres: ["Animation", "Comédie", "Familial"], rating: 6.9, cast: [], director: "Pablo Vazquez",
             categoryID: categoryID(.series, "anim-series"), quality: .fhd,
@@ -278,14 +279,14 @@ public enum DemoContent {
                     episode("caminandes-s1e2", season: 1, number: 2, title: "Gran Dillama",
                             plot: "L’herbe est toujours plus verte de l’autre côté de la clôture électrique : Koro va l’apprendre à ses dépens.",
                             duration: 146, stream: "https://archive.org/download/Caminandes2GranDillama/02_gran_dillama_1080p.mp4",
-                            still: commons + "thumb/a/a8/Blender_Foundation_-_Caminandes_-_Episode_2_-_Gran_Dillama_-_Cover_thumbnail.png/1280px-Blender_Foundation_-_Caminandes_-_Episode_2_-_Gran_Dillama_-_Cover_thumbnail.png",
+                            still: studioArt + "thumbnail/80/4b/804beb324d82e98db44d8308d9e6f495_m.webp",
                             aired: "2013-11-22"),
                 ].compactMap { $0 }),
                 Season(number: 2, name: "Saison 2", episodes: [
                     episode("caminandes-s2e1", season: 2, number: 1, title: "Llamigos",
                             plot: "En plein hiver, Koro croise Oti, un manchot taquin, et doit lui disputer les dernières baies rouges de la montagne.",
                             duration: 150, stream: "https://archive.org/download/CaminandesLlamigos/Caminandes_%20Llamigos-1080p.mp4",
-                            still: llamigosCover, aired: "2016-09-30"),
+                            still: studioArt + "thumbnail/6e/84/6e84fd08dda59d66aeb2152cb879f160_m.webp", aired: "2016-09-30"),
                 ].compactMap { $0 }),
             ]
         ),

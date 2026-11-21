@@ -23,16 +23,15 @@ struct TitleDetailMasthead: View {
     @Environment(\.isPageActive) private var isPageActive
     @State private var drift = false
 
-    private let ink = Color(red: 0.045, green: 0.061, blue: 0.092)
-    private let edge = Color.white.opacity(0.16)
+    private let ink = Color(white: 0.045)
 
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let textWidth = min(450, size.width * 0.59)
+            let textWidth = min(430, size.width * 0.60)
             ZStack(alignment: .bottomLeading) {
                 artwork(size: size)
-                VStack(alignment: .leading, spacing: 13) {
+                VStack(alignment: .leading, spacing: 10) {
                     titleLine
                     if !facts.isEmpty {
                         Text(facts.joined(separator: "  ·  "))
@@ -42,8 +41,8 @@ struct TitleDetailMasthead: View {
                     }
                     if let plot {
                         ExpandableText(
-                            plot, lineLimit: 3, font: .system(size: 15), moreTitle: "LIRE LA SUITE",
-                            popoverTitle: "Synopsis", lineSpacing: 3
+                            plot, lineLimit: 2, font: .system(size: 14), moreTitle: "Plus",
+                            popoverTitle: "Synopsis", lineSpacing: 2
                         )
                         .foregroundStyle(.white.opacity(0.88))
                     }
@@ -51,17 +50,12 @@ struct TitleDetailMasthead: View {
                         .padding(.top, 5)
                 }
                 .frame(width: textWidth, alignment: .leading)
-                .padding(.leading, 28)
-                .padding(.bottom, 29)
+                .padding(.leading, 40)
+                .padding(.bottom, 38)
             }
         }
         .frame(height: height)
-        .clipShape(.rect(cornerRadius: 20))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20)
-                .strokeBorder(edge, lineWidth: 1)
-                .allowsHitTesting(false)
-        }
+        .clipShape(.rect(cornerRadius: 15))
         .task(id: isPageActive && !reduceMotion && backdrop != nil) {
             var transaction = Transaction()
             transaction.disablesAnimations = true
@@ -79,7 +73,7 @@ struct TitleDetailMasthead: View {
             TitleLogo(url: logo, fallbackTitle: title.title, maxSize: CGSize(width: 380, height: 100))
         } else {
             Text(title.title)
-                .font(.system(size: 56, weight: .heavy))
+                .font(.system(size: 53, weight: .bold))
                 .tracking(-1.8)
                 .foregroundStyle(.white)
                 .lineLimit(2)
@@ -94,33 +88,33 @@ struct TitleDetailMasthead: View {
             HStack(spacing: 10) {
                 playButton
                 watchlistButton
-                if let edition, editionCount > 1 { editionButton(edition) }
+                if edition != nil, editionCount > 1 { editionButton }
             }
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
                     playButton
                     watchlistButton
                 }
-                if let edition, editionCount > 1 { editionButton(edition) }
+                if edition != nil, editionCount > 1 { editionButton }
             }
         }
     }
 
     private var playButton: some View {
         PrimaryCapsuleButton(
-            playLabel, systemImage: "play.fill", progress: progress, height: 42, minWidth: 132, action: play
+            playLabel, systemImage: "play.fill", progress: progress, height: 39, minWidth: 118, action: play
         )
         .disabled(!canPlay)
     }
 
     private var watchlistButton: some View {
-        WatchlistButton(isAdded: isInWatchlist, size: 42, action: toggleWatchlist)
+        WatchlistButton(isAdded: isInWatchlist, size: 39, action: toggleWatchlist)
     }
 
-    private func editionButton(_ edition: TitleEdition) -> some View {
+    private var editionButton: some View {
         GlassCapsuleButton(
-            title: "Éditions (\(editionCount))",
-            tint: PrismTint(rawValue: edition.source.tint.rawValue)?.color,
+            title: "Sources et langues",
+            systemImage: "rectangle.on.rectangle",
             action: showEditions
         )
         .disabled(!canPlay)
@@ -131,15 +125,9 @@ struct TitleDetailMasthead: View {
         ZStack(alignment: .trailing) {
             ink
             if let backdrop {
-                let artSize = CGSize(width: size.width * 0.81, height: size.height)
+                let artSize = CGSize(width: size.width, height: size.height)
                 RemoteImage(url: backdrop, size: artSize, placeholderSeed: title.id.rawValue, showsPlaceholder: false)
                     .scaleEffect(drift ? 1.045 : 1, anchor: .trailing)
-                    .mask {
-                        LinearGradient(
-                            stops: [.init(color: .clear, location: 0), .init(color: .white, location: 0.38)],
-                            startPoint: .leading, endPoint: .trailing
-                        )
-                    }
             } else {
                 let artSize = CGSize(width: size.width * 0.72, height: size.height)
                 RemoteImage(
@@ -157,24 +145,22 @@ struct TitleDetailMasthead: View {
                     placeholderSeed: title.id.rawValue, placeholderTitle: title.title
                 )
                 .clipShape(.rect(cornerRadius: 10))
-                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(edge, lineWidth: 1) }
-                .rotationEffect(.degrees(5))
-                .shadow(color: .black.opacity(0.5), radius: 24, y: 12)
+                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.15), lineWidth: 1) }
                 .padding(.trailing, size.width * 0.105)
             }
 
             LinearGradient(
                 stops: [
-                    .init(color: ink, location: 0.13),
-                    .init(color: ink.opacity(0.84), location: 0.43),
-                    .init(color: ink.opacity(0), location: 0.75),
+                    .init(color: ink.opacity(0.92), location: 0),
+                    .init(color: ink.opacity(0.48), location: 0.34),
+                    .init(color: .clear, location: 0.73),
                 ],
                 startPoint: .leading, endPoint: .trailing
             )
             LinearGradient(
                 stops: [
-                    .init(color: .clear, location: 0.48),
-                    .init(color: ink.opacity(0.89), location: 1),
+                    .init(color: .clear, location: 0.44),
+                    .init(color: ink.opacity(0.78), location: 1),
                 ],
                 startPoint: .top, endPoint: .bottom
             )

@@ -101,9 +101,19 @@ public actor XtreamClient {
         } catch let error as CancellationError {
             throw error
         } catch let error as URLError {
-            if error.code == .cancelled { throw CancellationError() }
-            if error.code == .unsupportedURL || error.code == .badURL { throw XtreamError.invalidServer }
-            throw XtreamError.network(error.localizedDescription)
+            switch error.code {
+            case .cancelled:
+                throw CancellationError()
+            case .unsupportedURL, .badURL:
+                throw XtreamError.invalidServer
+            case .appTransportSecurityRequiresSecureConnection:
+                throw XtreamError.secureConnectionRequired
+            case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+                 .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid:
+                throw XtreamError.untrustedSecureConnection
+            default:
+                throw XtreamError.network(error.localizedDescription)
+            }
         } catch {
             throw XtreamError.network(error.localizedDescription)
         }

@@ -5,7 +5,6 @@ import PrismDesign
 
 struct LibraryShell: View {
     @Environment(AppModel.self) private var app
-    @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var navigation = NavigationModel()
@@ -13,25 +12,34 @@ struct LibraryShell: View {
     @State private var visibility = NavigationSplitViewVisibility.all
     @State private var isAddingSource = false
 
+    private var mountedSections: [SidebarItem] {
+        let selection = navigation.selection
+        return visited.contains(selection) ? visited : visited + [selection]
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $visibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 200, ideal: 228, max: 290)
         } detail: {
-            ZStack {
-                ForEach(visited, id: \.self) { section in
-                    if let sourceID = section.sourceID, app.source(sourceID) == nil {
-                        Color.clear
-                    } else {
-                        let active = section == navigation.selection
-                        PageStack(section: section) { root(for: section) }
-                            .opacity(active ? 1 : 0)
-                            .allowsHitTesting(active)
-                            .accessibilityHidden(!active)
-                            .environment(\.isPageActive, active)
-                            .zIndex(active ? 1 : 0)
+            GeometryReader { layout in
+                ZStack {
+                    ForEach(mountedSections, id: \.self) { section in
+                        if let sourceID = section.sourceID, app.source(sourceID) == nil {
+                            Color.clear
+                        } else {
+                            let active = section == navigation.selection
+                            PageStack(section: section) { root(for: section) }
+                                .opacity(active ? 1 : 0)
+                                .allowsHitTesting(active)
+                                .accessibilityHidden(!active)
+                                .environment(\.isPageActive, active)
+                                .zIndex(active ? 1 : 0)
+                        }
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .environment(\.prismShelfViewportWidth, layout.size.width)
             }
             .environment(navigation)
             .transaction { transaction in
@@ -44,6 +52,12 @@ struct LibraryShell: View {
                             .keyboardShortcut("[", modifiers: .command)
                             .help("Retour")
                     }
+                }
+                ToolbarSpacer(.flexible, placement: .automatic)
+                ToolbarItem(placement: .automatic) {
+                    Button("Ajouter une source IPTV", systemImage: "plus") { isAddingSource = true }
+                        .keyboardShortcut("n", modifiers: [.command, .shift])
+                        .help("Ajouter une source IPTV")
                 }
             }
         }
@@ -70,17 +84,17 @@ struct LibraryShell: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PrismLogoLockup(size: 23)
-                .padding(.horizontal, 17)
-                .padding(.top, 12)
-                .padding(.bottom, 14)
+            PrismLogoLockup(size: 20)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 9)
 
             List(selection: Binding<SidebarItem?>(
                 get: { navigation.selection },
                 set: { if let item = $0, item != navigation.selection { navigation.select(item) } }
             )) {
                 Section("Explorer") {
-                    row("Accueil", symbol: "sparkle.tv", item: .home)
+                    row("Accueil", symbol: "house", item: .home)
                     row("Rechercher", symbol: "magnifyingglass", item: .search)
                     row("TV en direct", symbol: "dot.radiowaves.left.and.right", item: .live)
                     row("Films", symbol: "film.stack", item: .movies)
@@ -94,9 +108,9 @@ struct LibraryShell: View {
                 Section("Sources") {
                     ForEach(app.sources) { source in
                         HStack(spacing: 9) {
-                            Circle()
-                                .fill((PrismTint(rawValue: source.tint.rawValue) ?? .blue).gradient)
-                                .frame(width: 10, height: 10)
+                            Image(systemName: source.id == DemoContent.sourceID ? "play.rectangle" : "rectangle.connected.to.line.below")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 17)
                                 .accessibilityHidden(true)
                             Text(source.name).lineLimit(1)
                             Spacer(minLength: 3)
@@ -120,12 +134,13 @@ struct LibraryShell: View {
                                 .disabled(!source.isEnabled || app.isImporting(source.id))
                         }
                     }
+                    Button("Ajouter une source…", systemImage: "plus.circle") { isAddingSource = true }
+                        .buttonStyle(.plain)
                 }
             }
             .listStyle(.sidebar)
 
             VStack(alignment: .leading, spacing: 11) {
-                Button("Ajouter une source…", systemImage: "plus.circle") { isAddingSource = true }
                 Button("Réglages", systemImage: "gearshape") { openSettings() }
             }
             .buttonStyle(.plain)
@@ -136,7 +151,15 @@ struct LibraryShell: View {
     }
 
     private func row(_ title: String, symbol: String, item: SidebarItem) -> some View {
-        Label(title, systemImage: symbol).tag(item)
+        Label {
+            Text(title)
+                .foregroundStyle(.primary)
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+        }
+        .labelStyle(.titleAndIcon)
+        .tag(item)
     }
 
     @ViewBuilder private func root(for section: SidebarItem) -> some View {

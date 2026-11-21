@@ -73,4 +73,117 @@ public struct XtreamCredentials: Sendable, Hashable {
               let server = normalizeServer(url.absoluteString) else { return nil }
         return XtreamCredentials(server: server, username: username, password: password)
     }
+
+    /// Parses explicit Xtream fields or an Xtream endpoint shared by a provider.
+    /// A valid result has one unambiguous server, username and password.
+    public static func fromProviderMessage(_ text: String) -> XtreamCredentials? {
+        guard text.utf8.count <= 16_384 else { return nil }
+        var servers: Set<URL> = []
+        var usernames: Set<String> = []
+        var passwords: Set<String> = []
+
+        func addURL(_ input: String, fromServerField: Bool) -> Bool {
+            guard !input.isEmpty, !input.contains(where: \.isWhitespace) else { return !fromServerField }
+            let address = if input.hasPrefix("//") { "http:\(input)" }
+            else if input.contains("://") { input }
+            else { "http://\(input)" }
+            guard let components = URLComponents(string: address) else { return !fromServerField }
+            let isEndpoint = components.percentEncodedPath.split(separator: "/").last.map {
+                ["get.php", "player_api.php", "panel_api.php", "xmltv.php"].contains($0.lowercased())
+            } ?? false
+            guard fromServerField || isEndpoint else { return true }
+            guard components.user == nil, components.password == nil,
+                  let server = normalizeServer(address) else { return false }
+            servers.insert(server)
+
+            if isEndpoint {
+                for item in components.queryItems ?? [] {
+                    let key = item.name.lowercased()
+                    guard key == "username" || key == "password" else { continue }
+                    guard let value = item.value, isProviderCredential(value) else { return false }
+                    if key == "username" { usernames.insert(value) }
+                    else { passwords.insert(value) }
+                }
+            }
+            return true
+        }
+
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if let delimiter = line.firstIndex(where: { $0 == ":" || $0 == "=" }),
+               let field = ProviderField(label: String(line[..<delimiter])) {
+                let label = line[..<delimiter].trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: "-•")))
+                var value = line[line.index(after: delimiter)...].trimmingCharacters(in: .whitespaces)
+                if label.hasPrefix("**"), !label.hasSuffix("**"), value.hasPrefix("**") {
+                    value = value.dropFirst(2).trimmingCharacters(in: .whitespaces)
+                }
+                switch field {
+                case .server:
+                    if let opener = value.first, let closer = providerURLClosers[opener],
+                       opener != "[", value.last == closer, value.count >= 2 {
+                        value = String(value.dropFirst().dropLast())
+                    }
+                    guard addURL(value, fromServerField: true) else { return nil }
+                case .username:
+                    guard isProviderCredential(value) else { return nil }
+                    usernames.insert(value)
+                case .password:
+                    guard isProviderCredential(value) else { return nil }
+                    passwords.insert(value)
+                }
+            } else {
+                let wholeLine = NSRange(line.startIndex..<line.endIndex, in: line)
+                for match in providerURLPattern?.matches(in: line, range: wholeLine) ?? [] {
+                    guard let range = Range(match.range, in: line) else { continue }
+                    var candidate = line[range]
+                    if range.lowerBound > line.startIndex {
+                        let opener = line[line.index(before: range.lowerBound)]
+                        if let closer = providerURLClosers[opener], let end = candidate.lastIndex(of: closer),
+                           candidate[candidate.index(after: end)...].allSatisfy({ ".,;:!?".contains($0) }) {
+                            candidate = candidate[..<end]
+                        }
+                    }
+                    guard addURL(String(candidate), fromServerField: false) else { return nil }
+                }
+            }
+        }
+
+        guard servers.count == 1, usernames.count == 1, passwords.count == 1,
+              let server = servers.first, let username = usernames.first, let password = passwords.first else { return nil }
+        return XtreamCredentials(server: server, username: username, password: password)
+    }
+
+    private static let providerURLPattern = try? NSRegularExpression(
+        pattern: #"https?://[^\s<>"`]+"#, options: .caseInsensitive
+    )
+    private static let providerURLClosers: [Character: Character] = [
+        "(": ")", "[": "]", "{": "}", "<": ">", "'": "'", "\"": "\"", "`": "`"
+    ]
+
+    private static func isProviderCredential(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespaces).isEmpty &&
+            !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
+    private enum ProviderField {
+        case server, username, password
+
+        init?(label: String) {
+            let decoration = CharacterSet.whitespaces.union(CharacterSet(charactersIn: "-*•"))
+            let name = label.trimmingCharacters(in: decoration)
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "fr"))
+                .replacingOccurrences(of: "’", with: "'")
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            switch name {
+            case "serveur", "server", "url", "host", "hote", "adresse du serveur", "url du serveur", "server url":
+                self = .server
+            case "identifiant", "username", "nom d'utilisateur", "utilisateur", "user name":
+                self = .username
+            case "mot de passe", "password":
+                self = .password
+            default:
+                return nil
+            }
+        }
+    }
 }

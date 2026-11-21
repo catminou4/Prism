@@ -632,7 +632,9 @@ public final class PlayerController {
         reportProgress(force: true)
         seekTask?.cancel()
         seekTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
             await engine.seek(to: target)
+            guard !Task.isCancelled else { return }
             self?.seekTask = nil
         }
     }

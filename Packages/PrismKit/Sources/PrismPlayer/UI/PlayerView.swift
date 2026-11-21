@@ -188,7 +188,8 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
     }
 
     private var controlsLayer: some View {
-        VStack(spacing: 0) {
+        let showsTransport = !controller.isLoading && failureMessage == nil
+        return VStack(spacing: 0) {
             topBar
             Spacer(minLength: 12)
             bottomBlock
@@ -198,11 +199,27 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
         .padding(.bottom, PlayerMetrics.bottomMargin)
         .overlay {
             centerCluster
-                .opacity(controller.isLoading || failureMessage != nil ? 0 : 1)
-                .animation(fade, value: controller.isLoading)
+                .opacity(showsTransport ? 1 : 0)
+                .allowsHitTesting(showsTransport)
+                .accessibilityHidden(!showsTransport)
+                .animation(fade, value: showsTransport)
+        }
+        .background {
+            LinearGradient(
+                stops: [
+                    .init(color: .black.opacity(0.58), location: 0),
+                    .init(color: .clear, location: 0.22),
+                    .init(color: .clear, location: 0.62),
+                    .init(color: .black.opacity(0.82), location: 1),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
         .opacity(controller.controlsVisible ? 1 : 0)
         .allowsHitTesting(controller.controlsVisible)
+        .accessibilityHidden(!controller.controlsVisible)
         .animation(fade, value: controller.controlsVisible)
     }
 
@@ -216,10 +233,10 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 .onHover { controller.setHoveringControls($0) }
         }
         .overlay(alignment: .top) {
-            if let secondary = controller.secondaryTitle, !secondary.isEmpty {
+            if controller.isLive, let secondary = controller.secondaryTitle, !secondary.isEmpty {
                 Text(secondary)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
+                    .foregroundStyle(.white.opacity(0.82))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(height: PlayerMetrics.capsuleHeight)
@@ -271,9 +288,9 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 controller.togglePlayPause()
             } label: {
                 Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: PlayerMetrics.playSymbolSize, weight: .semibold))
+                    .font(.system(size: PlayerMetrics.playSymbolSize, weight: .medium))
                     .contentTransition(.symbolEffect(.replace))
-                    .offset(x: controller.isPlaying ? 0 : 3)
+                    .offset(x: controller.isPlaying ? 0 : 1.5)
             }
             .buttonStyle(PlayerTransportButtonStyle(diameter: PlayerMetrics.playDiameter, prominent: true))
             .help(controller.isPlaying ? "Pause (espace)" : "Lecture (espace)")
@@ -282,8 +299,6 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 skipButton(10)
             }
         }
-        .padding(7)
-        .playerGlass(RoundedRectangle(cornerRadius: 28))
         .onHover { controller.setHoveringControls($0) }
     }
 
@@ -333,10 +348,10 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 .font(.system(size: PlayerMetrics.titleSize, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
-            if controller.liveProgramme != nil, let subtitle = controller.item.subtitle, !subtitle.isEmpty {
+            if !controller.isLive, let subtitle = controller.item.subtitle, !subtitle.isEmpty {
                 Text(subtitle)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(.white.opacity(0.82))
                     .lineLimit(1)
             }
         }
@@ -382,7 +397,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 case .volume, .message:
                     PlayerHUD(kind: feedback.kind)
                         .fixedSize()
-                        .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.92)))
                 case .skip:
                     EmptyView()
                 }
@@ -399,7 +414,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 message: failureMessage, sourceOptions: sourceOptions,
                 onRetry: { controller.retry() }, onClose: onClose
             )
-            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.96)))
         }
     }
 

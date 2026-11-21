@@ -108,7 +108,7 @@ struct AddSourceView: View {
                 ForEach(SourceKind.allCases, id: \.self) { option in
                     Button {
                         changeStep { kind = option }
-                        focus = .name
+                        focus = option == .m3uFile ? .name : .address
                     } label: {
                         HStack(spacing: 13) {
                             Image(systemName: option.setupIcon)
@@ -140,10 +140,6 @@ struct AddSourceView: View {
     private func sourceForm(_ kind: SourceKind) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 13) {
-                formField("Nom de la source") {
-                    TextField("Ma source", text: $name)
-                        .focused($focus, equals: .name)
-                }
                 if kind == .m3uFile {
                     HStack(spacing: 10) {
                         Button("Choisir le fichier…", systemImage: "folder") { showsFileImporter = true }
@@ -174,6 +170,20 @@ struct AddSourceView: View {
                         }
                     }
                     if showsValidation, trimmed(username).isEmpty || password.isEmpty { validationText("Indiquez vos identifiants Xtream.") }
+                    HStack(spacing: 10) {
+                        PasteButton(payloadType: String.self) { values in
+                            guard let message = values.first else { return }
+                            fillXtreamFields(from: message)
+                        }
+                        .accessibilityLabel("Coller les codes Xtream")
+                        Text("Depuis un lien ou un message de votre fournisseur")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                formField("Nom de la source · facultatif") {
+                    TextField("Ma source", text: $name)
+                        .focused($focus, equals: .name)
                 }
                 DisclosureGroup("Options avancées", isExpanded: $advanced) {
                     VStack(alignment: .leading, spacing: 13) {
@@ -281,6 +291,8 @@ struct AddSourceView: View {
                         showsValidation = false
                         error = nil
                         address = ""
+                        username = ""
+                        password = ""
                     }
                 }
                 .keyboardShortcut(.cancelAction)
@@ -305,10 +317,28 @@ struct AddSourceView: View {
 
     private var validUserAgent: Bool { !trimmed(userAgent).contains(where: \.isNewline) }
 
+    private func fillXtreamFields(from message: String) {
+        guard let credentials = XtreamCredentials.fromProviderMessage(message) else {
+            error = "Codes introuvables. Collez le lien Xtream complet ou renseignez les trois champs."
+            return
+        }
+        address = credentials.server.absoluteString
+        username = credentials.username
+        password = credentials.password
+        error = nil
+        focus = nil
+    }
+
     private func startSelectedImport() {
         guard let kind, importTask == nil else { return }
         error = nil
         showsValidation = true
+        if kind == .xtream, trimmed(username).isEmpty, password.isEmpty,
+           let credentials = XtreamCredentials.fromProviderMessage(address) {
+            address = credentials.server.absoluteString
+            username = credentials.username
+            password = credentials.password
+        }
         if !trimmed(guideAddress).isEmpty, remoteURL(guideAddress) == nil {
             advanced = true
             focus = .guide

@@ -4,8 +4,8 @@ import SwiftUI
 /// Reads the 4 Hz time updates itself so the rest of the overlay does not re-render.
 struct PlayerScrubber: View {
     let controller: PlayerController
-
-    @State private var dragFraction: Double?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @GestureState private var dragFraction: Double?
     @State private var hoverFraction: Double?
 
     private var isLive: Bool { controller.isLive }
@@ -24,6 +24,10 @@ struct PlayerScrubber: View {
         .frame(height: PlayerMetrics.scrubberHeight)
         .frame(maxWidth: .infinity)
         .playerGlass(Capsule())
+        .onChange(of: dragFraction != nil) { _, dragging in controller.setScrubbing(dragging) }
+        .onDisappear {
+            if controller.isScrubbing { controller.setScrubbing(false) }
+        }
     }
 
     // MARK: Labels
@@ -69,7 +73,7 @@ struct PlayerScrubber: View {
         Text(text)
             .font(.system(size: PlayerMetrics.timeFontSize, weight: .semibold))
             .monospacedDigit()
-            .foregroundStyle(.white.opacity(0.36))
+            .foregroundStyle(.white.opacity(0.78))
             .lineLimit(1)
             .fixedSize()
     }
@@ -130,6 +134,17 @@ struct PlayerScrubber: View {
             .gesture(seekable ? dragGesture(width: width) : nil)
         }
         .frame(height: 20)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Position de lecture")
+        .accessibilityValue(PlayerFormat.timecode(displayedTime, forceHours: forceHours))
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: controller.skip(by: 10)
+            case .decrement: controller.skip(by: -10)
+            @unknown default: break
+            }
+        }
+        .accessibilityHidden(!seekable)
     }
 
     private func bars(width: CGFloat, played: Double, buffered: Double) -> some View {
@@ -150,8 +165,8 @@ struct PlayerScrubber: View {
             .fill(Color(white: 0.87))
             .frame(width: PlayerMetrics.knobSize.width, height: PlayerMetrics.knobSize.height)
             .shadow(color: .black.opacity(0.3), radius: 4, y: 1)
-            .scaleEffect(dragFraction == nil ? 1 : 1.12)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: dragFraction == nil)
+            .scaleEffect(dragFraction == nil || reduceMotion ? 1 : 1.12)
+            .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8), value: dragFraction == nil)
     }
 
     private func tooltip(_ text: String) -> some View {
@@ -165,15 +180,12 @@ struct PlayerScrubber: View {
 
     private func dragGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
-            .onChanged { value in
-                if dragFraction == nil { controller.setScrubbing(true) }
-                dragFraction = min(1, max(0, value.location.x / width))
+            .updating($dragFraction) { value, fraction, _ in
+                fraction = min(1, max(0, value.location.x / width))
             }
             .onEnded { value in
                 let fraction = min(1, max(0, value.location.x / width))
                 controller.seek(to: time(at: fraction))
-                dragFraction = nil
-                controller.setScrubbing(false)
             }
     }
 }

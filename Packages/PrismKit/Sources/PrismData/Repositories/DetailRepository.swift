@@ -71,6 +71,15 @@ public actor DetailRepository {
         }
     }
 
+    /// Reads the inventory already used by the detail screen or the edition picker.
+    /// Opening the player does not start a separate provider request.
+    public func cachedSeriesDetail(_ value: Series, source: Source) async -> SeriesDetail? {
+        guard source.kind == .xtream, !DemoContent.isDemo(source) else { return Self.localDetail(value) }
+        if let cached = series[value.id] { return cached }
+        if let running = seriesTasks[value.id], let detail = try? await running.value { return detail }
+        return read("series", value.id, allowStale: true)
+    }
+
     /// Empties the memory cache (disk entries expire on their own).
     public func clearMemory() {
         movies.removeAll()

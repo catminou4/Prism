@@ -19,8 +19,10 @@ public struct PlaybackProgress: Codable, Sendable, Hashable, Identifiable {
     }
 
     public var fraction: Double { duration > 0 ? min(max(position / duration, 0), 1) : 0 }
-    /// Considered watched past 95 % or within the last 2 minutes.
-    public var isFinished: Bool { duration > 0 && (fraction >= 0.95 || duration - position < 120) }
+    /// Short episodes must reach 95 %. Longer programmes allow two minutes for the credits.
+    public var isFinished: Bool {
+        duration > 0 && (fraction >= 0.95 || (duration >= 20 * 60 && remaining < 120))
+    }
     public var remaining: TimeInterval { max(duration - position, 0) }
 }
 

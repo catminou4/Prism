@@ -7,6 +7,8 @@ public enum XtreamError: Error, LocalizedError, Equatable {
     case accountDisabled(String)
     case http(Int)
     case decoding(String)
+    case secureConnectionRequired
+    case untrustedSecureConnection
     case network(String)
 
     public var errorDescription: String? {
@@ -27,6 +29,10 @@ public enum XtreamError: Error, LocalizedError, Equatable {
             "Le serveur a répondu avec une erreur (HTTP \(code))."
         case .decoding:
             "Réponse du serveur illisible."
+        case .secureConnectionRequired:
+            "macOS exige une connexion HTTPS à ce serveur."
+        case .untrustedSecureConnection:
+            "La connexion HTTPS du serveur n’a pas pu être vérifiée."
         case .network(let message):
             "Connexion au serveur impossible : \(message)"
         }
@@ -44,6 +50,8 @@ public enum XtreamError: Error, LocalizedError, Equatable {
         case .invalidServer: "Vérifiez l’adresse (ex. http://exemple.com:8080)."
         case .unauthorized: "Vérifiez le nom d’utilisateur et le mot de passe."
         case .accountExpired: "Renouvelez votre abonnement auprès de votre fournisseur."
+        case .secureConnectionRequired, .untrustedSecureConnection:
+            "Demandez à votre fournisseur une adresse HTTPS valide."
         case .network: "Vérifiez votre connexion Internet ou réessayez plus tard."
         default: nil
         }

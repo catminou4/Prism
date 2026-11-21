@@ -7,30 +7,41 @@ struct BrowseScreen: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
     @Environment(\.isPageActive) private var isActive
+    @Environment(\.displayScale) private var scale
+    @State private var selectedHero: Int? = 0
     let kind: MediaKind?
 
     private var hero: [MediaTitle] {
         let curated = app.recommendations.highlights.filter { kind == nil || $0.kind == kind }
-        let featured = app.catalog.featured(limit: 16).filter { kind == nil || $0.kind == kind }
-        return Array((curated.isEmpty ? featured : curated).prefix(5))
+        if !curated.isEmpty { return Array(curated.prefix(5)) }
+        return Array(app.catalog.featured(limit: 16).lazy.filter { kind == nil || $0.kind == kind }.prefix(5))
     }
 
     var body: some View {
         GeometryReader { geometry in
+            let featured = hero
+            let spotlightHeight = max(322, min(500, geometry.size.height * 0.55))
+            let artworkSize = CGSize(width: max(1, geometry.size.width - 16), height: spotlightHeight)
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 30) {
-                    if !hero.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 26) {
+                    if !featured.isEmpty {
                         HeroCarousel(
-                            items: hero,
+                            items: featured,
                             interval: isActive ? 9 : 0,
-                            height: max(330, min(520, geometry.size.height * 0.56))
+                            height: spotlightHeight,
+                            index: $selectedHero
                         ) { title in
-                            Spotlight(title: title)
+                            Spotlight(title: title, size: artworkSize)
                         }
-                        .clipShape(.rect(cornerRadius: 25))
-                        .padding(.horizontal, 28)
+                        .clipShape(.rect(cornerRadius: 15))
+                        .padding(.horizontal, 8)
+                        .task(id: nextArtwork(in: featured, size: artworkSize)) {
+                            guard isActive, let next = nextArtwork(in: featured, size: artworkSize) else { return }
+                            _ = await ImagePipeline.shared.image(for: next.url, pixelSize: next.size, fitting: .fill)
+                        }
                     } else {
                         BrowseHeading(title: kind.map(\.sectionTitle) ?? "Accueil")
+                            .padding(.top, 20)
                     }
 
                     if kind == nil {
@@ -41,29 +52,6 @@ struct BrowseScreen: View {
                             }) { item in
                                 ResumeCard(item: item)
                             }
-                        }
-                        if !app.catalog.channels.isEmpty {
-                            Button {
-                                navigation.select(.live)
-                            } label: {
-                                HStack(spacing: 14) {
-                                    Image(systemName: "dot.radiowaves.left.and.right")
-                                        .font(.title2)
-                                        .foregroundStyle(.tint)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text("TV en direct").font(.headline)
-                                        Text("\(app.catalog.channels.count.formatted()) chaînes")
-                                            .font(.subheadline)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                                }
-                                .padding(17)
-                                .background(.fill.tertiary, in: .rect(cornerRadius: 14))
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.horizontal, PrismMetrics.contentMargin)
                         }
                     }
 
@@ -97,20 +85,40 @@ struct BrowseScreen: View {
                             navigation.push(.collection(.recentlyAdded(.series)))
                         })
                     }
+                    if kind == nil, !app.catalog.channels.isEmpty {
+                        Button("Voir les chaînes en direct", systemImage: "dot.radiowaves.left.and.right") {
+                            navigation.select(.live)
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.horizontal, PrismMetrics.contentMargin)
+                    }
                     if app.catalog.isEmpty {
                         ContentUnavailableView("Catalogue vide", systemImage: "rectangle.stack",
                                                description: Text("Ajoutez ou actualisez une source pour retrouver vos programmes."))
                     }
                 }
-                .padding(.top, 14)
+                .padding(.top, featured.isEmpty ? 0 : 8)
                 .padding(.bottom, 48)
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .ignoresSafeArea(.container, edges: featured.isEmpty ? [] : .top)
         }
     }
 
     private func editorialShelf(_ title: String, subtitle: String? = nil, titles: [MediaTitle]) -> some View {
         TitleShelf(title: title, subtitle: subtitle, items: titles.filter { kind == nil || $0.kind == kind })
+    }
+
+    private struct Preload: Equatable {
+        let url: URL
+        let size: CGSize
+    }
+
+    private func nextArtwork(in titles: [MediaTitle], size: CGSize) -> Preload? {
+        guard isActive, titles.count > 1 else { return nil }
+        let next = titles[(min(selectedHero ?? 0, titles.count - 1) + 1) % titles.count]
+        guard let url = next.backdropURL else { return nil }
+        return Preload(url: url, size: RemoteImage.pixelSize(forPointSize: size, scale: scale))
     }
 }
 
@@ -119,25 +127,16 @@ private struct Spotlight: View {
     @Environment(NavigationModel.self) private var navigation
     @Environment(\.isPageActive) private var isActive
     let title: MediaTitle
+    let size: CGSize
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             HeroBackdrop(imageURL: title.backdropURL, seed: title.title, fallbackPosterURL: title.posterURL,
-                         leadingScrim: 0.92, animates: isActive)
-            LinearGradient(colors: [Color(red: 0.075, green: 0.07, blue: 0.18).opacity(0.91), .clear],
-                           startPoint: .bottomLeading, endPoint: .topTrailing)
-                .allowsHitTesting(false)
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    PrismLogoMark(size: 19)
-                        .accessibilityHidden(true)
-                    Text("À l’affiche")
-                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.84))
-                }
+                         leadingScrim: 0.83, animates: isActive, artSize: size)
+            VStack(alignment: .leading, spacing: 10) {
                 Text(title.title)
-                    .font(.system(size: 56, weight: .bold, design: .rounded))
-                    .tracking(-2)
+                    .font(.system(size: 52, weight: .bold))
+                    .tracking(-1.8)
                     .lineLimit(2)
                     .minimumScaleFactor(0.58)
                     .accessibilityAddTraits(.isHeader)
@@ -147,42 +146,21 @@ private struct Spotlight: View {
                 if let plot = title.plot, !plot.isEmpty {
                     Text(plot).font(.callout).foregroundStyle(.white.opacity(0.86)).lineLimit(2)
                 }
-                HStack(spacing: 12) {
-                    Button {
+                HStack(spacing: 9) {
+                    PrimaryCapsuleButton("Voir la fiche", systemImage: "info.circle", height: 37) {
                         navigation.push(.title(title.id))
-                    } label: {
-                        Label("Voir la fiche", systemImage: "arrow.right")
-                            .font(.callout.weight(.semibold))
-                            .padding(.horizontal, 17)
-                            .frame(height: 38)
-                            .foregroundStyle(.black)
-                            .background(.white, in: Capsule())
                     }
-                    .buttonStyle(.plain)
-                    Button {
+                    WatchlistButton(isAdded: app.library.isInWatchlist(title.id), size: 37) {
                         app.library.toggleWatchlist(title.id)
-                    } label: {
-                        Image(systemName: app.library.isInWatchlist(title.id) ? "checkmark" : "plus")
-                            .font(.callout.weight(.semibold))
-                            .frame(width: 38, height: 38)
-                            .contentTransition(.symbolEffect(.replace))
-                            .prismGlass(.dark, in: .circle, interactive: true)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(app.library.isInWatchlist(title.id) ? "Retirer de Ma liste" : "Ajouter à Ma liste")
                 }
                 .padding(.top, 4)
             }
-            .frame(maxWidth: 480, alignment: .leading)
+            .frame(maxWidth: 420, alignment: .leading)
             .foregroundStyle(.white)
-            .padding(.leading, 46)
+            .padding(.leading, 40)
             .padding(.trailing, 24)
-            .padding(.bottom, 56)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 25)
-                .strokeBorder(.white.opacity(0.14), lineWidth: 1)
-                .allowsHitTesting(false)
+            .padding(.bottom, 48)
         }
     }
 }
@@ -194,7 +172,7 @@ struct BrowseHeading: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
-                .font(.system(size: 37, weight: .bold, design: .rounded))
+                .font(.system(size: 36, weight: .bold))
                 .tracking(-1)
                 .accessibilityAddTraits(.isHeader)
             if let subtitle {
@@ -239,19 +217,37 @@ struct BrowsePoster: View {
 }
 
 struct ResumeCard: View {
+    @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
+    @Environment(\.playPrismItem) private var playItem
     let item: ContinueWatchingItem
 
     var body: some View {
         WideCard(imageURL: item.episode?.stillURL ?? item.title.backdropURL ?? item.title.posterURL,
                  caption: item.title.title, metadata: metadata, progress: item.progress?.fraction,
-                 action: { navigation.push(.title(item.title.id)) })
+                 action: resume) {
+            Button("Voir la fiche") { navigation.push(.title(item.title.id)) }
+        }
     }
 
     private var metadata: String {
         let episode = item.episode.map { "S\($0.season) · É\($0.number)" }
-        let remainder = item.progress.map { "\(max(1, Int($0.remaining / 60))) min restantes" }
+        let remainder = item.progress.map { "\(max(1, Int($0.remaining / 60))) min" }
         return [episode, remainder].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func resume() {
+        let editionID = item.episode?.seriesID ?? item.contentID
+        guard let variant = item.title.variants.first(where: { $0.id == editionID }),
+              let source = app.source(variant.sourceID), source.isEnabled,
+              let option = TitlePlaybackOption(edition: TitleEdition(variant: variant, source: source), episode: item.episode)
+        else {
+            navigation.push(.title(item.title.id))
+            return
+        }
+        let position = option.resumePosition(exact: item.progress, equivalent: nil)
+        playItem(option.playbackItem(for: item.title, position: position), .title(item.title.id), option.contentID,
+                 seriesEditionID: item.episode?.seriesID)
     }
 }
 

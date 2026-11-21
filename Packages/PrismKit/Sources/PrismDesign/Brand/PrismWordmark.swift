@@ -29,7 +29,7 @@ public struct PrismLogoLockup: View {
     private let wordmarkColor: Color
 
     /// - Parameter size: Wordmark point size; the mark scales with it.
-    public init(size: CGFloat = 34, axis: Axis = .horizontal, style: PrismLogoMark.Style = .spectral, wordmarkColor: Color = .primary) {
+    public init(size: CGFloat = 34, axis: Axis = .horizontal, style: PrismLogoMark.Style = .adaptive, wordmarkColor: Color = .primary) {
         self.size = size
         self.axis = axis
         self.style = style

@@ -1,10 +1,9 @@
 import CoreGraphics
 import SwiftUI
 
-/// Deterministic, Apple-like dark artwork used while an image loads or when none exists.
+/// Deterministic neutral artwork used while an image loads or when none is available.
 ///
-/// The palette, gradient angle and glow position derive from a stable hash of `seed`, so the
-/// same title always gets the same placeholder (across launches and machines).
+/// Tonal differences help distinguish titles without competing with poster art.
 public struct PlaceholderArtwork: View {
     public enum TitleStyle: Sendable {
         /// Centred title in bold type (posters, tiles).
@@ -46,11 +45,7 @@ public struct PlaceholderArtwork: View {
     private var artworkBody: some View {
         ZStack {
             LinearGradient(colors: [palette.top, palette.bottom], startPoint: palette.start, endPoint: palette.end)
-            RadialGradient(colors: [palette.glow.opacity(0.42), palette.glow.opacity(0)], center: palette.glowCenter, startRadius: 0, endRadius: 240)
-            RadialGradient(colors: [.clear, .black.opacity(0.38)], center: .center, startRadius: 40, endRadius: 320)
-            NoiseTexture.image
-                .resizable(resizingMode: .tile)
-                .opacity(0.06)
+            RadialGradient(colors: [.white.opacity(0.10), .clear], center: palette.glowCenter, startRadius: 0, endRadius: 225)
             label
         }
         .accessibilityHidden(true)
@@ -84,36 +79,17 @@ public struct PlaceholderArtwork: View {
         }
     }
 
-    /// Curated dark palettes (top, bottom, glow).
     struct Palette {
         let top: Color
         let bottom: Color
-        let glow: Color
         let start: UnitPoint
         let end: UnitPoint
         let glowCenter: UnitPoint
 
-        static let swatches: [(Double, Double, Double, Double, Double, Double, Double, Double, Double)] = [
-            (0.15, 0.19, 0.32, 0.04, 0.05, 0.10, 0.36, 0.46, 0.78), // indigo night
-            (0.27, 0.13, 0.25, 0.07, 0.03, 0.08, 0.66, 0.32, 0.54), // plum
-            (0.31, 0.10, 0.12, 0.08, 0.02, 0.04, 0.78, 0.34, 0.28), // burgundy
-            (0.08, 0.22, 0.25, 0.02, 0.06, 0.08, 0.24, 0.60, 0.62), // deep teal
-            (0.12, 0.21, 0.15, 0.03, 0.06, 0.04, 0.40, 0.60, 0.40), // forest
-            (0.21, 0.23, 0.28, 0.05, 0.06, 0.08, 0.55, 0.60, 0.70), // slate
-            (0.31, 0.20, 0.10, 0.08, 0.05, 0.03, 0.80, 0.56, 0.30), // amber
-            (0.19, 0.14, 0.33, 0.05, 0.03, 0.10, 0.52, 0.42, 0.84), // violet
-            (0.09, 0.16, 0.28, 0.02, 0.04, 0.08, 0.30, 0.52, 0.80), // ocean
-            (0.30, 0.15, 0.18, 0.07, 0.04, 0.06, 0.78, 0.46, 0.52), // rose
-            (0.24, 0.23, 0.14, 0.06, 0.06, 0.03, 0.70, 0.66, 0.40), // olive gold
-            (0.17, 0.18, 0.20, 0.04, 0.04, 0.05, 0.50, 0.52, 0.56), // graphite
-        ]
-
         init(seed: String) {
             var rng = StableHash.Generator(seed: seed)
-            let swatch = Self.swatches[Int(rng.next() % UInt64(Self.swatches.count))]
-            top = Color(.sRGB, red: swatch.0, green: swatch.1, blue: swatch.2)
-            bottom = Color(.sRGB, red: swatch.3, green: swatch.4, blue: swatch.5)
-            glow = Color(.sRGB, red: swatch.6, green: swatch.7, blue: swatch.8)
+            top = Color(white: 0.12 + rng.unit() * 0.19)
+            bottom = Color(white: 0.045 + rng.unit() * 0.045)
             let angle = rng.unit() * .pi * 0.5 - .pi * 0.25 // −45°…45° around vertical
             start = UnitPoint(x: 0.5 - sin(angle) * 0.5, y: 0)
             end = UnitPoint(x: 0.5 + sin(angle) * 0.5, y: 1)

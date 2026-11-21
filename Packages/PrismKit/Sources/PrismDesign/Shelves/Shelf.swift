@@ -29,10 +29,13 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     private let card: (Item) -> Card
 
     @State private var position = ScrollPosition(edge: .leading)
-    @State private var edges = ScrollEdges()
-    @State private var visibleWidth: CGFloat = 0
+    @State private var viewport = ShelfViewport()
+    @State private var scrollAvailability = ScrollAvailability()
+    @State private var measuredWidth: CGFloat = 0
     @State private var hovering = false
+    @Environment(\.prismShelfViewportWidth) private var layoutWidth
     @Environment(\.prismSnapshotHover) private var forcedHover
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isHovered: Bool { hovering || forcedHover }
 
@@ -62,7 +65,8 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     private var itemWidth: CGFloat {
         switch sizing {
         case .fixed(let width): width
-        case .columns(let minWidth): PrismMetrics.columnWidth(available: visibleWidth - margin * 2, minWidth: minWidth, spacing: spacing)
+        case .columns(let minWidth):
+            PrismMetrics.columnWidth(available: (layoutWidth ?? measuredWidth) - margin * 2, minWidth: minWidth, spacing: spacing)
         }
     }
 
@@ -99,20 +103,21 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
-            edges = newValue
+            viewport.edges = newValue
+            let availability = newValue.availability
+            if scrollAvailability != availability { scrollAvailability = availability }
+            if layoutWidth == nil, measuredWidth != newValue.width { measuredWidth = newValue.width }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0 }
         .padding(.top, -Self.liftInset.top)
         .padding(.bottom, -Self.liftInset.bottom)
-        .prismCardWidth(visibleWidth > 0 || sizing.isFixed ? itemWidth : nil)
+        .prismCardWidth(itemWidth)
         .overlay(alignment: .leading) { chevron(.leading) }
         .overlay(alignment: .trailing) { chevron(.trailing) }
         .onHover { inside in withAnimation(PrismMotion.quickFade) { hovering = inside } }
-        .opacity(visibleWidth > 0 || sizing.isFixed ? 1 : 0)
     }
 
     @ViewBuilder private func chevron(_ edge: HorizontalEdge) -> some View {
-        let canScroll = edge == .leading ? edges.canScrollBackward : edges.canScrollForward
+        let canScroll = edge == .leading ? scrollAvailability.backward : scrollAvailability.forward
         GlassCircleButton(
             systemName: edge == .leading ? "chevron.left" : "chevron.right",
             size: PrismMetrics.shelfChevronSize,
@@ -127,38 +132,48 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     private func page(_ edge: HorizontalEdge) {
-        let page = max(visibleWidth - margin * 2 + spacing, 100)
+        let edges = viewport.edges
+        let page = max(edges.width - margin * 2 + spacing, 100)
         let target = edge == .leading ? max(edges.offset - page, edges.minOffset) : min(edges.offset + page, edges.maxOffset)
-        withAnimation(PrismMotion.standard) {
+        withAnimation(reduceMotion ? nil : PrismMotion.standard) {
             position.scrollTo(x: target)
         }
     }
 }
 
-extension ShelfSizing {
-    var isFixed: Bool {
-        if case .fixed = self { return true }
-        return false
-    }
+extension EnvironmentValues {
+    /// The proposed width for full-width shelves in the library's content column.
+    @Entry public var prismShelfViewportWidth: CGFloat? = nil
 }
 
-struct ScrollEdges: Equatable {
+/// Paging uses the exact current offset. The scroll view only observes changes in edge availability.
+private final class ShelfViewport {
+    var edges = ScrollEdges()
+}
+
+private struct ScrollAvailability: Equatable {
+    var backward = false
+    var forward = false
+}
+
+private struct ScrollEdges: Equatable {
     var offset: CGFloat = 0
     var minOffset: CGFloat = 0
     var maxOffset: CGFloat = 0
+    var width: CGFloat = 0
 
     init() {}
 
     init(geometry: ScrollGeometry) {
         offset = geometry.contentOffset.x
+        width = geometry.containerSize.width
         minOffset = -geometry.contentInsets.leading
-        maxOffset = max(minOffset, geometry.contentSize.width + geometry.contentInsets.trailing - geometry.containerSize.width)
-        // Quantise so tiny scroll deltas don't invalidate the shelf.
-        offset = offset.rounded()
+        maxOffset = max(minOffset, geometry.contentSize.width + geometry.contentInsets.trailing - width)
     }
 
-    var canScrollBackward: Bool { offset > minOffset + 1 }
-    var canScrollForward: Bool { offset < maxOffset - 1 }
+    var availability: ScrollAvailability {
+        ScrollAvailability(backward: offset > minOffset + 1, forward: offset < maxOffset - 1)
+    }
 }
 
 #Preview("Shelf") {

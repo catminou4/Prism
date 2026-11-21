@@ -38,6 +38,58 @@ struct XtreamURLTests {
         #expect(XtreamCredentials.fromM3UURL(URL(string: "http://h.example.com/get.php?username=a")!) == nil)
     }
 
+    @Test func providerMessageWithFrenchLabels() throws {
+        let message = """
+        Vos accès IPTV
+        - **Serveur :** Panel.Example.com:8080/iptv/
+        - Nom d’utilisateur : Alice@Exemple
+        - Mot de passe : S+crèt:=# ?!
+        """
+        let credentials = try #require(XtreamCredentials.fromProviderMessage(message))
+        #expect(credentials.server.absoluteString == "http://panel.example.com:8080/iptv")
+        #expect(credentials.username == "Alice@Exemple")
+        #expect(credentials.password == "S+crèt:=# ?!")
+    }
+
+    @Test func providerMessageWithEmbeddedURL() throws {
+        let message = "Votre lien [playlist](https://panel.example.com:8443/iptv/get.php?password=A%2B%23%26%29&username=Alice%40Example)."
+        let credentials = try #require(XtreamCredentials.fromProviderMessage(message))
+        #expect(credentials.server.absoluteString == "https://panel.example.com:8443/iptv")
+        #expect(credentials.username == "Alice@Example")
+        #expect(credentials.password == "A+#&)")
+    }
+
+    @Test func providerMessageWithCompatibleLabelsAndURL() throws {
+        let message = """
+        Host = <panel.example.com:8080/>
+        Username: Alice
+        API: https://example.com/docs
+        Lien : <http://panel.example.com:8080/player_api.php?username=Alice&password=p+ss%2Fw>
+        """
+        let credentials = try #require(XtreamCredentials.fromProviderMessage(message))
+        #expect(credentials.server.absoluteString == "http://panel.example.com:8080")
+        #expect(credentials.password == "p+ss/w")
+    }
+
+    @Test(arguments: [
+        "Username: Alice\nPassword: p",
+        "Je vous donne un nom d’utilisateur Alice et un mot de passe secret https://panel.example.com.",
+        "Host: panel.example.com\nUsername: Alice\nMot de passe: p\nPassword: autre",
+        "Host: panel.example.com\nhttps://other.example/get.php?username=Alice&password=p",
+        "https://panel.example.com/get.php?username=Alice&username=alice&password=p",
+        "https://panel.example.com/get.php?username=Alice&password=p%00",
+        "https://panel.example.com/playlist.m3u?username=Alice&password=p",
+        "https://nom:motdepasse@panel.example.com/get.php?username=Alice&password=p"
+    ])
+    func rejectsAmbiguousOrIncompleteProviderMessage(_ message: String) {
+        #expect(XtreamCredentials.fromProviderMessage(message) == nil)
+    }
+
+    @Test func rejectsOversizedProviderMessage() {
+        let message = "Server: panel.example.com\nUsername: Alice\nPassword: p\n" + String(repeating: "x", count: 16_384)
+        #expect(XtreamCredentials.fromProviderMessage(message) == nil)
+    }
+
     let credentials = XtreamCredentials(server: URL(string: "http://panel.example.com:8080")!, username: "user@mail", password: "p+ss/w")
 
     @Test func streamURLs() {
@@ -407,6 +459,16 @@ struct XtreamClientTests {
 
     @Test func networkFailure() async {
         await #expect(throws: XtreamError.self) { try await client(host: "unrouted.test").categories(.live) }
+    }
+
+    @Test func authenticationExplainsTransportSecurityFailures() async {
+        let httpHost = "cleartext.test"
+        StubURLProtocol.registerTransportError(host: httpHost, code: .appTransportSecurityRequiresSecureConnection)
+        await #expect(throws: XtreamError.secureConnectionRequired) { try await client(host: httpHost).authenticate() }
+
+        let tlsHost = "untrusted.test"
+        StubURLProtocol.registerTransportError(host: tlsHost, code: .serverCertificateUntrusted)
+        await #expect(throws: XtreamError.untrustedSecureConnection) { try await client(host: tlsHost).authenticate() }
     }
 
     @Test func liveStreamsUseCategoryAdultFlags() async throws {

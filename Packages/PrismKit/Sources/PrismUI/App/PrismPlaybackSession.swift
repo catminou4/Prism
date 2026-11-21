@@ -13,9 +13,15 @@ final class PrismPlaybackSession {
     private(set) var controller: PlayerController?
     private(set) var target: HistoryEntry.Target?
     private(set) var contentID: ContentID?
+    private(set) var seriesEditionID: ContentID?
+    private var episodeInventory: DetailEpisodeInventory?
+    private var dismissedNextFor: ContentID?
     private var recordedContent: ContentID?
 
-    func open(_ item: PlaybackItem, target: HistoryEntry.Target, contentID: ContentID, app: AppModel) {
+    func open(
+        _ item: PlaybackItem, target: HistoryEntry.Target, contentID: ContentID,
+        app: AppModel, seriesEditionID: ContentID? = nil
+    ) {
         let programme = item.isLive ? currentProgramme(for: target, app: app) : nil
         if let controller, controller.isLive == item.isLive {
             controller.replace(with: item, programme: programme)
@@ -27,6 +33,9 @@ final class PrismPlaybackSession {
         }
         self.target = target
         self.contentID = contentID
+        if self.seriesEditionID != seriesEditionID { episodeInventory = nil }
+        self.seriesEditionID = seriesEditionID
+        dismissedNextFor = nil
         recordedContent = nil
         let titleID: TitleID?
         if case .title(let id) = target {
@@ -41,6 +50,40 @@ final class PrismPlaybackSession {
         controller?.onEnded = { [weak app] in
             if let titleID { app?.library.markWatched(contentID, titleID: titleID) }
         }
+    }
+
+    var nextEpisode: Episode? {
+        guard let current = contentID, dismissedNextFor != current else { return nil }
+        return episodeInventory?.nextAvailableEpisode(after: current)
+    }
+
+    func loadEpisodeInventory(app: AppModel) async {
+        guard let editionID = seriesEditionID, episodeInventory == nil,
+              case let .title(titleID) = target, let title = app.catalog.title(titleID),
+              let variant = title.variants.first(where: { $0.id == editionID }), let series = variant.series,
+              let source = app.source(variant.sourceID), source.isEnabled,
+              let detail = await app.detailRepository.cachedSeriesDetail(series, source: source),
+              !Task.isCancelled else { return }
+        let edition = TitleEdition(variant: variant, source: source)
+        let inventory = await DetailEpisodeInventory.build(edition: edition, detail: detail)
+        guard !Task.isCancelled, editionID == seriesEditionID else { return }
+        episodeInventory = inventory
+    }
+
+    func playNextEpisode(app: AppModel) {
+        guard let episode = nextEpisode, let editionID = seriesEditionID,
+              case let .title(titleID) = target, let title = app.catalog.title(titleID),
+              let variant = title.variants.first(where: { $0.id == editionID }),
+              let source = app.source(variant.sourceID), source.isEnabled,
+              let option = TitlePlaybackOption(edition: TitleEdition(variant: variant, source: source), episode: episode)
+        else { return }
+        let position = option.resumePosition(exact: app.library.progress(for: option.contentID), equivalent: nil)
+        open(option.playbackItem(for: title, position: position), target: .title(titleID),
+             contentID: option.contentID, app: app, seriesEditionID: editionID)
+    }
+
+    func dismissNextEpisode() {
+        dismissedNextFor = contentID
     }
 
     func playbackBegan(app: AppModel) {
@@ -60,6 +103,9 @@ final class PrismPlaybackSession {
         controller = nil
         target = nil
         contentID = nil
+        seriesEditionID = nil
+        episodeInventory = nil
+        dismissedNextFor = nil
         recordedContent = nil
     }
 
@@ -104,7 +150,11 @@ struct PrismPlaybackWindow: View {
                         }
                     )
                 } else {
-                    PlayerView(controller: controller, onClose: close)
+                    PlayerView(
+                        controller: controller, onClose: close,
+                        sidePanel: { EmptyView() },
+                        upNext: { nextEpisodeCard }
+                    )
                 }
             } else {
                 Color.black
@@ -112,6 +162,7 @@ struct PrismPlaybackWindow: View {
         }
         .frame(minWidth: 520, minHeight: 292)
         .onChange(of: session.controller?.phase) { _, _ in session.playbackBegan(app: app) }
+        .task(id: session.seriesEditionID) { await session.loadEpisodeInventory(app: app) }
         .task(id: session.controller?.isLive == true) {
             guard session.controller?.isLive == true else { return }
             while !Task.isCancelled {
@@ -121,6 +172,22 @@ struct PrismPlaybackWindow: View {
             }
         }
         .onDisappear { session.close() }
+    }
+
+    @ViewBuilder private var nextEpisodeCard: some View {
+        if let episode = session.nextEpisode, app.source(episode.sourceID)?.isEnabled == true {
+            PlayerUpNextCard(
+                title: episode.title, subtitle: EpisodeCoordinate(episode).label,
+                remaining: 0, countdown: 0,
+                onPlay: { session.playNextEpisode(app: app) },
+                onDismiss: { session.dismissNextEpisode() }
+            ) {
+                RemoteImage(
+                    url: episode.stillURL, size: CGSize(width: 112, height: 63),
+                    placeholderSeed: episode.title, placeholderStyle: .monogram
+                )
+            }
+        }
     }
 
     private func options(for id: String) -> [PlayerSourceOption] {

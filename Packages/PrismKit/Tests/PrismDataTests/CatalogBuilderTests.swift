@@ -20,6 +20,31 @@ struct CatalogBuilderTests {
         #expect(title.kind == .movie)
     }
 
+    @Test(arguments: [true, false])
+    func hiddenProviderCategoryKeepsOtherEditions(categoryListed: Bool) async throws {
+        let hidden = F.category(F.a, .movie, "1", "Cinéma")
+        let visible = F.category(F.b, .movie, "1", "Cinéma")
+        let removed = F.movie(F.a, "1", "Inception", year: 2010, category: hidden.nativeID)
+        let retained = F.movie(F.b, "1", "Inception", year: 2010, category: visible.id)
+        let hiddenOnly = F.movie(F.a, "2", "Interstellar", year: 2014, category: hidden.id)
+        let catalogs = [
+            SourceCatalog(sourceID: F.a, categories: categoryListed ? [hidden] : [], movies: [removed, hiddenOnly]),
+            SourceCatalog(sourceID: F.b, categories: [visible], movies: [retained]),
+        ]
+        let filtered = await CatalogBuilder.build(
+            sources: [F.source(F.a), F.source(F.b)], catalogs: catalogs,
+            options: .init(hiddenCategoryIDs: [hidden.id])
+        )
+
+        let title = try #require(filtered.movies.first)
+        #expect(filtered.movies.count == 1)
+        #expect(title.variants.map(\.id) == [retained.id])
+        #expect(filtered.titleID(containing: removed.id) == nil)
+        #expect(filtered.titleID(containing: hiddenOnly.id) == nil)
+        #expect(filtered.category(hidden.id) == nil)
+        #expect(filtered.movieCategories.first?.categoryIDs == [visible.id])
+    }
+
     @Test func sameSourceQualityDuplicatesBecomeVariants() async {
         let movies = [
             F.movie(F.a, "1", "Avatar", year: 2009, quality: .hd, raw: "FR: Avatar (2009) HD"),

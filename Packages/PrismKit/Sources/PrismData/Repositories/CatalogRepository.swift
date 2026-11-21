@@ -25,8 +25,8 @@ public actor CatalogRepository {
         let loaded = await withTaskGroup(of: (Int, SourceCatalog?).self) { group in
             for (index, source) in sources.enumerated() {
                 group.addTask {
-                    if let cached = await cache.load(source.id) { return (index, cached) }
-                    return (index, DemoContent.isDemo(source) ? DemoContent.makeCatalog() : nil)
+                    if DemoContent.isDemo(source) { return (index, DemoContent.makeCatalog()) }
+                    return (index, await cache.load(source.id))
                 }
             }
             var results: [(Int, SourceCatalog?)] = []
@@ -89,12 +89,14 @@ public actor CatalogRepository {
                 do {
                     let (catalog, epgURLs) = try await self.performRefresh(source) { continuation.yield($0) }
                     try Task.checkCancellation()
-                    do {
-                        try await self.cache.save(catalog)
-                    } catch {
-                        // A cache write failure must not fail the import.
+                    if !DemoContent.isDemo(source) {
+                        do {
+                            try await self.cache.save(catalog)
+                        } catch {
+                            // A cache write failure must not fail the import.
+                        }
+                        self.savePlaylistEPGURLs(epgURLs, for: source.id)
                     }
-                    self.savePlaylistEPGURLs(epgURLs, for: source.id)
                     await self.remember(catalog)
                     continuation.yield(ImportProgress(stage: .finished, counts: ImportCounts(catalog), fraction: 1, catalog: catalog, epgURLs: epgURLs))
                     continuation.finish()

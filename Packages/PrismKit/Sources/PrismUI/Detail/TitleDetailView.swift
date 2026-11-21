@@ -25,7 +25,6 @@ private struct TitleDetailContent: View {
     @Environment(\.isPageActive) private var isPageActive
     let title: MediaTitle
 
-    @State private var availableHeight: CGFloat = 760
     @State private var movieDetail: MovieDetail?
     @State private var inventory: DetailEpisodeInventory?
     @State private var enriched: TMDBMetadata?
@@ -79,22 +78,24 @@ private struct TitleDetailContent: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 34) {
-                masthead
-                    .padding(.horizontal, margin)
-                if title.kind == .series { episodes }
-                details
-                    .padding(.horizontal, margin)
-                if !related.isEmpty { similarTitles }
-                if !cast.isEmpty { castShelf }
+        GeometryReader { viewport in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    masthead(viewportHeight: viewport.size.height)
+                        .padding(.horizontal, 8)
+                    if title.kind == .series { episodes }
+                    details
+                        .padding(.horizontal, margin)
+                    if !related.isEmpty { similarTitles }
+                    if !cast.isEmpty { castShelf }
+                }
+                .padding(.top, 8)
+                .padding(.bottom, 42)
             }
-            .padding(.top, 48)
-            .padding(.bottom, 42)
+            .scrollEdgeEffectStyle(.soft, for: .top)
+            .ignoresSafeArea(.container, edges: .top)
         }
-        .scrollEdgeEffectStyle(.soft, for: .top)
         .background(PrismColors.pageBackground)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { availableHeight = $0 }
         .task(id: LookupKey(active: isPageActive, revision: app.catalogRevision, edition: preferredEditionID, retry: retryCount)) {
             guard isPageActive else { return }
             await loadProviderDetails()
@@ -122,7 +123,7 @@ private struct TitleDetailContent: View {
         }
     }
 
-    private var masthead: some View {
+    private func masthead(viewportHeight: CGFloat) -> some View {
         let episode = heroEpisode
         let progress = title.kind == .series
             ? episode.flatMap { app.library.progress(for: $0.id) }
@@ -141,7 +142,7 @@ private struct TitleDetailContent: View {
         } ?? (resuming ? "Reprendre" : "Lecture")
 
         return TitleDetailMasthead(
-            title: title, height: min(590, max(415, availableHeight * 0.60)), metadata: enriched,
+            title: title, height: min(550, max(378, viewportHeight * 0.62)), metadata: enriched,
             backdrop: backdrop, plot: plot, facts: facts, playLabel: label,
             progress: resuming ? progress?.fraction : nil,
             canPlay: title.kind == .series ? episode != nil : activeEdition != nil,
@@ -396,7 +397,10 @@ private struct TitleDetailContent: View {
         playbackSelection = nil
         app.library.setPreferredVariant(option.id, for: title.id)
         browseEditionID = nil
-        playItem(option.playbackItem(for: title, position: position), .title(title.id), option.contentID)
+        playItem(
+            option.playbackItem(for: title, position: position), .title(title.id), option.contentID,
+            seriesEditionID: option.episode == nil ? nil : option.id
+        )
     }
 
     private func loadProviderDetails() async {

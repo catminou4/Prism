@@ -70,6 +70,21 @@ struct LibraryStoreTests {
         #expect(store.progress(for: id) == nil)
     }
 
+    @Test func shortDemoEpisodeCanResumeBeforeTheEnd() async throws {
+        let catalog = await CatalogBuilder.build(sources: DemoContent.makeSources(), catalogs: DemoContent.makeCatalogs())
+        let title = try #require(catalog.series.first)
+        let episode = try #require(title.variants.first?.series?.seasons?.first?.episodes.first)
+        let duration = TimeInterval(try #require(episode.durationSeconds))
+        let store = LibraryStore.inMemory()
+
+        store.updateProgress(PlaybackProgress(contentID: episode.id, titleID: title.id, position: 12, duration: duration))
+        #expect(!store.isWatched(episode.id))
+        #expect(store.continueWatching(in: catalog).first?.progress?.position == 12)
+
+        store.updateProgress(PlaybackProgress(contentID: episode.id, titleID: title.id, position: duration - 1, duration: duration))
+        #expect(store.isWatched(episode.id))
+    }
+
     @Test func persistenceWithDebounceAndFlush() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
