@@ -3,6 +3,8 @@ import SwiftUI
 extension EnvironmentValues {
     /// Column width chosen by the enclosing `Shelf`/grid. Cards use it when no explicit width is given.
     @Entry public var prismCardWidth: CGFloat? = nil
+    /// The enclosing card is hovered: its artwork casts the lift shadow.
+    @Entry var prismCardLifted: Bool = false
 }
 
 extension View {
@@ -22,12 +24,25 @@ struct ArtworkSurface<Content: View>: View {
         self.content = content()
     }
 
+    @Environment(\.prismCardLifted) private var lifted
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         content
             .clipShape(shape)
             .overlay {
                 shape.strokeBorder(PrismColors.artworkStroke, lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
+            // The lift shadow is cast by a plain shape, not by the artwork's pixels, and is not
+            // drawn at all at rest: a hidden shadow on every card still cost an offscreen pass
+            // per card on every scrolled frame.
+            .background {
+                shape.fill(.black)
+                    .shadow(color: PrismColors.hoverShadow, radius: 18, y: 10)
+                    .opacity(lifted && !reduceMotion ? 1 : 0)
+                    .animation(PrismMotion.hover, value: lifted)
                     .allowsHitTesting(false)
             }
     }
@@ -138,7 +153,8 @@ struct CardContainer<Content: View, MenuContent: View>: View {
                 content(isHovered)
             }
         }
-        .hoverLiftEffect(isHovered: isHovered, isPressed: isPressed, scale: hoverScale, pressedScale: 0.97, shadow: true, reduceMotion: reduceMotion)
+        .environment(\.prismCardLifted, isHovered)
+        .hoverLiftEffect(isHovered: isHovered, isPressed: isPressed, scale: hoverScale, pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion)
         .onHover { hovering = $0 }
         .modifier(OptionalContextMenu(menu: menu))
         .focusEffectDisabled()

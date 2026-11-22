@@ -8,12 +8,7 @@ public struct HeroBackdrop: View {
     private let fadeInto: Color?
     private let leadingScrim: Double
     private let extendsUnderSidebar: Bool
-    private let animates: Bool
     private let artSize: CGSize?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.prismSnapshotRendering) private var snapshot
-    @Environment(\.appearsActive) private var appearsActive
-    @State private var kenBurns = false
     @State private var failedBackdrops: Set<URL> = []
     @State private var failedPosters: Set<URL> = []
 
@@ -22,6 +17,8 @@ public struct HeroBackdrop: View {
     ///     `nil` keeps a dark legibility gradient.
     ///   - extendsUnderSidebar: Applies `backgroundExtensionEffect()` so the artwork continues
     ///     (mirrored + blurred) under the Liquid Glass sidebar.
+    ///   - animates: Kept for source compatibility. The artwork stays still: a perpetual zoom kept the
+    ///     main thread and the sidebar's extension blur busy on every frame for a barely visible effect.
     public init(
         imageURL: URL?,
         seed: String,
@@ -57,7 +54,6 @@ public struct HeroBackdrop: View {
         self.fadeInto = fadeInto
         self.leadingScrim = leadingScrim
         self.extendsUnderSidebar = extendsUnderSidebar
-        self.animates = animates
         self.artSize = artSize
     }
 
@@ -70,24 +66,16 @@ public struct HeroBackdrop: View {
         }
         .clipped()
         .accessibilityHidden(true)
-        .onChange(of: animates && !reduceMotion && !snapshot && appearsActive, initial: true) { _, shouldAnimate in
-            kenBurns = shouldAnimate
-        }
     }
 
     @ViewBuilder private var artwork: some View {
         if let url = backdropURLs.first(where: { !failedBackdrops.contains($0) }) {
             RemoteImage(
                 url: url, size: artSize, alignment: .top, fitting: .landscapeFill,
-                placeholderSeed: seed, showsPlaceholder: false,
+                placeholderSeed: seed, showsPlaceholder: false, progressive: true,
                 onLoadFailure: { failedBackdrops.insert(url) }
             )
             .id(url)
-            .scaleEffect(kenBurns ? 1.025 : 1, anchor: .top)
-            .animation(
-                kenBurns ? .easeInOut(duration: PrismMotion.kenBurnsDuration).repeatForever(autoreverses: true) : nil,
-                value: kenBurns
-            )
         } else if let url = posterURLs.first(where: { !failedPosters.contains($0) }) {
             PosterHeroArtwork(posterURL: url, seed: seed, onLoadFailure: { failedPosters.insert(url) })
                 .id(url)

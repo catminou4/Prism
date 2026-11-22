@@ -19,16 +19,10 @@ struct LibraryShell: View {
         return visited.contains(selection) ? visited : visited + [selection]
     }
 
-    private let sidebarText = Color.primary
-    private let sidebarSecondary = Color.secondary
-    private var sidebarAccent: Color {
-        colorScheme == .dark ? Color(red: 0.46, green: 0.72, blue: 1) : Color(red: 0.07, green: 0.33, blue: 0.68)
-    }
-
     var body: some View {
         NavigationSplitView(columnVisibility: $visibility) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 290)
+                .navigationSplitViewColumnWidth(min: 200, ideal: PrismMetrics.sidebarWidth, max: 290)
         } detail: {
             GeometryReader { layout in
                 ZStack {
@@ -62,12 +56,7 @@ struct LibraryShell: View {
                             .help("Retour")
                     }
                 }
-                ToolbarSpacer(.flexible, placement: .automatic)
-                ToolbarItem(placement: .automatic) {
-                    Button("Ajouter une source IPTV", systemImage: "plus") { isAddingSource = true }
-                        .keyboardShortcut("n", modifiers: [.command, .shift])
-                        .help("Ajouter une source IPTV")
-                }
+
             }
         }
         .onChange(of: navigation.selection) { _, selection in
@@ -79,63 +68,34 @@ struct LibraryShell: View {
                 visited.removeAll { $0 == .source(id) }
             }
         }
-        .background(alignment: .bottomLeading) {
-            Button("Rechercher") { navigation.select(.search) }
-                .keyboardShortcut("f", modifiers: .command)
-                .opacity(0)
-                .accessibilityHidden(true)
-        }
+        .background(alignment: .bottomLeading) { sectionShortcuts }
         .sheet(isPresented: $isAddingSource) {
             AddSourceView(onImported: { isAddingSource = false })
         }
     }
 
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PrismLogoLockup(size: 20)
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 14)
+    private var sidebarSelection: Binding<SidebarItem?> {
+        Binding(get: { navigation.selection }, set: { item in
+            if let item { navigation.select(item) }
+        })
+    }
 
-            List {
-                Section {
-                    row("Accueil", symbol: "house", item: .home)
-                    row("Rechercher", symbol: "magnifyingglass", item: .search)
-                    row("TV en direct", symbol: "dot.radiowaves.left.and.right", item: .live)
-                    row("Sport", symbol: "sportscourt", item: .sports)
-                    row("Films", symbol: "film.stack", item: .movies)
-                    row("Séries", symbol: "rectangle.stack", item: .series)
+    private var sidebar: some View {
+        List(selection: sidebarSelection) {
+            Section {
+                ForEach(Self.mainItems, id: \.item) { entry in
+                    Label(entry.title, systemImage: entry.symbol).tag(entry.item)
                 }
-                Section {
-                    row("Ma liste", symbol: "bookmark", item: .watchlist)
-                    row("Chaînes favorites", symbol: "star", item: .favorites)
-                    row("Historique", symbol: "clock.arrow.circlepath", item: .history)
-                } header: {
-                    Text("Bibliothèque").foregroundStyle(sidebarSecondary)
+            }
+            Section("Bibliothèque") {
+                ForEach(Self.libraryItems, id: \.item) { entry in
+                    Label(entry.title, systemImage: entry.symbol).tag(entry.item)
                 }
-                Section {
-                    ForEach(app.sources) { source in
-                        let item = SidebarItem.source(source.id)
-                        sidebarButton(item) {
-                            HStack(spacing: 9) {
-                                Image(systemName: source.id == DemoContent.sourceID ? "play.rectangle" : "rectangle.connected.to.line.below")
-                                    .foregroundStyle(rowSymbol(item))
-                                    .frame(width: 17)
-                                    .accessibilityHidden(true)
-                                Text(source.name).lineLimit(1).foregroundStyle(sidebarText)
-                                    .fontWeight(navigation.selection == item ? .semibold : .regular)
-                                Spacer(minLength: 3)
-                                if app.isImporting(source.id) {
-                                    ProgressView().controlSize(.mini).accessibilityLabel("Importation")
-                                } else if app.errors[source.id] != nil {
-                                    Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
-                                        .accessibilityLabel("Erreur d’actualisation")
-                                } else if !source.isEnabled {
-                                    Image(systemName: "pause.circle").foregroundStyle(rowSymbol(item))
-                                        .accessibilityLabel("Source inactive")
-                                }
-                            }
-                        }
+            }
+            Section("Sources") {
+                ForEach(app.sources) { source in
+                    SourceSidebarRow(source: source)
+                        .tag(SidebarItem.source(source.id))
                         .contextMenu {
                             Button(source.isEnabled ? "Désactiver" : "Activer") {
                                 app.setEnabled(!source.isEnabled, for: source.id)
@@ -144,75 +104,73 @@ struct LibraryShell: View {
                             Button("Actualiser") { Task { await app.refresh(source.id) } }
                                 .disabled(!source.isEnabled || app.isImporting(source.id))
                         }
-                    }
-                    Button {
-                        isAddingSource = true
-                    } label: {
-                        Label {
-                            Text("Ajouter une source…").foregroundStyle(sidebarText)
-                        } icon: {
-                            Image(systemName: "plus.circle").foregroundStyle(sidebarSecondary)
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-                        .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
-                } header: {
-                    Text("Sources").foregroundStyle(sidebarSecondary)
                 }
-            }
-            .listStyle(.sidebar)
-
-            Button("Réglages", systemImage: "gearshape") { openSettings() }
-                .buttonStyle(.glass)
-                .help("Ouvrir les réglages de Prism")
-                .padding(.horizontal, 18)
-                .padding(.vertical, 14)
-        }
-    }
-
-    private func row(_ title: String, symbol: String, item: SidebarItem) -> some View {
-        sidebarButton(item) {
-            Label {
-                Text(title)
-                    .foregroundStyle(sidebarText)
-                    .fontWeight(navigation.selection == item ? .semibold : .regular)
-            } icon: {
-                Image(systemName: symbol).foregroundStyle(rowSymbol(item))
+                Button {
+                    isAddingSource = true
+                } label: {
+                    Label("Ajouter une source…", systemImage: "plus.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
         }
-    }
-
-    private func sidebarButton(_ item: SidebarItem, @ViewBuilder label: () -> some View) -> some View {
-        Button {
-            navigation.select(item)
-        } label: {
-            label()
-                .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(navigation.selection == item ? .isSelected : [])
-        .listRowBackground(selectionBackground(item))
-    }
-
-    private func rowSymbol(_ item: SidebarItem) -> Color {
-        navigation.selection == item ? sidebarAccent : sidebarSecondary
-    }
-
-    private func selectionBackground(_ item: SidebarItem) -> some View {
-        ZStack {
-            if navigation.selection == item {
-                Capsule()
-                    .fill(sidebarAccent.opacity(colorScheme == .dark ? 0.16 : 0.105))
-                    .overlay {
-                        Capsule().strokeBorder(sidebarAccent.opacity(colorScheme == .dark ? 0.22 : 0.12), lineWidth: 1)
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Button {
+                openSettings()
+            } label: {
+                HStack(spacing: 10) {
+                    PrismLogoMark(size: 28)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Prism").font(.system(size: 13, weight: .semibold))
+                        Text("Réglages").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 3)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .contentShape(.rect)
             }
+            .buttonStyle(.plain)
+            .help("Ouvrir les réglages de Prism (⌘,)")
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private struct SidebarEntry {
+        let title: String
+        let symbol: String
+        let item: SidebarItem
+    }
+
+    private static let mainItems = [
+        SidebarEntry(title: "Rechercher", symbol: "magnifyingglass", item: .search),
+        SidebarEntry(title: "Accueil", symbol: "house", item: .home),
+        SidebarEntry(title: "TV en direct", symbol: "play.tv", item: .live),
+        SidebarEntry(title: "Sport", symbol: "sportscourt", item: .sports),
+        SidebarEntry(title: "Films", symbol: "film", item: .movies),
+        SidebarEntry(title: "Séries", symbol: "tv", item: .series),
+    ]
+
+    private static let libraryItems = [
+        SidebarEntry(title: "Ma liste", symbol: "plus.circle", item: .watchlist),
+        SidebarEntry(title: "Chaînes favorites", symbol: "star", item: .favorites),
+        SidebarEntry(title: "Historique", symbol: "clock.arrow.circlepath", item: .history),
+    ]
+
+    /// ⌘1…⌘6 jump between the main sections, ⌘F searches.
+    private var sectionShortcuts: some View {
+        ZStack {
+            ForEach(Array(Self.mainItems.enumerated()), id: \.offset) { offset, entry in
+                Button(entry.title) { navigation.select(entry.item) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(offset + 1))), modifiers: .command)
+            }
+            Button("Rechercher") { navigation.select(.search) }
+                .keyboardShortcut("f", modifiers: .command)
+            Button("Ajouter une source IPTV") { isAddingSource = true }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+        }
+        .opacity(0)
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder private func root(for section: SidebarItem) -> some View {
@@ -234,5 +192,27 @@ struct LibraryShell: View {
 private extension SidebarItem {
     var sourceID: SourceID? {
         if case .source(let id) = self { id } else { nil }
+    }
+}
+
+/// A source in the sidebar: tinted monogram and live status.
+private struct SourceSidebarRow: View {
+    @Environment(AppModel.self) private var app
+    let source: Source
+
+    var body: some View {
+        Label {
+            Text(source.name).lineLimit(1)
+        } icon: {
+            Monogram(text: source.name, tint: PrismTint(rawValue: source.tint.rawValue), size: 18)
+        }
+        .badge(status)
+    }
+
+    private var status: Text? {
+        if app.isImporting(source.id) { return Text(Image(systemName: "arrow.triangle.2.circlepath")) }
+        if app.errors[source.id] != nil { return Text(Image(systemName: "exclamationmark.circle")).foregroundStyle(.orange) }
+        if !source.isEnabled { return Text("Inactive") }
+        return nil
     }
 }

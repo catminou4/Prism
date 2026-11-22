@@ -246,7 +246,7 @@ public struct Catalog: Sendable {
                 let shared = other.genres.reduce(0) { $0 + (genres.contains(TextFolding.fold($1)) ? 1 : 0) }
                 score += Double(shared) * 3
             }
-            if other.posterURL != nil { score += 1 }
+            if other.$posterURL != nil { score += 1 }
             if let rating = other.rating { score += min(max(rating, 0), 10) / 10 }
             scored.append((score, index))
         }

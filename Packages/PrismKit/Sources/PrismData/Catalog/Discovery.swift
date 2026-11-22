@@ -54,7 +54,7 @@ public enum DiscoveryBuilder {
         var ranked: [RankedTitle] = []
         for (index, title) in titles.enumerated() {
             if index.isMultiple(of: 2_048), Task.isCancelled { return .empty }
-            guard !title.isAdult, title.primary != nil, title.posterURL != nil || title.backdropURL != nil else { continue }
+            guard !title.isAdult, title.primary != nil, title.$posterURL != nil || title.$backdropURL != nil else { continue }
             if demo {
                 guard RecommendationBuilder.hasLatinTitle(recommendations.editorialCopy[title.id]?.title ?? title.title)
                 else { continue }
@@ -148,7 +148,7 @@ public enum DiscoveryBuilder {
         let recentRelease = (0...3).contains(age) ? Double(4 - age) * 0.35 : 0
         let firstSource = title.primary?.sourceID
         let multipleProviders = title.variants.dropFirst().contains { $0.sourceID != firstSource } ? 1.6 : 0
-        let artwork = title.backdropURL != nil ? 0.5 : 0
+        let artwork = title.$backdropURL != nil ? 0.5 : 0
         return rating + freshness + recentRelease + multipleProviders + artwork
     }
 

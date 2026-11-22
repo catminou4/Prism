@@ -56,8 +56,8 @@ public struct MediaTitle: Identifiable, Sendable, Hashable {
     public var year: Int?
     /// Sorted best first (enabled source order, then quality desc).
     public var variants: [MediaVariant]
-    public var posterURL: URL?
-    public var backdropURL: URL?
+    @CompactURL public var posterURL: URL?
+    @CompactURL public var backdropURL: URL?
     public var plot: String?
     public var genres: [String]
     public var rating: Double?
@@ -91,7 +91,7 @@ public struct ChannelGroup: Identifiable, Sendable, Hashable {
     /// Normalized channel name key.
     public var id: String
     public var name: String
-    public var logoURL: URL?
+    @CompactURL public var logoURL: URL?
     public var number: Int?
     public var epgID: String?
     /// Sorted best first.

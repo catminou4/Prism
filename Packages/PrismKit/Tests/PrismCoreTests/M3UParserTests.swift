@@ -83,6 +83,21 @@ struct M3UParserTests {
         #expect(playlist.entries.first?.group == "Ciné")
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func strayEqualsSignsDoNotStallTheScan() {
+        let text = """
+        #EXTM3U foo=
+        #EXTINF:-1 tvg-id="a"="b",Nom
+        http://h.example.com/a.ts
+        #EXTINF:-1 =x tvg-name="B",Autre
+        http://h.example.com/b.ts
+        """
+        let playlist = M3UParser.parse(text)
+        #expect(playlist.entries.map(\.name) == ["Nom", "Autre"])
+        #expect(playlist.entries[0].attributes["tvg-id"] == "a")
+        #expect(playlist.entries[1].attributes["tvg-name"] == "B")
+    }
+
     @Test func quotingAndAttributes() {
         let text = """
         #EXTM3U
@@ -146,5 +161,32 @@ struct M3UParserTests {
         print("M3UParser: 150 000 entries, \(data.count / 1_000_000) MB parsed in \(elapsed)")
         #expect(playlist.entries.count == 150_000)
         #expect(elapsed < .seconds(4))
+    }
+}
+
+@Suite("Valeurs partagées du catalogue")
+struct CatalogSharingTests {
+    @Test func sharingKeepsEveryValueAndCompactURLsKeepTheirJSON() throws {
+        let source: SourceID = "c0ffee00-1111-2222-3333-444455556666"
+        func movie(_ id: String, source: SourceID) -> Movie {
+            Movie(sourceID: source, nativeID: id, title: "Film \(id)", posterURL: URL(string: "https://image.tmdb.org/t/p/w500/\(id).jpg"),
+                  categoryID: "\(source.rawValue):movie:42", streamURL: URL(string: "http://example.com/movie/u/p/\(id).mkv")!,
+                  containerExtension: "mkv", tags: ["FR", "HEVC"])
+        }
+        var catalog = SourceCatalog(sourceID: source, movies: [movie("1", source: source), movie("2", source: "other-source")])
+        let before = catalog.movies
+        catalog.shareRepeatedValues()
+        #expect(catalog.movies == before)
+
+        // The wrapped URLs encode exactly like plain `URL` properties: strings, omitted when nil.
+        let json = try JSONEncoder().encode(catalog.movies[0])
+        let object = try #require(try JSONSerialization.jsonObject(with: json) as? [String: Any])
+        #expect(object["posterURL"] as? String == "https://image.tmdb.org/t/p/w500/1.jpg")
+        #expect(object["streamURL"] as? String == "http://example.com/movie/u/p/1.mkv")
+        #expect(object["backdropURL"] == nil)
+        let decoded = try JSONDecoder().decode(Movie.self, from: json)
+        #expect(decoded == catalog.movies[0])
+        #expect(decoded.posterURL?.host() == "image.tmdb.org")
+        #expect(decoded.$backdropURL == nil)
     }
 }

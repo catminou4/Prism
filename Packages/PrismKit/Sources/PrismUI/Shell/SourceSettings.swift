@@ -347,10 +347,19 @@ struct PrismSettingsView: View {
                     Text("Français et anglais").tag(HomeAudioLanguage.defaults)
                 }
                 .pickerStyle(.menu)
+                LabeledContent("Titres masqués") {
+                    HStack(spacing: 10) {
+                        Text(app.library.dismissed.count, format: .number)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                        Button("Tout proposer à nouveau") { app.library.clearDismissed() }
+                            .disabled(app.library.dismissed.isEmpty)
+                    }
+                }
             } header: {
                 Text("Recommandations")
             } footer: {
-                Text("Langues audio des titres suggérés dans Accueil, Films et Séries.")
+                Text("Langues audio des titres suggérés dans Accueil, Films et Séries. « Pas intéressé » masque un titre des sélections ; il reste accessible dans la recherche et les catégories.")
             }
         }
         .formStyle(.grouped)

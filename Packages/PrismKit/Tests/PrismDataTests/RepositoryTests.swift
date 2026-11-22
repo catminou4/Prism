@@ -257,6 +257,36 @@ struct RepositoryTests {
         #expect(epg.guideURLs(for: source, playlistEPGURLs: []).first?.path == "/xmltv.php")
     }
 
+    @Test func failedXtreamEndpointKeepsThePreviousList() async throws {
+        let host = StubURLProtocol.uniqueHost("xtream-partial")
+        StubURLProtocol.register(host: host, handler: Self.xtreamHandler)
+        defer { StubURLProtocol.unregister(host: host) }
+        let credentials = InMemoryCredentialStore()
+        let (repository, directories) = makeRepository(session: StubURLProtocol.session(), credentials: credentials)
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let source = Source(id: "xt-partial", name: "Atlas", kind: .xtream, serverURL: URL(string: "http://\(host)"), username: "louis")
+        try credentials.setPassword("secret", for: source.id)
+        for try await _ in repository.refresh(source) {}
+        #expect(await repository.cache.load(source.id)?.movies.count == 1)
+
+        // The VOD endpoints now fail: films and their categories must survive the refresh.
+        StubURLProtocol.register(host: host) { request in
+            switch request.queryValue("action") {
+            case "get_vod_streams", "get_vod_categories": .text("Internal error", status: 500)
+            default: Self.xtreamHandler(request)
+            }
+        }
+        var catalog: SourceCatalog?
+        for try await progress in repository.refresh(source) {
+            if let value = progress.catalog { catalog = value }
+        }
+        let result = try #require(catalog)
+        #expect(result.movies.first?.title == "Heat")
+        #expect(result.categories.contains { $0.kind == .movie })
+        #expect(result.channels.count == 2)
+        #expect(await repository.cache.load(source.id)?.movies.count == 1, "the cache keeps the films")
+    }
+
     // MARK: EPG
 
     static let xmltv = """

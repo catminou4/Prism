@@ -263,7 +263,10 @@ private struct ParserState {
             while p < end, b[p] != 0x3D, b[p] != 0x20, b[p] != 0x09, b[p] != 0x2C { p += 1 }
             let keyEnd = p
             guard p < end, b[p] == 0x3D, keyEnd > keyStart else {
-                continue // bare token: ignore
+                // Bare token: ignore it. A stray '=' where a key should start must still be
+                // consumed, otherwise the scan never advances.
+                if p == keyStart { p += 1 }
+                continue
             }
             p += 1 // '='
             var valueStart = p

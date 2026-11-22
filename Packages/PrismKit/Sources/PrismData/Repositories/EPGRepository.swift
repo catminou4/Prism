@@ -38,19 +38,24 @@ public actor EPGRepository {
             for await result in group { results.append(result) }
             return results.sorted { $0.0 < $1.0 }
         }
-        var merged = EPGGuide.empty
+        var ordered: [EPGGuide] = []
         for (_, id, guide, date) in loaded {
             guard let guide else { continue }
             guides[id] = guide
             if let date { fetchedAt[id] = date }
-            merged = merged.merging(guide)
+            ordered.append(guide)
         }
-        return merged
+        return await Self.merge(ordered)
+    }
+
+    /// Off the actor: building the merged name index normalizes every channel name.
+    @concurrent private static func merge(_ guides: [EPGGuide]) async -> EPGGuide {
+        EPGGuide.merged(guides)
     }
 
     /// Merged in-memory guide of the given sources (after `cachedGuide` / `refresh`).
-    public func currentGuide(for sources: [Source]) -> EPGGuide {
-        sources.filter(\.isEnabled).compactMap { guides[$0.id] }.reduce(EPGGuide.empty) { $0.merging($1) }
+    public func currentGuide(for sources: [Source]) async -> EPGGuide {
+        await Self.merge(sources.filter(\.isEnabled).compactMap { guides[$0.id] })
     }
 
     /// When the guide of a source was last downloaded.

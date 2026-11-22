@@ -558,22 +558,26 @@ public enum CatalogBuilder {
         if refs.count == 1 {
             let ref = refs[0]
             let rating = first.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-            return MediaTitle(
+            var single = MediaTitle(
                 id: id,
                 kind: kind, title: first.title, year: year ?? first.year, variants: [first.mediaVariant],
-                posterURL: first.posterURL, backdropURL: first.backdropURL, plot: cleanPlot(first.plot),
+                plot: cleanPlot(first.plot),
                 genres: cleanGenres(first.genres), rating: rating, addedAt: first.addedAt,
                 categoryIDs: categories[Int(ref.catalog)][Int(ref.item)].map { [$0] } ?? [],
                 isAdult: adult[Int(ref.catalog)][Int(ref.item)]
             )
+            // Artwork addresses are shared with the variant as text, never re-parsed.
+            single.$posterURL = first.posterText
+            single.$backdropURL = first.backdropText
+            return single
         }
         var variants: [MediaVariant] = []
         variants.reserveCapacity(refs.count)
         var title = first.title
         var bestNaturalness = TextFolding.naturalnessScore(first.title)
         var resolvedYear = year
-        var poster: URL?
-        var backdrop: URL?
+        var poster: String?
+        var backdrop: String?
         var plot: String?
         var plotLength = 0
         var genres: [String] = []
@@ -594,8 +598,8 @@ public enum CatalogBuilder {
                 }
             }
             if resolvedYear == nil { resolvedYear = item.year }
-            if poster == nil { poster = item.posterURL }
-            if backdrop == nil { backdrop = item.backdropURL }
+            if poster == nil { poster = item.posterText }
+            if backdrop == nil { backdrop = item.backdropText }
             if let candidate = cleanPlot(item.plot), candidate.utf8.count > plotLength {
                 plot = candidate
                 plotLength = candidate.utf8.count
@@ -611,12 +615,15 @@ public enum CatalogBuilder {
             if adult[Int(ref.catalog)][Int(ref.item)] { isAdult = true }
         }
 
-        return MediaTitle(
+        var grouped = MediaTitle(
             id: id,
             kind: kind, title: title, year: resolvedYear, variants: variants,
-            posterURL: poster, backdropURL: backdrop, plot: plot, genres: genres,
+            plot: plot, genres: genres,
             rating: rating, addedAt: addedAt, categoryIDs: categoryIDs, isAdult: isAdult
         )
+        grouped.$posterURL = poster
+        grouped.$backdropURL = backdrop
+        return grouped
     }
 
     static func trimmed(_ text: String) -> String {
@@ -715,16 +722,17 @@ public enum CatalogBuilder {
             }
             let number = variants.lazy.compactMap(\.number).min()
             numbers.append(number)
-            groups.append(ChannelGroup(
+            var channelGroup = ChannelGroup(
                 id: groupKeys[group],
                 name: name,
-                logoURL: variants.lazy.compactMap(\.logoURL).first,
                 number: number,
                 epgID: variants.lazy.compactMap { $0.epgID?.isEmpty == false ? $0.epgID : nil }.first,
                 variants: variants,
                 categoryIDs: categoryIDs[group],
                 isAdult: adultFlags[group]
-            ))
+            )
+            channelGroup.$logoURL = variants.lazy.compactMap(\.$logoURL).first
+            groups.append(channelGroup)
         }
 
         // Sort: number asc (nil last), then name key.
@@ -830,8 +838,8 @@ public enum CatalogBuilder {
         scored.reserveCapacity(titles.count)
         for (index, title) in titles.enumerated() {
             var score = 0.0
-            if title.backdropURL != nil { score += 100 }
-            if title.posterURL != nil {
+            if title.$backdropURL != nil { score += 100 }
+            if title.$posterURL != nil {
                 score += (title.plot?.utf8.count ?? 0) >= 40 ? 40 : 10
             } else if (title.plot?.utf8.count ?? 0) >= 40 {
                 score += 5
@@ -853,7 +861,7 @@ public enum CatalogBuilder {
         for (index, title) in titles.enumerated() {
             guard let rating = title.rating, rating > 0, !title.isAdult else { continue }
             var score = min(rating, 10) * 1_000
-            if title.posterURL != nil { score += 10 }
+            if title.$posterURL != nil { score += 10 }
             score += Double(min(title.variants.count, 9))
             scored.append((score, Int32(index)))
         }
@@ -896,6 +904,9 @@ protocol GroupableMedia: Sendable {
     var quality: VideoQuality { get }
     var posterURL: URL? { get }
     var backdropURL: URL? { get }
+    /// Artwork addresses as stored (no parsing).
+    var posterText: String? { get }
+    var backdropText: String? { get }
     var plot: String? { get }
     var genres: [String] { get }
     var rating: Double? { get }
@@ -908,8 +919,12 @@ protocol GroupableMedia: Sendable {
 
 extension Movie: GroupableMedia {
     var mediaVariant: MediaVariant { .movie(self) }
+    var posterText: String? { $posterURL }
+    var backdropText: String? { $backdropURL }
 }
 
 extension Series: GroupableMedia {
     var mediaVariant: MediaVariant { .series(self) }
+    var posterText: String? { $posterURL }
+    var backdropText: String? { $backdropURL }
 }

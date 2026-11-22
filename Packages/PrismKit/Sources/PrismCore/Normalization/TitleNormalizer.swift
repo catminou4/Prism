@@ -767,12 +767,19 @@ struct NameWork {
         var i = t.start
         let end = t.end
         var season = 0, digits = 0
-        while i < end, Self.isDigit(s[i].value) { season = season * 10 + Int(s[i].value - 0x30); i += 1; digits += 1 }
+        // Digit runs are bounded before accumulating: a 20-digit run would overflow `Int`.
+        while i < end, Self.isDigit(s[i].value) {
+            if digits < 3 { season = season * 10 + Int(s[i].value - 0x30) }
+            i += 1; digits += 1
+        }
         guard digits >= 1, digits <= 2, i < end, s[i].value | 0x20 == 0x78 else { return nil }
         i += 1
         var episode = 0
         digits = 0
-        while i < end, Self.isDigit(s[i].value) { episode = episode * 10 + Int(s[i].value - 0x30); i += 1; digits += 1 }
+        while i < end, Self.isDigit(s[i].value) {
+            if digits < 4 { episode = episode * 10 + Int(s[i].value - 0x30) }
+            i += 1; digits += 1
+        }
         guard i == end, digits >= 2, digits <= 3 else { return nil }
         return (season, episode)
     }

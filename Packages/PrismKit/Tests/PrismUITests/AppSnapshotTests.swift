@@ -57,6 +57,15 @@ struct AppSnapshotTests {
             )
         }
         try await write(
+            SearchScreen().environment(demo).environment(navigation),
+            label: "search", size: CGSize(width: 1170, height: 870), scheme: .light, settle: .seconds(1)
+        )
+        try await write(
+            CollectionView(collection: .curated(CurationQuery(kind: .movie, facet: .discover, title: "À découvrir")))
+                .environment(demo).environment(navigation),
+            label: "collection", size: CGSize(width: 1170, height: 870), scheme: .light
+        )
+        try await write(
             TitleDetailView(titleID: movie.id).environment(app).environment(navigation),
             label: "film", size: CGSize(width: 1170, height: 870)
         )

@@ -24,7 +24,13 @@ struct TitleGrid: View {
 
 struct CollectionView: View {
     @Environment(AppModel.self) private var app
+    @State private var curated: CuratedItems?
     let collection: CollectionRoute
+
+    private struct CuratedItems {
+        let request: CurationRequest
+        let titles: [MediaTitle]
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -41,6 +47,8 @@ struct CollectionView: View {
                             }
                             .padding(.horizontal, PrismMetrics.contentMargin)
                         }
+                    } else if case .curated = collection, curated == nil {
+                        ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
                     } else if items.isEmpty {
                         emptyMessage
                     } else {
@@ -52,6 +60,17 @@ struct CollectionView: View {
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
         }
+        .task(id: curatedRequest) {
+            guard case .curated(let query) = collection, let request = curatedRequest else { return }
+            let titles = await app.collection(query)
+            guard !Task.isCancelled else { return }
+            curated = CuratedItems(request: request, titles: titles)
+        }
+    }
+
+    private var curatedRequest: CurationRequest? {
+        guard case .curated(let query) = collection else { return nil }
+        return app.curationRequest(for: query.kind == .movie ? .movies : query.kind == .series ? .series : .home)
     }
 
     private var title: String {
@@ -63,6 +82,7 @@ struct CollectionView: View {
         case .continueWatching: "Reprendre"
         case .watchlist: "Ma liste"
         case .related: "À voir aussi"
+        case .curated(let query): query.title
         }
     }
 
@@ -70,8 +90,14 @@ struct CollectionView: View {
         switch collection {
         case .category(let id):
             app.catalog.categoryGroup(id).map(app.catalog.titles(in:)) ?? []
-        case .all(let kind), .recentlyAdded(let kind):
+        case .all(let kind):
             kind == .movie ? app.catalog.movies : app.catalog.series
+        case .recentlyAdded(let kind):
+            // Newest first, without clips, cams and listings in scripts the user cannot read.
+            (kind == .movie ? app.catalog.movies : app.catalog.series).prefix(3_000)
+                .filter { app.signals(for: $0)?.isEligible ?? true }
+        case .curated:
+            curated?.titles ?? []
         case .topRated(let kind):
             app.catalog.topRated(kind, limit: 200)
         case .watchlist:

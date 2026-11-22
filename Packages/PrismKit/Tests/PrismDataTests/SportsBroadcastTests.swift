@@ -65,6 +65,21 @@ struct SportsBroadcastTests {
         #expect(links[bout.id]?.map(\.channel.id) == ["boxing"])
     }
 
+    @Test func memoisedClassificationAgreesWithTheFullMatcher() {
+        let titles: [(String, String?)] = [
+            ("UEFA Ligue des champions : Paris SG - Inter", nil), ("SOIRÉE DE BOXE", nil), ("Lakers / Celtics", "NBA"),
+            ("Le journal de 20 heures", "Information"), ("Météo", nil), ("FOOTBALL : OM - OL", nil),
+            ("Football américain NFL", nil), ("Résumé", "Basket-ball"), ("Ｆｏｏｔｂａｌｌ", nil), ("Fútbol", "Soccer"),
+        ]
+        var memo: [String: BroadcastSport?] = [:]
+        for (title, category) in titles + titles {
+            let item = program("x", title, category: category)
+            #expect(SportsScheduleMatcher.classify(item, memo: &memo) == SportsScheduleMatcher.classify(item), "\(title)")
+        }
+        #expect(!SportsScheduleMatcher.mayMentionSport("Le journal de 20 heures\u{1F}\u{1F}Information"))
+        #expect(SportsScheduleMatcher.mayMentionSport("SOCCER night"))
+    }
+
     private func channel(_ id: String) -> ChannelGroup {
         ChannelGroup(id: id, name: id, epgID: id, variants: [Fixture.channel(Fixture.a, id, id, epg: id)])
     }

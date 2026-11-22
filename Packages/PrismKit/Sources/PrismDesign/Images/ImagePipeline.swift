@@ -67,11 +67,19 @@ public actor ImagePipeline {
     private let memory: MemoryCache
     private let disk: ImageDiskCache
     private let session: URLSession
+    /// Background warm-ups use their own small connection pool so they never queue ahead of
+    /// artwork that is on screen.
+    private let prefetchSession: URLSession
     private var inFlight: [Key: InFlight<CGImage?>] = [:]
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
     private var prefetches: [URL: Task<Void, Never>] = [:]
     private var averageColors: [URL: RGBA?] = [:]
+    /// Byte warm-ups waiting for a slot, most recent request first.
+    private var warmQueue: [ArtworkURL.Resolved] = []
+    private var warmQueued: Set<URL> = []
+    private var warmRunning = 0
+    private static let warmConcurrency = 3
 
     public init(memoryCapacity: Int = 256 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
         memory = MemoryCache(costLimit: memoryCapacity)
@@ -85,6 +93,10 @@ public actor ImagePipeline {
         configuration.waitsForConnectivity = false
         configuration.httpAdditionalHeaders = ["Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8"]
         session = URLSession(configuration: configuration)
+        let background = configuration.copy() as? URLSessionConfiguration ?? configuration
+        background.httpMaximumConnectionsPerHost = 2
+        background.networkServiceType = .background
+        prefetchSession = URLSession(configuration: background)
     }
 
     // MARK: Public API
@@ -130,6 +142,24 @@ public actor ImagePipeline {
     }
 
     nonisolated func cachedImage(for key: Key) -> CGImage? { memory.image(for: key) }
+
+    /// A 1280-wide stand-in for a TMDB `original` (hero backdrops): it arrives in a fraction of the
+    /// time and is replaced as soon as the full-resolution image is decoded. `nil` when the target
+    /// is already served at its final size.
+    nonisolated static func previewKey(for key: Key) -> Key? {
+        guard key.blur == 0, key.width > 1280,
+              ArtworkURL.resolve(key.url, target: key.target, fitting: key.fitting, fillsForBlur: false).isOriginal else { return nil }
+        let height = bucket(for: CGFloat(key.height) * 1280 / CGFloat(key.width))
+        return Key(url: key.url, width: 1280, height: height, fitting: key.fitting, blur: 0)
+    }
+
+    /// Downloads the bytes `RemoteImage` will need for `urls` at `pixelSize` into the disk cache,
+    /// without decoding them (no memory cost). Low priority, a few at a time, newest request first.
+    public nonisolated func warm(_ urls: [URL], pixelSize: CGSize, fitting: Fitting = .fill) {
+        guard !urls.isEmpty, let probe = Self.key(url: urls[0], pixelSize: pixelSize, fitting: fitting, blurRadius: 0) else { return }
+        let target = probe.target
+        Task(priority: .utility) { await self.enqueueWarm(urls, target: target, fitting: fitting) }
+    }
 
     /// Warms the caches for upcoming items (low priority, de-duplicated).
     public nonisolated func prefetch(_ urls: [URL], maxPixelSize: CGFloat) {
@@ -208,7 +238,9 @@ public actor ImagePipeline {
             var image: CGImage?
             if key.url.isFileURL {
                 image = await ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
-            } else if let data = await self.sharedData(for: key.url) {
+            } else if let data = await self.sharedData(
+                for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+            ) {
                 image = await ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             }
             if let decoded = image, blur > 0 {
@@ -221,15 +253,16 @@ public actor ImagePipeline {
         }
     }
 
-    /// Encoded bytes for `url`, fetched once even when several decodes need them concurrently.
-    private func sharedData(for url: URL) async -> Data? {
+    /// Encoded bytes for `request`, fetched once even when several decodes need them concurrently.
+    private func sharedData(for request: ArtworkURL.Resolved) async -> Data? {
+        let url = request.primary
         let entry: InFlight<Data?>
         if let existing = dataInFlight[url] {
             entry = existing
         } else {
             let disk = disk, session = session
             entry = InFlight(task: Task.detached(priority: .userInitiated) {
-                await Self.encodedData(for: url, disk: disk, session: session)
+                await Self.encodedData(for: request, disk: disk, session: session)
             })
             dataInFlight[url] = entry
         }
@@ -258,9 +291,18 @@ public actor ImagePipeline {
         }
     }
 
-    /// Disk hit, else network (validated as an image before being stored).
-    @concurrent private nonisolated static func encodedData(for url: URL, disk: ImageDiskCache, session: URLSession) async -> Data? {
-        if let data = disk.data(for: url) { return data }
+    /// Disk hit, else network (validated as an image before being stored). A resized TMDB request
+    /// falls back to the provider's own URL, from disk when its copy is large enough, else online.
+    @concurrent private nonisolated static func encodedData(for request: ArtworkURL.Resolved, disk: ImageDiskCache, session: URLSession) async -> Data? {
+        if let data = disk.data(for: request.primary) { return data }
+        if request.fallbackIsLarger, let fallback = request.fallback, let data = disk.data(for: fallback) { return data }
+        if let data = await download(request.primary, disk: disk, session: session) { return data }
+        guard !Task.isCancelled, let fallback = request.fallback else { return nil }
+        if !request.fallbackIsLarger, let data = disk.data(for: fallback) { return data }
+        return await download(fallback, disk: disk, session: session)
+    }
+
+    @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession) async -> Data? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
         do {
             let (data, response) = try await session.data(from: url)
@@ -274,6 +316,50 @@ public actor ImagePipeline {
         } catch {
             return nil
         }
+    }
+
+    private func enqueueWarm(_ urls: [URL], target: CGSize, fitting: Fitting) {
+        var fresh: [ArtworkURL.Resolved] = []
+        for url in urls where !url.isFileURL {
+            let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
+            guard dataInFlight[request.primary] == nil, warmQueued.insert(request.primary).inserted else { continue }
+            fresh.append(request)
+        }
+        guard !fresh.isEmpty else { return }
+        // The latest screen matters most: its items go ahead of older, possibly scrolled-away ones.
+        warmQueue.insert(contentsOf: fresh, at: 0)
+        if warmQueue.count > 600 {
+            for dropped in warmQueue[600...] { warmQueued.remove(dropped.primary) }
+            warmQueue.removeSubrange(600...)
+        }
+        startWarming()
+    }
+
+    private func startWarming() {
+        while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
+            let request = warmQueue.removeFirst()
+            warmQueued.remove(request.primary)
+            guard dataInFlight[request.primary] == nil else { continue }
+            warmRunning += 1
+            let disk = disk, session = prefetchSession
+            // Registered like any fetch, so an on-screen decode of the same image joins it.
+            let entry = InFlight(task: Task.detached(priority: .utility) {
+                await Self.encodedData(for: request, disk: disk, session: session)
+            })
+            entry.waiters = 1
+            dataInFlight[request.primary] = entry
+            let token = ObjectIdentifier(entry)
+            Task(priority: .utility) {
+                _ = await entry.task.value
+                self.warmFinished(request.primary, token: token)
+            }
+        }
+    }
+
+    private func warmFinished(_ url: URL, token: ObjectIdentifier) {
+        warmRunning -= 1
+        if let entry = dataInFlight[url], ObjectIdentifier(entry) == token { dataInFlight[url] = nil }
+        startWarming()
     }
 
     private func release(_ key: Key, token: ObjectIdentifier, finished: Bool) {

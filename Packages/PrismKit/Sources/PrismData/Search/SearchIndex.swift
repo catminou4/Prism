@@ -579,12 +579,6 @@ func containsBytes(_ haystack: UnsafeBufferPointer<UInt8>, _ start: Int, _ count
     let n = needle.count
     guard n > 0 else { return true }
     guard count >= n, let h = haystack.baseAddress, let p = needle.baseAddress else { return false }
-    let first = p[0]
-    var index = start
-    let last = start + count - n
-    while index <= last {
-        if h[index] == first && memcmp(h + index, p, n) == 0 { return true }
-        index += 1
-    }
-    return false
+    // libc's vectorised search: several times faster than a byte loop over 300k+ words per keystroke.
+    return memmem(h + start, count, p, n) != nil
 }

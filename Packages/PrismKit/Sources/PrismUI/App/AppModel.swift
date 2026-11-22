@@ -5,13 +5,16 @@ import SwiftUI
 import PrismCore
 import PrismData
 
-public struct DiscoveryRequest: Hashable, Sendable {
-    public let kind: MediaKind
+/// Everything a curated page depends on. Equal requests produce the same feed.
+public struct CurationRequest: Hashable, Sendable {
+    public let scope: CurationScope
     let catalogRevision: Int
-    let metadataRevision: Int
-    let usesTMDB: Bool
+    let curationRevision: Int
+    let trendingRevision: Int
     let languages: Set<HomeAudioLanguage>
-    let profile: DiscoveryProfile
+    let profile: CurationProfile
+    /// Shelves rotate once a day.
+    let day: Int
 }
 
 /// App-wide state: sources, the merged catalog, the EPG guide, the search index and the
@@ -33,6 +36,8 @@ public final class AppModel {
     @ObservationIgnored public let detailRepository: DetailRepository
     @ObservationIgnored public let metadataRepository: MetadataRepository
     @ObservationIgnored public let sportsRepository: SportsRepository
+    /// Hero pages' artwork and synopsis, resolved once per title.
+    @ObservationIgnored let heroArtwork = HeroArtworkStore()
     @ObservationIgnored private let sourceStore: SourceStore
     @ObservationIgnored private let settings = AppSettings()
     @ObservationIgnored private let isEphemeral: Bool
@@ -58,8 +63,15 @@ public final class AppModel {
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
     public private(set) var isRefreshingGuide = false
     public private(set) var isMetadataEnabled = false
-    private var discoveryMetadataRevision = 0
-    private var discoveryShelves: [MediaKind: DiscoveryResult] = [:]
+    /// Signals behind the curated shelves; rebuilt in the background after each catalogue.
+    @ObservationIgnored public private(set) var curationIndex = CurationIndex.empty
+    public private(set) var curationRevision = 0
+    private var curatedFeeds: [CurationScope: CuratedResult] = [:]
+    /// TMDB weekly charts matched to the catalogue (only with a TMDB key).
+    @ObservationIgnored private var trendingIDs: [MediaKind: [TitleID]] = [:]
+    private var trendingRevision = 0
+    @ObservationIgnored private var trendingTask: Task<Void, Never>?
+    @ObservationIgnored private var curationTask: Task<Void, Never>?
     private var hiddenCategoriesBySource: [String: [String]] = [:]
     /// Bumped every time `catalog` is replaced (cheap change token for views/tasks).
     public private(set) var catalogRevision = 0
@@ -158,58 +170,98 @@ public final class AppModel {
         if !isEphemeral { settings.homeAudioLanguages = languages }
     }
 
-    private struct DiscoveryResult {
-        let request: DiscoveryRequest
-        let shelves: DiscoveryShelves
+    private struct CuratedResult {
+        let request: CurationRequest
+        let feed: CuratedFeed
     }
 
-    public func discoveryRequest(for kind: MediaKind) -> DiscoveryRequest {
-        let watched = library.history.lazy.compactMap { entry -> TitleID? in
-            if case .title(let id) = entry.target { return id }
-            return nil
-        }.prefix(24)
-        return DiscoveryRequest(
-            kind: kind, catalogRevision: catalogRevision, metadataRevision: discoveryMetadataRevision,
-            usesTMDB: isMetadataEnabled, languages: homeAudioLanguages,
-            profile: DiscoveryProfile(watchlist: library.watchlist, watched: Array(watched))
-        )
-    }
-
-    public func discovery(for kind: MediaKind) -> DiscoveryShelves {
-        guard let result = discoveryShelves[kind],
-              result.request.catalogRevision == catalogRevision, result.request.languages == homeAudioLanguages,
-              result.request.usesTMDB == isMetadataEnabled, result.request.metadataRevision == discoveryMetadataRevision
-        else { return .empty }
-        return result.shelves
-    }
-
-    public func refreshDiscovery(_ request: DiscoveryRequest) async {
-        guard request.kind == .movie || request.kind == .series,
-              request == discoveryRequest(for: request.kind), !Task.isCancelled else { return }
-        let catalog = self.catalog, recommendations = self.recommendations
-        async let chart = request.usesTMDB ? metadataRepository.weeklyTrending(for: request.kind) : []
-        let local: DiscoveryShelves
-        if let loaded = discoveryShelves[request.kind], loaded.request == request {
-            local = loaded.shelves
-        } else {
-            local = await DiscoveryBuilder.local(
-                for: request.kind, in: catalog, recommendations: recommendations,
-                languages: request.languages, profile: request.profile
-            )
-            guard !Task.isCancelled, request == discoveryRequest(for: request.kind) else { return }
-            // Library edits affect the personal score, not a chart in the same catalogue/language.
-            let charts = discovery(for: request.kind).trending
-            let shelves = DiscoveryShelves(recommended: local.recommended, trending: charts, localHighlights: local.localHighlights)
-            discoveryShelves[request.kind] = DiscoveryResult(request: request, shelves: shelves)
+    /// What the curated shelves know about the user (local only).
+    public var curationProfile: CurationProfile {
+        var watched: [TitleID] = []
+        var seen: Set<TitleID> = []
+        for entry in library.history.prefix(48) {
+            if case .title(let id) = entry.target, seen.insert(id).inserted { watched.append(id) }
         }
-        guard request.usesTMDB else { return }
-        let trending = await DiscoveryBuilder.trending(
-            chart, for: request.kind, in: catalog, recommendations: recommendations, languages: request.languages
+        return CurationProfile(watchlist: library.watchlist, watched: watched, dismissed: Set(library.dismissed))
+    }
+
+    public func curationRequest(for scope: CurationScope) -> CurationRequest {
+        CurationRequest(
+            scope: scope, catalogRevision: catalogRevision, curationRevision: curationRevision,
+            trendingRevision: trendingRevision, languages: homeAudioLanguages, profile: curationProfile,
+            day: Int(Date.now.timeIntervalSince1970 / 86_400)
         )
-        guard !Task.isCancelled, request == discoveryRequest(for: request.kind),
-              discoveryShelves[request.kind]?.shelves.trending != trending else { return }
-        let shelves = DiscoveryShelves(recommended: local.recommended, trending: trending, localHighlights: local.localHighlights)
-        discoveryShelves[request.kind] = DiscoveryResult(request: request, shelves: shelves)
+    }
+
+    /// The latest feed composed for `scope`. A stale feed stays visible while its replacement is built.
+    public func feed(for scope: CurationScope) -> CuratedFeed {
+        curatedFeeds[scope]?.feed ?? .empty
+    }
+
+    /// `false` until a first feed exists for `scope` (the page then shows a placeholder).
+    public func hasFeed(for scope: CurationScope) -> Bool {
+        curatedFeeds[scope] != nil
+    }
+
+    public func refreshFeed(_ request: CurationRequest) async {
+        guard request == curationRequest(for: request.scope), curatedFeeds[request.scope]?.request != request,
+              curationIndex.isBuilt, !Task.isCancelled else { return }
+        let catalog = self.catalog, index = curationIndex, recommendations = self.recommendations
+        let feed = await Curator.feed(
+            scope: request.scope, catalog: catalog, index: index, recommendations: recommendations,
+            languages: request.languages, profile: request.profile, trending: trendingIDs
+        )
+        guard !Task.isCancelled, request == curationRequest(for: request.scope) else { return }
+        curatedFeeds[request.scope] = CuratedResult(request: request, feed: feed)
+        if isMetadataEnabled, trendingTask == nil, trendingIDs.isEmpty { refreshTrending() }
+    }
+
+    /// The full ranked list behind a curated shelf.
+    public func collection(_ query: CurationQuery) async -> [MediaTitle] {
+        await Curator.collection(
+            query, catalog: catalog, index: curationIndex, recommendations: recommendations,
+            languages: homeAudioLanguages, profile: curationProfile
+        )
+    }
+
+    /// "À voir aussi": titles close to `title` in genres, platforms and era, best first.
+    public func similarTitles(to title: MediaTitle, limit: Int = 16) async -> [MediaTitle] {
+        guard let signals = signals(for: title), signals.genres.count > 0 else { return [] }
+        let query = CurationQuery(kind: title.kind, facet: .because(title.id), title: "")
+        return await Curator.collection(
+            query, catalog: catalog, index: curationIndex, recommendations: recommendations,
+            languages: homeAudioLanguages, profile: curationProfile, limit: limit
+        )
+    }
+
+    public func signals(for title: MediaTitle) -> TitleSignals? {
+        curationIndex.signals(for: title, in: catalog)
+    }
+
+    private func refreshTrending() {
+        trendingTask?.cancel()
+        guard isMetadataEnabled else {
+            if !trendingIDs.isEmpty {
+                trendingIDs = [:]
+                trendingRevision &+= 1
+            }
+            return
+        }
+        let catalog = self.catalog, recommendations = self.recommendations, revision = catalogRevision
+        trendingTask = Task { [weak self, metadataRepository] in
+            var charts: [MediaKind: [TitleID]] = [:]
+            for kind in [MediaKind.movie, .series] {
+                let chart = await metadataRepository.weeklyTrending(for: kind)
+                let matched = await DiscoveryBuilder.trending(
+                    chart, for: kind, in: catalog, recommendations: recommendations, languages: HomeAudioLanguage.defaults
+                )
+                charts[kind] = matched.map(\.id)
+            }
+            guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
+            self.trendingIDs = charts
+            self.trendingRevision &+= 1
+            self.trendingTask = nil
+        }
     }
 
     // MARK: Lifecycle
@@ -397,7 +449,8 @@ public final class AppModel {
         Task {
             await metadataRepository.reload()
             isMetadataEnabled = await metadataRepository.isEnabled
-            discoveryMetadataRevision &+= 1
+            trendingIDs = [:]
+            refreshTrending()
         }
     }
 
@@ -532,7 +585,20 @@ public final class AppModel {
         searchIndex = nil
         self.recommendations = recommendations
         catalogRevision &+= 1
-        discoveryShelves.removeAll(keepingCapacity: true)
+        trendingTask?.cancel()
+        trendingTask = nil
+        trendingIDs = [:]
+        // Positions in the previous index do not match the new catalogue.
+        curationIndex = .empty
+        curationTask?.cancel()
+        curationTask = Task { [weak self] in
+            let index = await CurationIndex.build(catalog: built, recommendations: recommendations)
+            guard !Task.isCancelled, let self else { return }
+            self.curationIndex = index
+            // Previous feeds stay visible until each page recomposes with the new index.
+            self.curationRevision &+= 1
+            if self.isMetadataEnabled { self.refreshTrending() }
+        }
         searchTask = Task { [weak self] in
             let index = await SearchIndex.build(from: built, recommendations: recommendations)
             guard !Task.isCancelled else { return }
@@ -544,7 +610,10 @@ public final class AppModel {
         while !Task.isCancelled {
             let generation = rebuildGeneration
             await catalogTask?.value
-            if includingSearch { await searchTask?.value }
+            if includingSearch {
+                await searchTask?.value
+                await curationTask?.value
+            }
             if generation == rebuildGeneration { return }
         }
     }

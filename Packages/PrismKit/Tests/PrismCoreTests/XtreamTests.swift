@@ -416,6 +416,8 @@ struct XtreamDecodingTests {
         #expect(LenientValue.day("2019-05-02") == Date(timeIntervalSince1970: 1_556_755_200))
         #expect(LenientValue.day("02/05/2019") == Date(timeIntervalSince1970: 1_556_755_200))
         #expect(LenientValue.hms("01:52:33") == 6753)
+        #expect(LenientValue.hms("99999999999999999:99999999999999999:9") == nil, "hostile durations must not overflow")
+        #expect(LenientValue.year("release 99999999999999999999999 (2019)") == 2019)
         #expect(LenientValue.list("a, b,, a") == ["a", "b"])
     }
 }

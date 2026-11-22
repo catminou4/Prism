@@ -46,6 +46,8 @@ extension EPGGuide {
         guard !isEmpty else { return [] }
         var result: [SportsBroadcast] = []
         var programsByID: [String: [(EPGProgram, BroadcastSport)]] = [:]
+        // Guides repeat the same shows across days and channels: classify each distinct text once.
+        var classified: [String: BroadcastSport?] = [:]
         for channel in channels {
             guard !Task.isCancelled else { return [] }
             guard !channel.variants.isEmpty, let id = resolveEPGID(for: channel) else { continue }
@@ -54,7 +56,7 @@ extension EPGGuide {
                 sports = cached
             } else {
                 sports = programs(forEPGID: id, in: interval).compactMap { program in
-                    guard let sport = SportsScheduleMatcher.classify(program) else { return nil }
+                    guard let sport = SportsScheduleMatcher.classify(program, memo: &classified) else { return nil }
                     return (program, sport)
                 }
                 programsByID[id] = sports
@@ -102,6 +104,41 @@ public enum SportsScheduleMatcher {
             }
         }
         return result
+    }
+
+    /// `classify` with a memo keyed by the programme's raw texts, after a byte-level check that
+    /// rules out most programmes without normalizing their text.
+    static func classify(_ program: EPGProgram, memo: inout [String: BroadcastSport?]) -> BroadcastSport? {
+        let categories = program.categoryLabels?.joined(separator: " ") ?? program.category ?? ""
+        let raw = program.title + "\u{1F}" + (program.subtitle ?? "") + "\u{1F}" + categories
+        if let known = memo[raw] { return known }
+        let sport = mayMentionSport(raw) ? classify(program) : nil
+        memo[raw] = sport
+        return sport
+    }
+
+    /// Lowercase ASCII stems of every keyword `classify` accepts.
+    private static let sportStems: [[UInt8]] = [
+        "box", "basket", "nba", "euroleague", "football", "soccer", "uefa", "ligue", "europa", "conference",
+    ].map { Array($0.utf8) }
+
+    /// `false` only when no sport keyword can appear once the text is folded. Text with non-ASCII
+    /// characters could fold into one (accents, wide letters): it always goes to the full matcher.
+    static func mayMentionSport(_ text: String) -> Bool {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(text.utf8.count)
+        for byte in text.utf8 {
+            if byte >= 0x80 { return true }
+            bytes.append(byte >= 65 && byte <= 90 ? byte + 32 : byte)
+        }
+        return bytes.withUnsafeBufferPointer { haystack in
+            sportStems.contains { stem in
+                stem.withUnsafeBufferPointer { needle in
+                    guard let h = haystack.baseAddress, let n = needle.baseAddress, haystack.count >= needle.count else { return false }
+                    return memmem(h, haystack.count, n, needle.count) != nil
+                }
+            }
+        }
     }
 
     static func classify(_ program: EPGProgram) -> BroadcastSport? {

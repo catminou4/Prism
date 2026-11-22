@@ -137,7 +137,8 @@ enum LenientValue {
         var current = 0
         for ch in raw.unicodeScalars {
             if ch.value >= 0x30, ch.value <= 0x39 {
-                current = current * 10 + Int(ch.value - 0x30)
+                // Only 4-digit runs matter; longer runs must not overflow.
+                if run < 5 { current = current * 10 + Int(ch.value - 0x30) }
                 run += 1
             } else {
                 if run == 4, (1900...2100).contains(current) { return current }
@@ -191,8 +192,10 @@ enum LenientValue {
         let parts = raw.split(separator: ":").map { Int($0.trimmingCharacters(in: .whitespaces)) }
         guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
         let numbers = parts.compactMap { $0 }
+        // A week is far beyond any real duration; it also keeps the arithmetic from overflowing.
+        guard numbers.count <= 3, numbers.allSatisfy({ (0...604_800).contains($0) }) else { return nil }
         let seconds = numbers.reduce(0) { $0 * 60 + $1 }
-        return seconds > 0 ? seconds : nil
+        return seconds > 0 && seconds <= 604_800 ? seconds : nil
     }
 
     /// Lenient base64 (missing padding, URL-safe alphabet, embedded whitespace). Falls back to the raw text.

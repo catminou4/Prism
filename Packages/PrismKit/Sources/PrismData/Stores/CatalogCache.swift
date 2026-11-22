@@ -119,10 +119,12 @@ public actor CatalogCache {
         }
         guard let meta, id == nil || meta.sourceID == id,
               meta.channelCount == channels.count, meta.movieCount == movies.count, meta.seriesCount == series.count else { return nil }
-        return SourceCatalog(
+        var catalog = SourceCatalog(
             sourceID: meta.sourceID, categories: meta.categories, channels: channels, movies: movies, series: series,
             account: meta.account, fetchedAt: meta.fetchedAt
         )
+        catalog.shareRepeatedValues()
+        return catalog
     }
 }
 

@@ -133,7 +133,8 @@ private struct TitleDetailContent: View {
     }
     private var relatedLookup: RelatedLookup {
         RelatedLookup(
-            active: isPageActive, revision: app.catalogRevision, genres: genres, languages: app.homeAudioLanguages
+            active: isPageActive, revision: app.catalogRevision, curation: app.curationRevision, genres: genres,
+            languages: app.homeAudioLanguages
         )
     }
     private var rating: DetailRating? {
@@ -189,10 +190,14 @@ private struct TitleDetailContent: View {
         }
         .task(id: relatedLookup) { [lookup = relatedLookup] in
             guard lookup.active else { return }
-            let values = await DetailPresentation.relatedTitles(
-                to: title, genres: lookup.genres, in: app.catalog, recommendations: app.recommendations,
-                languages: lookup.languages
-            )
+            // Catalogue-wide similarity (genres, platforms, era) first; provider genre labels otherwise.
+            var values = await app.similarTitles(to: title)
+            if values.count < 4 {
+                values = await DetailPresentation.relatedTitles(
+                    to: title, genres: lookup.genres, in: app.catalog, recommendations: app.recommendations,
+                    languages: lookup.languages
+                )
+            }
             if !Task.isCancelled { related = values }
         }
         .sheet(item: $playbackSelection) { selection in
@@ -629,6 +634,7 @@ private struct TitleDetailContent: View {
     private struct RelatedLookup: Equatable {
         let active: Bool
         let revision: Int
+        let curation: Int
         let genres: [String]
         let languages: Set<HomeAudioLanguage>
     }

@@ -23,6 +23,26 @@ struct LibraryStoreTests {
         #expect(store.watchlist.isEmpty)
     }
 
+    @Test func dismissedTitlesLeaveTheWatchlistAndCanComeBack() async throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let store = LibraryStore(directories: directories, saveDelay: .milliseconds(10))
+        let a = TitleID(rawValue: "movie:a:"), b = TitleID(rawValue: "movie:b:")
+        store.addToWatchlist(a)
+        store.dismiss(a)
+        store.dismiss(b)
+        store.dismiss(a)
+        #expect(store.dismissed == [b, a], "most recent first, no duplicates")
+        #expect(!store.isInWatchlist(a))
+        #expect(store.isDismissed(b))
+        store.flush()
+        #expect(LibraryStore(directories: directories).dismissed == [b, a])
+        store.undismiss(a)
+        #expect(store.dismissed == [b])
+        store.clearDismissed()
+        #expect(store.dismissed.isEmpty)
+    }
+
     @Test func favoritesToggleAndMove() {
         let store = LibraryStore.inMemory()
         for id in ["tf1", "france 2", "m6", "arte"] { store.toggleFavorite(id) }

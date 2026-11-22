@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Observation
 import PrismCore
 
@@ -49,6 +50,8 @@ public final class LibraryStore {
     public private(set) var history: [HistoryEntry] = []
     public private(set) var preferredVariants: [TitleID: ContentID] = [:]
     public private(set) var preferredChannelVariants: [String: ContentID] = [:]
+    /// Titles the user marked “Pas intéressé”: never suggested again by the curated shelves.
+    public private(set) var dismissed: [TitleID] = []
 
     public var lastChannelGroupID: String? {
         get { storedLastChannelGroupID }
@@ -62,6 +65,7 @@ public final class LibraryStore {
     private var storedLastChannelGroupID: String?
 
     public static let maxHistory = 200
+    static let maxDismissed = 2_000
     static let maxProgressEntries = 3_000
 
     @ObservationIgnored private let fileURL: URL?
@@ -69,6 +73,8 @@ public final class LibraryStore {
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     /// Number of disk writes performed (tests).
     @ObservationIgnored private(set) var saveCount = 0
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private let writer = LibraryWriter()
 
     /// Loads `library.json` synchronously (small file).
     public convenience init(directories: AppDirectories, saveDelay: Duration = .milliseconds(1_500)) {
@@ -109,6 +115,31 @@ public final class LibraryStore {
     public func removeFromWatchlist(_ id: TitleID) {
         guard isInWatchlist(id) else { return }
         watchlist.removeAll { $0 == id }
+        scheduleSave()
+    }
+
+    // MARK: - Dismissed suggestions
+
+    public func isDismissed(_ id: TitleID) -> Bool { dismissed.contains(id) }
+
+    /// Hides a title from recommendations (and from Ma liste, which it contradicts).
+    public func dismiss(_ id: TitleID) {
+        guard !isDismissed(id) else { return }
+        dismissed.insert(id, at: 0)
+        if dismissed.count > Self.maxDismissed { dismissed.removeLast(dismissed.count - Self.maxDismissed) }
+        watchlist.removeAll { $0 == id }
+        scheduleSave()
+    }
+
+    public func undismiss(_ id: TitleID) {
+        guard isDismissed(id) else { return }
+        dismissed.removeAll { $0 == id }
+        scheduleSave()
+    }
+
+    public func clearDismissed() {
+        guard !dismissed.isEmpty else { return }
+        dismissed.removeAll()
         scheduleSave()
     }
 
@@ -355,7 +386,10 @@ public final class LibraryStore {
     public func flush() {
         saveTask?.cancel()
         saveTask = nil
-        saveNow()
+        guard let fileURL else { return }
+        generation += 1
+        writer.writeNow(snapshot(), generation: generation, to: fileURL)
+        saveCount += 1
     }
 
     private func scheduleSave() {
@@ -369,17 +403,14 @@ public final class LibraryStore {
         }
     }
 
+    /// The state is captured here; encoding and the atomic write run off the main actor
+    /// (they took 10–50 ms with a full history, during playback).
     private func saveNow() {
         guard let fileURL else { return }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(snapshot()) else { return }
-        do {
-            try data.write(to: fileURL, options: [.atomic])
-            saveCount += 1
-        } catch {
-            // Keep the in-memory state; the next mutation retries.
-        }
+        generation += 1
+        let file = snapshot(), generation = generation, writer = writer
+        saveCount += 1
+        Task.detached(priority: .utility) { writer.writeNow(file, generation: generation, to: fileURL) }
     }
 
     private func pruneProgressIfNeeded() {
@@ -397,7 +428,8 @@ public final class LibraryStore {
             history: history,
             preferredVariants: preferredVariants.map { .init(key: $0.key.rawValue, contentID: $0.value) }.sorted { $0.key < $1.key },
             preferredChannelVariants: preferredChannelVariants.map { .init(key: $0.key, contentID: $0.value) }.sorted { $0.key < $1.key },
-            lastChannelGroupID: storedLastChannelGroupID
+            lastChannelGroupID: storedLastChannelGroupID,
+            dismissed: dismissed
         )
     }
 
@@ -410,6 +442,28 @@ public final class LibraryStore {
         preferredVariants = Dictionary(file.preferredVariants.map { (TitleID(rawValue: $0.key), $0.contentID) }, uniquingKeysWith: { a, _ in a })
         preferredChannelVariants = Dictionary(file.preferredChannelVariants.map { ($0.key, $0.contentID) }, uniquingKeysWith: { a, _ in a })
         storedLastChannelGroupID = file.lastChannelGroupID
+        dismissed = Array(file.dismissed.prefix(Self.maxDismissed))
+    }
+}
+
+/// Serialises library writes: a snapshot older than the last one written is dropped, so a slow
+/// background write can never overwrite a newer state (e.g. the one `flush()` wrote at quit).
+nonisolated final class LibraryWriter: Sendable {
+    private let lastWritten = Mutex(0)
+
+    func writeNow(_ file: LibraryFile, generation: Int, to url: URL) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(file) else { return }
+        lastWritten.withLock { last in
+            guard generation > last else { return }
+            do {
+                try data.write(to: url, options: [.atomic])
+                last = generation
+            } catch {
+                // Keep the in-memory state; the next mutation retries.
+            }
+        }
     }
 }
 
@@ -429,11 +483,12 @@ struct LibraryFile: Codable {
     var preferredVariants: [Preferred] = []
     var preferredChannelVariants: [Preferred] = []
     var lastChannelGroupID: String?
+    var dismissed: [TitleID] = []
 
     init(
         watchlist: [TitleID], favoriteChannels: [String], progress: [PlaybackProgress], watched: [ContentID],
         history: [HistoryEntry], preferredVariants: [Preferred], preferredChannelVariants: [Preferred],
-        lastChannelGroupID: String?
+        lastChannelGroupID: String?, dismissed: [TitleID] = []
     ) {
         self.watchlist = watchlist
         self.favoriteChannels = favoriteChannels
@@ -443,6 +498,7 @@ struct LibraryFile: Codable {
         self.preferredVariants = preferredVariants
         self.preferredChannelVariants = preferredChannelVariants
         self.lastChannelGroupID = lastChannelGroupID
+        self.dismissed = dismissed
     }
 
     init(from decoder: any Decoder) throws {
@@ -456,5 +512,6 @@ struct LibraryFile: Codable {
         preferredVariants = (try? container.decodeIfPresent([Preferred].self, forKey: .preferredVariants)) ?? []
         preferredChannelVariants = (try? container.decodeIfPresent([Preferred].self, forKey: .preferredChannelVariants)) ?? []
         lastChannelGroupID = try? container.decodeIfPresent(String.self, forKey: .lastChannelGroupID)
+        dismissed = (try? container.decodeIfPresent([TitleID].self, forKey: .dismissed)) ?? []
     }
 }

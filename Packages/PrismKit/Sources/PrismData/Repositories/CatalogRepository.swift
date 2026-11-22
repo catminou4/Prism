@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import PrismCore
 
 /// Loads source catalogs from the disk cache and refreshes them from the network / local files.
@@ -87,8 +88,9 @@ public actor CatalogRepository {
         AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
             let task = Task {
                 do {
-                    let (catalog, epgURLs) = try await self.performRefresh(source) { continuation.yield($0) }
+                    var (catalog, epgURLs) = try await self.performRefresh(source) { continuation.yield($0) }
                     try Task.checkCancellation()
+                    catalog.shareRepeatedValues()
                     if !DemoContent.isDemo(source) {
                         do {
                             try await self.cache.save(catalog)
@@ -114,7 +116,7 @@ public actor CatalogRepository {
 
     typealias Reporter = @Sendable (ImportProgress) -> Void
 
-    private nonisolated func performRefresh(_ source: Source, report: Reporter) async throws -> (SourceCatalog, [URL]) {
+    private nonisolated func performRefresh(_ source: Source, report: @escaping Reporter) async throws -> (SourceCatalog, [URL]) {
         if DemoContent.isDemo(source) {
             report(ImportProgress(stage: .connecting, fraction: 0.1))
             let catalog = DemoContent.makeCatalog()
@@ -153,7 +155,7 @@ public actor CatalogRepository {
         case channels([Channel])
         case movies([Movie])
         case series([Series])
-        case failed(any Error)
+        case failed(MediaKind, any Error)
     }
 
     private nonisolated func refreshXtream(_ source: Source, report: Reporter) async throws -> SourceCatalog {
@@ -166,23 +168,28 @@ public actor CatalogRepository {
         async let liveCategories = try? client.categories(.live)
         async let movieCategories = try? client.categories(.movie)
         async let seriesCategories = try? client.categories(.series)
-        let categories = await (liveCategories ?? []) + (movieCategories ?? []) + (seriesCategories ?? [])
+        let fetchedCategories = await (live: liveCategories, movie: movieCategories, series: seriesCategories)
+        let categories = (fetchedCategories.live ?? []) + (fetchedCategories.movie ?? []) + (fetchedCategories.series ?? [])
+        var failedCategoryKinds: Set<MediaKind> = []
+        if fetchedCategories.live == nil { failedCategoryKinds.insert(.live) }
+        if fetchedCategories.movie == nil { failedCategoryKinds.insert(.movie) }
+        if fetchedCategories.series == nil { failedCategoryKinds.insert(.series) }
         try Task.checkCancellation()
         report(ImportProgress(stage: .downloading(fraction: nil), fraction: 0.2))
 
         let preferHLS = source.preferHLSForLive
         var catalog = SourceCatalog(sourceID: source.id, categories: categories, account: account, fetchedAt: .now)
         var counts = ImportCounts()
-        var failures: [any Error] = []
+        var failures: [(kind: MediaKind, error: any Error)] = []
         try await withThrowingTaskGroup(of: XtreamList.self) { group in
             group.addTask {
-                do { return .channels(try await client.liveStreams(preferHLS: preferHLS, account: account)) } catch { return .failed(error) }
+                do { return .channels(try await client.liveStreams(preferHLS: preferHLS, account: account)) } catch { return .failed(.live, error) }
             }
             group.addTask {
-                do { return .movies(try await client.vodStreams()) } catch { return .failed(error) }
+                do { return .movies(try await client.vodStreams()) } catch { return .failed(.movie, error) }
             }
             group.addTask {
-                do { return .series(try await client.series()) } catch { return .failed(error) }
+                do { return .series(try await client.series()) } catch { return .failed(.series, error) }
             }
             var completed = 0
             for try await result in group {
@@ -201,58 +208,51 @@ public actor CatalogRepository {
                     catalog.series = series
                     counts.series = series.count
                     report(ImportProgress(stage: .series(series.count), counts: counts, fraction: fraction))
-                case .failed(let error):
+                case .failed(let kind, let error):
                     if error is CancellationError { throw error }
-                    failures.append(error)
+                    failures.append((kind, error))
                 }
             }
         }
         try Task.checkCancellation()
         // Panels often fail on one endpoint: keep what worked, fail only when everything failed.
-        if failures.count == 3, let first = failures.first { throw first }
+        if failures.count == 3, let first = failures.first { throw first.error }
+        // A list or category endpoint that failed this time keeps its previous content instead of
+        // wiping it from the UI and from the cache until the next fully successful refresh.
+        let stale = Set(failures.map(\.kind)).union(failedCategoryKinds)
+        if !stale.isEmpty, let previous = await previousCatalog(source.id) {
+            catalog.merge(kinds: stale, from: previous, listsOnly: Set(failures.map(\.kind)))
+        }
         return catalog
+    }
+
+    private func previousCatalog(_ id: SourceID) async -> SourceCatalog? {
+        if let last = lastCatalogs[id] { return last }
+        return await cache.load(id)
     }
 
     // MARK: M3U
 
-    private nonisolated func download(_ url: URL, userAgent: String?, report: Reporter) async throws -> Data {
+    private nonisolated func download(_ url: URL, userAgent: String?, report: @escaping Reporter) async throws -> Data {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.setValue(Self.userAgent(userAgent), forHTTPHeaderField: "User-Agent")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
-        let bytes: URLSession.AsyncBytes
+        report(ImportProgress(stage: .downloading(fraction: nil), fraction: 0.05))
+        // URLSession accumulates the body natively; iterating `AsyncBytes` byte by byte costs
+        // seconds of CPU on 100 MB playlists. Progress comes from the task's byte counters.
+        let observer = TransferObserver { received, expected in
+            let fraction = expected > 0 ? min(Double(received) / Double(expected), 1) : nil
+            report(ImportProgress(stage: .downloading(fraction: fraction), fraction: 0.05 + 0.6 * (fraction ?? 0.5)))
+        }
+        let data: Data
         let response: URLResponse
         do {
-            (bytes, response) = try await session.bytes(for: request)
+            (data, response) = try await session.data(for: request, delegate: observer)
         } catch let error as URLError {
             throw SourceError.from(error)
         }
+        observer.invalidate()
         if let http = response as? HTTPURLResponse { try SourceError.check(status: http.statusCode) }
-        let expected = response.expectedContentLength > 0 ? Int(response.expectedContentLength) : nil
-        report(ImportProgress(stage: .downloading(fraction: expected == nil ? nil : 0), fraction: 0.05))
-
-        var data = Data()
-        data.reserveCapacity(min(expected ?? 1 << 20, 512 << 20))
-        var buffer = [UInt8]()
-        let chunkSize = 1 << 16
-        buffer.reserveCapacity(chunkSize)
-        var lastReported = 0
-        do {
-            for try await byte in bytes {
-                buffer.append(byte)
-                if buffer.count == chunkSize {
-                    data.append(contentsOf: buffer)
-                    buffer.removeAll(keepingCapacity: true)
-                    if data.count - lastReported >= 1 << 19 {
-                        lastReported = data.count
-                        let fraction = expected.map { min(Double(data.count) / Double($0), 1) }
-                        report(ImportProgress(stage: .downloading(fraction: fraction), fraction: 0.05 + 0.6 * (fraction ?? 0.5)))
-                    }
-                }
-            }
-        } catch let error as URLError {
-            throw SourceError.from(error)
-        }
-        data.append(contentsOf: buffer)
         report(ImportProgress(stage: .downloading(fraction: 1), fraction: 0.65))
         return data
     }
@@ -364,5 +364,57 @@ public actor CatalogRepository {
         } catch let error as URLError {
             throw SourceError.from(error)
         }
+    }
+}
+
+extension SourceCatalog {
+    /// Restores the categories of `kinds` from `previous`, and their item lists for `listsOnly`.
+    /// Categories are restored only when this refresh brought none for that kind.
+    mutating func merge(kinds: Set<MediaKind>, from previous: SourceCatalog, listsOnly: Set<MediaKind>) {
+        for kind in kinds where !categories.contains(where: { $0.kind == kind }) {
+            categories += previous.categories.filter { $0.kind == kind }
+        }
+        if listsOnly.contains(.live), channels.isEmpty { channels = previous.channels }
+        if listsOnly.contains(.movie), movies.isEmpty { movies = previous.movies }
+        if listsOnly.contains(.series), series.isEmpty { series = previous.series }
+    }
+}
+
+/// Reports download progress of an async `URLSession` call, at most every 512 KB.
+private final class TransferObserver: NSObject, URLSessionTaskDelegate, Sendable {
+    private struct State {
+        var observation: NSKeyValueObservation?
+        var lastReported: Int64 = 0
+    }
+
+    private let state = Mutex(State())
+    private let onProgress: @Sendable (_ received: Int64, _ expected: Int64) -> Void
+
+    init(onProgress: @escaping @Sendable (_ received: Int64, _ expected: Int64) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        let observation = task.observe(\.countOfBytesReceived, options: [.new]) { [weak self] task, _ in
+            self?.received(task.countOfBytesReceived, of: task.countOfBytesExpectedToReceive)
+        }
+        state.withLock { $0.observation = observation }
+    }
+
+    private func received(_ received: Int64, of expected: Int64) {
+        let shouldReport = state.withLock { state -> Bool in
+            guard received - state.lastReported >= 1 << 19 else { return false }
+            state.lastReported = received
+            return true
+        }
+        if shouldReport { onProgress(received, expected) }
+    }
+
+    func invalidate() {
+        let observation = state.withLock { state -> NSKeyValueObservation? in
+            defer { state.observation = nil }
+            return state.observation
+        }
+        observation?.invalidate()
     }
 }

@@ -145,10 +145,10 @@ public enum RecommendationBuilder {
         for (index, item) in titles.enumerated() {
             if index.isMultiple(of: 2_048), Task.isCancelled { return [:] }
             guard let rating = item.rating, (7...10).contains(rating), !item.isAdult,
-                  item.posterURL != nil || item.backdropURL != nil, !excluded.contains(item.id) else { continue }
+                  item.$posterURL != nil || item.$backdropURL != nil, !excluded.contains(item.id) else { continue }
             let audio = availableAudio(for: item, original: nil, catalog: catalog)
             guard !audio.isEmpty, hasLatinTitle(item.title) else { continue }
-            let score = rating * 1_000 + (item.posterURL == nil ? 0 : 10) + Double(min(item.variants.count, 9))
+            let score = rating * 1_000 + (item.$posterURL == nil ? 0 : 10) + Double(min(item.variants.count, 9))
             candidates.append(((score, Int32(index)), audio))
         }
         return Dictionary(uniqueKeysWithValues: choices.map { languages in
@@ -225,9 +225,9 @@ public enum RecommendationBuilder {
     }
 
     private static func artworkFirst(_ titles: [MediaTitle]) -> [MediaTitle] {
-        titles.filter { $0.backdropURL != nil }
-            + titles.filter { $0.backdropURL == nil && $0.posterURL != nil }
-            + titles.filter { $0.backdropURL == nil && $0.posterURL == nil }
+        titles.filter { $0.$backdropURL != nil }
+            + titles.filter { $0.$backdropURL == nil && $0.$posterURL != nil }
+            + titles.filter { $0.$backdropURL == nil && $0.$posterURL == nil }
     }
 
     private static func interleaved(_ shelves: [[MediaTitle]], limit: Int) -> [MediaTitle] {

@@ -10,11 +10,26 @@ extension View {
     func hoverLiftEffect(isHovered: Bool, isPressed: Bool, scale: CGFloat, pressedScale: CGFloat, shadow: Bool, reduceMotion: Bool) -> some View {
         let target: CGFloat = isPressed ? pressedScale : (isHovered ? scale : 1)
         return self
-            .shadow(color: PrismColors.hoverShadow.opacity(shadow && isHovered ? 1 : 0), radius: 18, y: 10)
+            .modifier(ContentShadow(enabled: shadow, isHovered: isHovered))
             .scaleEffect(reduceMotion ? 1 : target)
             .brightness(reduceMotion && isHovered ? 0.04 : 0)
             .animation(isPressed ? PrismMotion.press : PrismMotion.hover, value: isHovered)
             .animation(PrismMotion.press, value: isPressed)
+    }
+}
+
+/// A shadow cast by the content's own pixels. Only for callers that ask for it: cards draw theirs
+/// from their artwork shape instead (see `ArtworkSurface`).
+private struct ContentShadow: ViewModifier {
+    let enabled: Bool
+    let isHovered: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.shadow(color: PrismColors.hoverShadow.opacity(isHovered ? 1 : 0), radius: 18, y: 10)
+        } else {
+            content
+        }
     }
 }
 

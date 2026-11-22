@@ -77,13 +77,13 @@ public struct Channel: Identifiable, Codable, Sendable, Hashable {
     public var name: String
     public var rawName: String
     public var number: Int?
-    public var logoURL: URL?
+    @CompactURL public var logoURL: URL?
     public var categoryID: String?
     /// XMLTV channel id (`tvg-id` / `epg_channel_id`).
     public var epgID: String?
-    public var streamURL: URL
+    @CompactRequiredURL public var streamURL: URL
     /// Fallback URL (e.g. `.ts` when the primary is `.m3u8`).
-    public var alternateStreamURL: URL?
+    @CompactURL public var alternateStreamURL: URL?
     public var quality: VideoQuality
     /// Normalized tags extracted from the raw name (e.g. ["FR", "HEVC"]).
     public var tags: [String]
@@ -125,8 +125,8 @@ public struct Movie: Identifiable, Codable, Sendable, Hashable {
     public var title: String
     public var rawName: String
     public var year: Int?
-    public var posterURL: URL?
-    public var backdropURL: URL?
+    @CompactURL public var posterURL: URL?
+    @CompactURL public var backdropURL: URL?
     public var plot: String?
     public var genres: [String]
     /// 0…10 scale.
@@ -135,14 +135,14 @@ public struct Movie: Identifiable, Codable, Sendable, Hashable {
     public var cast: [String]
     public var director: String?
     public var categoryID: String?
-    public var streamURL: URL
+    @CompactRequiredURL public var streamURL: URL
     /// File extension of the stream (`mp4`, `mkv`…), when known.
     public var containerExtension: String?
     public var quality: VideoQuality
     public var tags: [String]
     public var addedAt: Date?
     public var tmdbID: Int?
-    public var trailerURL: URL?
+    @CompactURL public var trailerURL: URL?
     public var isAdult: Bool
     public var httpHeaders: [String: String]
 
@@ -191,8 +191,8 @@ public struct Episode: Identifiable, Codable, Sendable, Hashable {
     public var title: String
     public var plot: String?
     public var durationSeconds: Int?
-    public var stillURL: URL?
-    public var streamURL: URL
+    @CompactURL public var stillURL: URL?
+    @CompactRequiredURL public var streamURL: URL
     public var containerExtension: String?
     public var airDate: Date?
     public var rating: Double?
@@ -246,8 +246,8 @@ public struct Series: Identifiable, Codable, Sendable, Hashable {
     public var title: String
     public var rawName: String
     public var year: Int?
-    public var posterURL: URL?
-    public var backdropURL: URL?
+    @CompactURL public var posterURL: URL?
+    @CompactURL public var backdropURL: URL?
     public var plot: String?
     public var genres: [String]
     public var rating: Double?
@@ -258,7 +258,7 @@ public struct Series: Identifiable, Codable, Sendable, Hashable {
     public var tags: [String]
     public var addedAt: Date?
     public var tmdbID: Int?
-    public var trailerURL: URL?
+    @CompactURL public var trailerURL: URL?
     public var isAdult: Bool
     /// Known upfront for M3U-derived series; `nil` for Xtream until `SeriesDetail` is loaded.
     public var seasons: [Season]?

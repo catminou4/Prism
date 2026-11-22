@@ -18,6 +18,7 @@ public struct RemoteImage: View {
     private let placeholderStyle: PlaceholderArtwork.TitleStyle
     private let blurRadius: CGFloat
     private let showsPlaceholder: Bool
+    private let progressive: Bool
     private let onLoadFailure: (() -> Void)?
 
     @Environment(\.displayScale) private var displayScale
@@ -36,6 +37,7 @@ public struct RemoteImage: View {
         placeholderStyle: PlaceholderArtwork.TitleStyle = .title,
         blurRadius: CGFloat = 0,
         showsPlaceholder: Bool = true,
+        progressive: Bool = false,
         onLoadFailure: (() -> Void)? = nil
     ) {
         self.url = url
@@ -48,6 +50,7 @@ public struct RemoteImage: View {
         self.placeholderStyle = placeholderStyle
         self.blurRadius = blurRadius
         self.showsPlaceholder = showsPlaceholder
+        self.progressive = progressive
         self.onLoadFailure = onLoadFailure
     }
 
@@ -114,10 +117,39 @@ public struct RemoteImage: View {
             loaded = Loaded(key: key, image: cached)
             return
         }
-        let image = await ImagePipeline.shared.image(for: key)
+        // Full-screen artwork: a lighter copy fills the slot while the full resolution downloads.
+        // Whichever arrives first wins; a full image already on disk never waits for the copy.
+        if progressive, loaded?.key.showsSameArtwork(as: key) != true, let preview = ImagePipeline.previewKey(for: key) {
+            await withTaskGroup(of: (isFull: Bool, image: CGImage?).self) { group in
+                group.addTask { (true, await ImagePipeline.shared.image(for: key)) }
+                group.addTask { (false, await ImagePipeline.shared.image(for: preview)) }
+                for await result in group {
+                    if result.isFull {
+                        group.cancelAll()
+                        finish(result.image, key: key)
+                        return
+                    }
+                    if let image = result.image, !Task.isCancelled, loaded?.key != key {
+                        withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) {
+                            loaded = Loaded(key: preview, image: image)
+                        }
+                    }
+                }
+            }
+            return
+        }
+        finish(await ImagePipeline.shared.image(for: key), key: key)
+    }
+
+    private func finish(_ image: CGImage?, key: ImagePipeline.Key) {
         guard !Task.isCancelled else { return }
         guard let image else {
             if loaded?.key.showsSameArtwork(as: key) != true { onLoadFailure?() }
+            return
+        }
+        if loaded?.key.showsSameArtwork(as: key) == true {
+            // Same artwork at a new resolution: swap in place, no second fade.
+            loaded = Loaded(key: key, image: image)
             return
         }
         withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) {

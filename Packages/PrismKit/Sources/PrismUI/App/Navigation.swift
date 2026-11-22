@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import SwiftUI
 import PrismCore
+import PrismData
 import PrismDesign
 
 /// Top-level sections shown in the sidebar.
@@ -20,6 +21,8 @@ public enum CollectionRoute: Hashable, Sendable {
     case continueWatching
     case watchlist
     case related(TitleID)
+    /// The full ranking behind a curated shelf.
+    case curated(CurationQuery)
 }
 
 /// Pages pushed inside a section's page stack.

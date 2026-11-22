@@ -1,5 +1,6 @@
 import Foundation
 import PrismCore
+import Synchronization
 
 /// Immutable, indexed TV guide (one or several XMLTV feeds merged).
 ///
@@ -12,6 +13,8 @@ public struct EPGGuide: Sendable {
     let channelsByID: [String: XMLTVChannel]
     /// Normalized channel name → lowercased channel id (only channels that have programmes).
     let nameIndex: [String: String]
+    /// Channel → guide id, filled as views ask (name matching normalizes text: too slow to redo per row).
+    private let resolutions = ResolutionMemo()
 
     public let programCount: Int
 
@@ -101,6 +104,15 @@ public struct EPGGuide: Sendable {
     /// otherwise a match of the normalized channel name against the XMLTV display names.
     public func resolveEPGID(for channel: ChannelGroup) -> String? {
         guard !programsByChannel.isEmpty else { return nil }
+        // The group id alone could outlive a catalogue rebuild that added variants.
+        let key = "\(channel.id)|\(channel.epgID ?? "")|\(channel.variants.count)"
+        if let known = resolutions.value(for: key) { return known }
+        let id = resolveUncached(channel)
+        resolutions.store(id, for: key)
+        return id
+    }
+
+    private func resolveUncached(_ channel: ChannelGroup) -> String? {
         if let id = matchingEPGID(channel.epgID) { return id }
         for variant in channel.variants where variant.epgID != channel.epgID {
             if let id = matchingEPGID(variant.epgID) { return id }
@@ -115,23 +127,32 @@ public struct EPGGuide: Sendable {
 
     /// Union of both guides; on conflicting programmes `self` wins.
     public func merging(_ other: EPGGuide) -> EPGGuide {
-        guard !other.programsByChannel.isEmpty || !other.channelsByID.isEmpty else { return self }
-        guard !programsByChannel.isEmpty || !channelsByID.isEmpty else { return other }
-        var programs = programsByChannel
-        var count = programCount
-        for (id, list) in other.programsByChannel {
-            if let existing = programs[id] {
-                let merged = Self.normalize(existing + list)
-                count += merged.count - existing.count
-                programs[id] = merged
-            } else {
-                programs[id] = list
-                count += list.count
+        Self.merged([self, other])
+    }
+
+    /// Union of `guides`; on conflicting programmes the earlier guide wins. The name index is built
+    /// once for the result (merging pairwise rebuilt it for every intermediate guide).
+    public static func merged(_ guides: [EPGGuide]) -> EPGGuide {
+        let filled = guides.filter { !$0.programsByChannel.isEmpty || !$0.channelsByID.isEmpty }
+        guard filled.count > 1 else { return filled.first ?? .empty }
+        var programs = filled[0].programsByChannel
+        var channels = filled[0].channelsByID
+        var count = filled[0].programCount
+        for other in filled.dropFirst() {
+            for (id, list) in other.programsByChannel {
+                if let existing = programs[id] {
+                    // Both lists are already sorted and cleaned: a linear merge replaces a re-sort.
+                    let merged = clean(mergeSorted(existing, list))
+                    count += merged.count - existing.count
+                    programs[id] = merged
+                } else {
+                    programs[id] = list
+                    count += list.count
+                }
             }
-        }
-        var channels = channelsByID
-        for (id, channel) in other.channelsByID where channels[id] == nil {
-            channels[id] = channel
+            for (id, channel) in other.channelsByID where channels[id] == nil {
+                channels[id] = channel
+            }
         }
         return EPGGuide(programsByChannel: programs, channelsByID: channels, programCount: count)
     }
@@ -156,9 +177,31 @@ public struct EPGGuide: Sendable {
         let sorted = programs.enumerated().sorted {
             $0.element.start != $1.element.start ? $0.element.start < $1.element.start : $0.offset < $1.offset
         }
+        return clean(sorted.map(\.element))
+    }
+
+    /// Stable merge of two lists sorted by start (`first` wins ties).
+    static func mergeSorted(_ first: [EPGProgram], _ second: [EPGProgram]) -> [EPGProgram] {
+        var result: [EPGProgram] = []
+        result.reserveCapacity(first.count + second.count)
+        var i = 0, j = 0
+        while i < first.count, j < second.count {
+            if second[j].start < first[i].start {
+                result.append(second[j]); j += 1
+            } else {
+                result.append(first[i]); i += 1
+            }
+        }
+        result.append(contentsOf: first[i...])
+        result.append(contentsOf: second[j...])
+        return result
+    }
+
+    /// Drops empty/duplicate programmes of a start-sorted list and trims overlaps.
+    static func clean(_ sorted: [EPGProgram]) -> [EPGProgram] {
         var result: [EPGProgram] = []
         result.reserveCapacity(sorted.count)
-        for (_, program) in sorted {
+        for program in sorted {
             guard program.end > program.start else { continue }
             if let last = result.last {
                 if program.start == last.start { continue }
@@ -216,5 +259,18 @@ public struct EPGGuide: Sendable {
             for key in nameKeys(strippedChannelID(original)) where index[key] == nil { index[key] = id }
         }
         return index
+    }
+}
+
+/// Thread-safe memo shared by the copies of one guide (a guide is immutable).
+private final class ResolutionMemo: Sendable {
+    private let storage = Mutex<[String: String?]>([:])
+
+    func value(for key: String) -> String?? {
+        storage.withLock { $0[key] }
+    }
+
+    func store(_ value: String?, for key: String) {
+        storage.withLock { $0[key] = .some(value) }
     }
 }

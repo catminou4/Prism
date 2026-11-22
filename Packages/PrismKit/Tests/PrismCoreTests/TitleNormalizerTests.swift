@@ -227,4 +227,10 @@ struct TitleNormalizerTests {
         #expect(sink > 0)
         #expect(elapsed < .seconds(20))
     }
+
+    @Test func hugeDigitRunsDoNotOverflow() {
+        _ = TitleNormalizer.normalize("Série 99999999999999999999x12 FR")
+        _ = TitleNormalizer.normalize("Série 12x99999999999999999999 FR")
+        #expect(TitleNormalizer.normalize("The Office 2x05").title.isEmpty == false)
+    }
 }
