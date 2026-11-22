@@ -87,10 +87,23 @@ public struct CurationIndex: Sendable {
         )
         async let movies = signals(for: catalog.movies, context: context)
         async let series = signals(for: catalog.series, context: context)
-        let (movieSignals, seriesSignals) = await (movies, series)
+        var (movieSignals, seriesSignals) = await (movies, series)
+        var movieRanking = ranking(movieSignals)
+        var seriesRanking = ranking(seriesSignals)
+        // Conservative degraded mode: providers without any artwork would leave a whole kind
+        // without eligible titles and every shelf empty. When that happens, relax only the
+        // artwork clause — the UI already renders monogram placeholders for missing art.
+        if movieRanking.isEmpty, !catalog.movies.isEmpty {
+            relaxArtworkEligibility(titles: catalog.movies, signals: &movieSignals, context: context)
+            movieRanking = ranking(movieSignals)
+        }
+        if seriesRanking.isEmpty, !catalog.series.isEmpty {
+            relaxArtworkEligibility(titles: catalog.series, signals: &seriesSignals, context: context)
+            seriesRanking = ranking(seriesSignals)
+        }
         return CurationIndex(
             movies: movieSignals, series: seriesSignals,
-            movieRanking: ranking(movieSignals), seriesRanking: ranking(seriesSignals),
+            movieRanking: movieRanking, seriesRanking: seriesRanking,
             currentYear: currentYear, hasLanguageEvidence: hasLanguageEvidence, catalogDay: catalogDay
         )
     }
@@ -202,12 +215,23 @@ public struct CurationIndex: Sendable {
         return rating
     }
 
-    private static func isEligible(_ title: MediaTitle, signals: TitleSignals) -> Bool {
-        guard !title.isAdult, title.$posterURL != nil || title.$backdropURL != nil,
+    private static func isEligible(_ title: MediaTitle, signals: TitleSignals, requiresArtwork: Bool = true) -> Bool {
+        guard !title.isAdult,
+              !requiresArtwork || title.$posterURL != nil || title.$backdropURL != nil,
               title.year != nil || title.rating != nil,
               signals.flags.isDisjoint(with: [.lowQualityRelease, .episodeLike, .religious, .sportEvent]) else { return false }
         if RecommendationBuilder.hasLatinTitle(title.title) { return true }
         return title.variants.prefix(6).contains { RecommendationBuilder.hasLatinTitle($0.title) }
+    }
+
+    /// Second pass used only when a kind's ranking came out empty (artwork-less providers):
+    /// re-runs the eligibility gate without the artwork clause and rescores what passes.
+    private static func relaxArtworkEligibility(titles: [MediaTitle], signals: inout [TitleSignals], context: Context) {
+        for (offset, title) in titles.enumerated() where !signals[offset].isEligible {
+            guard isEligible(title, signals: signals[offset], requiresArtwork: false) else { continue }
+            signals[offset].isEligible = true
+            signals[offset].score = score(signals[offset], title: title, context: context)
+        }
     }
 
     private static func score(_ signals: TitleSignals, title: MediaTitle, context: Context) -> Float {
@@ -242,8 +266,14 @@ public struct CurationIndex: Sendable {
     }
 
     private static let nonLanguageTags: Set<String> = [
-        "4K", "UHD", "HD", "FHD", "SD", "HEVC", "H265", "X265", "3D", "CAM", "HDCAM", "SUB", "SUBS", "DUB", "MULTI",
-        "MULTI-SUB", "VOSTFR", "VOST", "VO", "HDR", "DV", "AI", "NF", "IMAX", "REMUX", "BLURAY",
+        "4K", "UHD", "HD", "FHD", "SD", "HEVC", "H265", "X265", "H264", "X264", "3D", "CAM", "HDCAM",
+        "SUB", "SUBS", "DUB", "MULTI", "MULTI-SUB", "VOSTFR", "VOST", "VO", "HDR", "DV", "AI", "NF",
+        "IMAX", "REMUX", "BLURAY",
+        // Codec, container and release-quality tags describe the file, not an audio language.
+        "AAC", "AC3", "EAC3", "DTS", "DTSHD", "TRUEHD", "ATMOS", "10BIT", "50FPS", "60FPS",
+        "DVDRIP", "BDRIP", "WEBRIP", "WEBDL", "WEB-DL", "HDRIP", "MP4", "MKV", "AVI", "TS", "HDTS", "HDTC", "TSHD",
+        "PROPER", "REPACK", "NTSC", "PAL", "UNRATED", "SDR", "HQ", "LQ", "BACKUP", "BKP",
+        "HDLIGHT", "4KLIGHT",
     ]
 
     /// Any tag that is not about picture quality, or a language-named category.
@@ -259,7 +289,10 @@ public struct CurationIndex: Sendable {
     ]
 
     private static func isLanguageTag(_ tag: String) -> Bool {
-        let count = tag.utf8.count
-        return count >= 2 && count <= 7 && !nonLanguageTags.contains(tag)
+        let bytes = tag.utf8
+        let count = bytes.count
+        guard count >= 2 && count <= 7, !nonLanguageTags.contains(tag) else { return false }
+        // Language codes never contain digits: "HDR10", "BD50", "2024", "60FPS" are release tags.
+        return !bytes.contains { $0 >= 0x30 && $0 <= 0x39 }
     }
 }

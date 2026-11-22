@@ -3,13 +3,13 @@ import SwiftUI
 /// `À propos` panel: title 17 bold, caps genres 10 semibold secondary, description.
 public struct AboutCard: View {
     private let title: String
-    private let subtitle: String?
+    private let subtitleCaps: String?
     private let text: String
     private let width: CGFloat?
 
     public init(title: String, subtitle: String? = nil, text: String, width: CGFloat? = 450) {
         self.title = title
-        self.subtitle = subtitle
+        subtitleCaps = subtitle?.uppercased()
         self.text = text
         self.width = width
     }
@@ -20,8 +20,8 @@ public struct AboutCard: View {
                 .font(PrismFont.aboutTitle)
                 .foregroundStyle(.primary)
                 .lineLimit(2)
-            if let subtitle, !subtitle.isEmpty {
-                Text(subtitle.uppercased())
+            if let subtitleCaps, !subtitleCaps.isEmpty {
+                Text(subtitleCaps)
                     .font(PrismFont.aboutGenres)
                     .tracking(0.2)
                     .foregroundStyle(.secondary)

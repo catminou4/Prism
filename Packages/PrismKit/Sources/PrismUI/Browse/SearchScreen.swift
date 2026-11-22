@@ -68,6 +68,7 @@ struct SearchScreen: View {
             }
             .padding(.vertical, 24)
         }
+        .prismScrollPhase()
         .task(id: isActive ? app.catalogRevision : nil, priority: .utility) {
             if isActive { app.prepareSearchIndex() }
         }

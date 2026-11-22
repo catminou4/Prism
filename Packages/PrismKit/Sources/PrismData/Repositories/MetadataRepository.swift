@@ -13,16 +13,24 @@ public actor MetadataRepository {
     public static let positiveTTL: TimeInterval = 14 * 86_400
     public static let negativeTTL: TimeInterval = 86_400
 
+    /// In-memory entries kept per cache; browsing a large catalog must not grow them forever.
+    public static let memoryLimit = 500
+
     private var client: TMDBClient?
     private var clientKey: String?
-    private var memory: [String: CacheEntry] = [:]
+    private var memory = BoundedCache<String, CacheEntry>(limit: MetadataRepository.memoryLimit)
     private var inFlight: [String: Task<Lookup, Never>] = [:]
-    private var episodeMemory: [String: [TMDBEpisodeInfo]] = [:]
+    private var episodeMemory = BoundedCache<String, EpisodeEntry>(limit: MetadataRepository.memoryLimit)
     private var trendMemory: [MediaKind: TrendCache] = [:]
     private var trendTasks: [MediaKind: TrendRequest] = [:]
 
     private struct CacheEntry {
         var metadata: TMDBMetadata?
+        var savedAt: Date
+    }
+
+    private struct EpisodeEntry {
+        var episodes: [TMDBEpisodeInfo]
         var savedAt: Date
     }
 
@@ -53,6 +61,11 @@ public actor MetadataRepository {
         self.credentials = credentials
         self.session = session
         self.language = language
+        // Metadata/episode files older than the TTL are dropped once at launch, off the main actor.
+        let directory = directories.metadataCacheDirectory
+        Task.detached(priority: .utility) {
+            AppDirectories.purgeExpiredFiles(in: directory, ttl: Self.positiveTTL)
+        }
     }
 
     /// Whether a TMDB key is configured.
@@ -76,9 +89,9 @@ public actor MetadataRepository {
         let tmdbID = title.variants.lazy.compactMap { $0.movie?.tmdbID ?? $0.series?.tmdbID }.first { $0 > 0 }
         let key = tmdbID.map { "\(title.kind.rawValue)-tmdb-\($0)" } ?? "title-\(title.id.rawValue)"
 
-        if let entry = memory[key], Self.isFresh(entry) { return entry.metadata }
-        if let entry = readDisk(key), Self.isFresh(entry) {
-            memory[key] = entry
+        if let entry = memory.value(for: key), Self.isFresh(entry) { return entry.metadata }
+        if let entry = await readDisk(key), Self.isFresh(entry) {
+            memory.insert(entry, for: key)
             return entry.metadata
         }
         if let running = inFlight[key] { return await running.value.metadata }
@@ -97,34 +110,36 @@ public actor MetadataRepository {
         inFlight[key] = nil
         switch lookup {
         case .found(let metadata):
-            store(CacheEntry(metadata: metadata, savedAt: .now), key: key)
+            await store(CacheEntry(metadata: metadata, savedAt: .now), key: key)
         case .notFound:
-            store(CacheEntry(metadata: nil, savedAt: .now), key: key)
+            await store(CacheEntry(metadata: nil, savedAt: .now), key: key)
         case .failed:
             break
         }
         return lookup.metadata
     }
 
-    private func store(_ entry: CacheEntry, key: String) {
-        memory[key] = entry
-        writeDisk(key, entry)
+    private func store(_ entry: CacheEntry, key: String) async {
+        memory.insert(entry, for: key)
+        await writeDisk(key, entry)
     }
 
     public func episodes(tmdbID: Int, season: Int) async -> [TMDBEpisodeInfo] {
         let key = "tv-\(tmdbID)-s\(season)"
-        if let cached = episodeMemory[key] { return cached }
-        let stored = readEpisodes(key)
+        if let cached = episodeMemory.value(for: key), Self.isFresh(cached.savedAt, ttl: Self.positiveTTL) {
+            return cached.episodes
+        }
+        let stored = await readEpisodes(key)
         if let stored, stored.formatVersion == Self.episodeFormatVersion {
             let episodes = stored.episodes.map(\.value)
-            episodeMemory[key] = episodes
+            episodeMemory.insert(EpisodeEntry(episodes: episodes, savedAt: stored.savedAt), for: key)
             return episodes
         }
         guard let client = currentClient(),
               let episodes = try? await client.seasonEpisodes(tmdbID: tmdbID, season: season)
         else { return stored?.episodes.map(\.value) ?? [] }
-        episodeMemory[key] = episodes
-        writeEpisodes(key, episodes)
+        episodeMemory.insert(EpisodeEntry(episodes: episodes, savedAt: .now), for: key)
+        await writeEpisodes(key, episodes)
         return episodes
     }
 
@@ -188,8 +203,12 @@ public actor MetadataRepository {
     }
 
     private static func isFresh(_ entry: CacheEntry) -> Bool {
-        let age = Date.now.timeIntervalSince(entry.savedAt)
-        return age >= 0 && age < (entry.metadata == nil ? negativeTTL : positiveTTL)
+        isFresh(entry.savedAt, ttl: entry.metadata == nil ? negativeTTL : positiveTTL)
+    }
+
+    private static func isFresh(_ savedAt: Date, ttl: TimeInterval) -> Bool {
+        let age = Date.now.timeIntervalSince(savedAt)
+        return age >= 0 && age < ttl
     }
 
     // MARK: Disk
@@ -204,14 +223,17 @@ public actor MetadataRepository {
         var metadata: StoredMetadata?
     }
 
-    private func readDisk(_ key: String) -> CacheEntry? {
+    /// Disk IO runs off the actor (JSON decode/encode + atomic write used to block it).
+    @concurrent
+    private nonisolated func readDisk(_ key: String) async -> CacheEntry? {
         guard let data = try? Data(contentsOf: file(key)),
               let stored = try? Self.decoder.decode(StoredEntry.self, from: data),
               stored.language == language else { return nil }
         return CacheEntry(metadata: stored.metadata?.value, savedAt: stored.savedAt)
     }
 
-    private func writeDisk(_ key: String, _ entry: CacheEntry) {
+    @concurrent
+    private nonisolated func writeDisk(_ key: String, _ entry: CacheEntry) async {
         let stored = StoredEntry(savedAt: entry.savedAt, language: language, metadata: entry.metadata.map(StoredMetadata.init))
         guard let data = try? Self.encoder.encode(stored) else { return }
         try? data.write(to: file(key), options: [.atomic])
@@ -226,7 +248,8 @@ public actor MetadataRepository {
         var episodes: [StoredEpisode]
     }
 
-    private func readEpisodes(_ key: String) -> StoredEpisodes? {
+    @concurrent
+    private nonisolated func readEpisodes(_ key: String) async -> StoredEpisodes? {
         guard let data = try? Data(contentsOf: file(key)),
               let stored = try? Self.decoder.decode(StoredEpisodes.self, from: data),
               stored.language == language,
@@ -234,7 +257,8 @@ public actor MetadataRepository {
         return stored
     }
 
-    private func writeEpisodes(_ key: String, _ episodes: [TMDBEpisodeInfo]) {
+    @concurrent
+    private nonisolated func writeEpisodes(_ key: String, _ episodes: [TMDBEpisodeInfo]) async {
         let stored = StoredEpisodes(
             formatVersion: Self.episodeFormatVersion, savedAt: .now, language: language, episodes: episodes.map(StoredEpisode.init)
         )

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import PrismCore
 import Security
 import Synchronization
@@ -36,7 +37,23 @@ public struct KeychainError: LocalizedError, Sendable, Equatable {
 public struct KeychainCredentialStore: CredentialStoring {
     public static let defaultService = "app.prism.credentials"
 
+    /// Memoized read outcome per account: `SecItemCopyMatching` is synchronous and callers ask
+    /// for the same secrets repeatedly (every detail/metadata/guide request). Writes update it.
+    private enum Memo: Sendable {
+        case hit(String)
+        case miss
+    }
+
+    /// `Mutex` is noncopyable: boxed so the store struct stays `Copyable` while all copies
+    /// still share the same memo.
+    private final class MemoStorage: Sendable {
+        let entries = Mutex<[String: Memo]>([:])
+    }
+
+    private static let logger = Logger(subsystem: "app.prism", category: "credentials")
+
     public let service: String
+    private let memo = MemoStorage()
 
     public init(service: String = KeychainCredentialStore.defaultService) {
         self.service = service
@@ -70,20 +87,42 @@ public struct KeychainCredentialStore: CredentialStoring {
     }
 
     private func read(account: String) -> String? {
+        if let memoized = memo.entries.withLock({ $0[account] }) {
+            if case .hit(let value) = memoized { return value }
+            return nil
+        }
         var query = baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
+                memo.entries.withLock { $0[account] = .miss }
+                return nil
+            }
+            memo.entries.withLock { $0[account] = .hit(value) }
+            return value
+        case errSecItemNotFound:
+            memo.entries.withLock { $0[account] = .miss }
+            return nil
+        default:
+            // Not cached: an unexpected status (locked keychain, ACL…) may be transient.
+            Self.logger.error("SecItemCopyMatching failed for \(account, privacy: .public): OSStatus \(status)")
+            return nil
+        }
     }
 
     private func write(_ value: String?, account: String) throws {
         let query = baseQuery(account: account)
         guard let value, !value.isEmpty else {
             let status = SecItemDelete(query as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError(status: status) }
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                Self.logger.error("SecItemDelete failed for \(account, privacy: .public): OSStatus \(status)")
+                throw KeychainError(status: status)
+            }
+            memo.entries.withLock { $0[account] = .miss }
             return
         }
         let data = Data(value.utf8)
@@ -93,6 +132,7 @@ public struct KeychainCredentialStore: CredentialStoring {
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         switch status {
         case errSecSuccess:
+            memo.entries.withLock { $0[account] = .hit(value) }
             return
         case errSecItemNotFound:
             var add = query
@@ -100,8 +140,13 @@ public struct KeychainCredentialStore: CredentialStoring {
             add[kSecAttrLabel as String] = "Prism"
             let addStatus = SecItemAdd(add as CFDictionary, nil)
             let writeStatus = addStatus == errSecDuplicateItem ? SecItemUpdate(query as CFDictionary, attributes as CFDictionary) : addStatus
-            guard writeStatus == errSecSuccess else { throw KeychainError(status: writeStatus) }
+            guard writeStatus == errSecSuccess else {
+                Self.logger.error("SecItemAdd/Update failed for \(account, privacy: .public): OSStatus \(writeStatus)")
+                throw KeychainError(status: writeStatus)
+            }
+            memo.entries.withLock { $0[account] = .hit(value) }
         default:
+            Self.logger.error("SecItemUpdate failed for \(account, privacy: .public): OSStatus \(status)")
             throw KeychainError(status: status)
         }
     }

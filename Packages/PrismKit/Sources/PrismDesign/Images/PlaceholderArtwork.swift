@@ -1,5 +1,5 @@
-import CoreGraphics
 import SwiftUI
+import Synchronization
 
 /// Deterministic neutral artwork used while an image loads or when none is available.
 ///
@@ -16,14 +16,16 @@ public struct PlaceholderArtwork: View {
         case none
     }
 
-    private let seed: String
     private let title: String?
     private let style: TitleStyle
+    private let palette: Palette
 
     public init(seed: String, title: String? = nil, style: TitleStyle = .title) {
-        self.seed = seed
         self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.style = title == nil ? .none : style
+        // Computed once per view instead of on every `body` evaluation (the palette only
+        // depends on the seed, which never changes for a given placeholder).
+        palette = Palette(seed: seed)
     }
 
     public var body: some View {
@@ -48,8 +50,7 @@ public struct PlaceholderArtwork: View {
     }
 
     private var artworkBody: some View {
-        let palette = Palette(seed: seed)
-        return ZStack {
+        ZStack {
             LinearGradient(colors: [palette.top, palette.bottom], startPoint: palette.start, endPoint: palette.end)
             RadialGradient(colors: [.white.opacity(0.10), .clear], center: palette.glowCenter, startRadius: 0, endRadius: 225)
             label
@@ -99,7 +100,16 @@ public struct PlaceholderArtwork: View {
         let end: UnitPoint
         let glowCenter: UnitPoint
 
+        /// Palettes are tiny and seeds repeat across re-evaluations; memoize so the FNV-1a +
+        /// SplitMix64 work happens once per seed instead of once per `body` pass per card.
+        private static let memo = Mutex<[String: Palette]>([:])
+        private static let memoLimit = 2_048
+
         init(seed: String) {
+            if let hit = Self.memo.withLock({ $0[seed] }) {
+                self = hit
+                return
+            }
             var rng = StableHash.Generator(seed: seed)
             top = Color(white: 0.12 + rng.unit() * 0.19)
             bottom = Color(white: 0.045 + rng.unit() * 0.045)
@@ -107,27 +117,12 @@ public struct PlaceholderArtwork: View {
             start = UnitPoint(x: 0.5 - sin(angle) * 0.5, y: 0)
             end = UnitPoint(x: 0.5 + sin(angle) * 0.5, y: 1)
             glowCenter = UnitPoint(x: 0.15 + rng.unit() * 0.7, y: 0.05 + rng.unit() * 0.35)
+            Self.memo.withLock { memo in
+                if memo.count >= Self.memoLimit { memo.removeAll(keepingCapacity: true) }
+                memo[seed] = self
+            }
         }
     }
-}
-
-/// A tiny tiling grain texture generated once.
-enum NoiseTexture {
-    static let image: Image = {
-        let side = 64
-        var rng = StableHash.Generator(seed: 0x5EED)
-        var bytes = [UInt8](repeating: 0, count: side * side)
-        for i in bytes.indices { bytes[i] = UInt8(truncatingIfNeeded: rng.next() >> 56) }
-        let data = Data(bytes) as CFData
-        guard let provider = CGDataProvider(data: data),
-              let cgImage = CGImage(
-                  width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: side,
-                  space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
-              )
-        else { return Image(systemName: "circle.fill") }
-        return Image(decorative: cgImage, scale: 2)
-    }()
 }
 
 extension String {

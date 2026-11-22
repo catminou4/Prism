@@ -50,6 +50,21 @@ enum SegmentedArchive {
         return segments
     }
 
+    /// Deletes `*.<suffix>` archives in `directory` whose embedded version differs from `version`
+    /// (or that are truncated/foreign — they can never be decoded). Reads only the 8-byte header
+    /// of each file; cheap enough to run once at launch, off the main actor.
+    static func purgeObsoleteFiles(in directory: URL, version: UInt32, suffix: String) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path(percentEncoded: false)) else { return }
+        for name in names where name.hasSuffix("." + suffix) {
+            let url = directory.appending(path: name)
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory != true else { continue }
+            let header = (try? Data(contentsOf: url, options: [.mappedIfSafe]))?.prefix(8) ?? Data()
+            let current = header.count == 8 && Array(header.prefix(4)) == magic
+                && readUInt32([UInt8](header.dropFirst(4)), at: 0) == version
+            if !current { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
     // MARK: Segments
 
     static func encodeSegment<T: Encodable>(_ value: T, tag: UInt8) throws -> Segment {

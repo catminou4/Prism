@@ -77,6 +77,10 @@ public final class LibraryStore {
     public static let maxHistory = 200
     static let maxDismissed = 2_000
     static let maxProgressEntries = 3_000
+    static let maxWatched = 20_000
+    static let maxWatchlist = 2_000
+    static let maxFavoriteChannels = 1_000
+    static let maxPreferredEntries = 5_000
 
     @ObservationIgnored private let fileURL: URL?
     @ObservationIgnored private let saveDelay: Duration
@@ -120,6 +124,7 @@ public final class LibraryStore {
     public func addToWatchlist(_ id: TitleID) {
         watchlist.removeAll { $0 == id }
         watchlist.insert(id, at: 0)
+        if watchlist.count > Self.maxWatchlist { watchlist.removeLast(watchlist.count - Self.maxWatchlist) }
         scheduleSave()
     }
 
@@ -163,6 +168,9 @@ public final class LibraryStore {
             favoriteChannels.removeAll { $0 == groupID }
         } else {
             favoriteChannels.append(groupID)
+            if favoriteChannels.count > Self.maxFavoriteChannels {
+                favoriteChannels.removeLast(favoriteChannels.count - Self.maxFavoriteChannels)
+            }
         }
         scheduleSave()
     }
@@ -174,6 +182,9 @@ public final class LibraryStore {
         let insertion = destination - valid.filter { $0 < destination }.count
         for index in valid.sorted(by: >) { favoriteChannels.remove(at: index) }
         favoriteChannels.insert(contentsOf: moving, at: min(max(insertion, 0), favoriteChannels.count))
+        if favoriteChannels.count > Self.maxFavoriteChannels {
+            favoriteChannels.removeLast(favoriteChannels.count - Self.maxFavoriteChannels)
+        }
         scheduleSave()
     }
 
@@ -199,6 +210,7 @@ public final class LibraryStore {
         progress[value.contentID] = value
         if value.isFinished, !watched.contains(value.contentID) { watched.insert(value.contentID) }
         pruneProgressIfNeeded()
+        pruneWatchedIfNeeded()
         scheduleSave()
     }
 
@@ -216,6 +228,7 @@ public final class LibraryStore {
             contentID: id, titleID: titleID ?? existing?.titleID, position: duration, duration: duration, updatedAt: .now
         )
         pruneProgressIfNeeded()
+        pruneWatchedIfNeeded()
         scheduleSave()
     }
 
@@ -470,6 +483,18 @@ public final class LibraryStore {
         progress = Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
     }
 
+    /// `watched` has no timestamps: entries without a progress entry are the oldest (progress
+    /// itself keeps only the 3 000 most recent), then the oldest resume points go first.
+    private func pruneWatchedIfNeeded() {
+        guard watched.count > Self.maxWatched else { return }
+        let ordered = watched.sorted { lhs, rhs in
+            let l = progress[lhs]?.updatedAt ?? .distantPast
+            let r = progress[rhs]?.updatedAt ?? .distantPast
+            return l == r ? lhs.rawValue < rhs.rawValue : l > r
+        }
+        watched = Set(ordered.prefix(Self.maxWatched))
+    }
+
     private func snapshot() -> @Sendable () -> LibraryFile {
         { [watchlist, favoriteChannels, progress, watched, history, preferredVariants,
            preferredChannelVariants, storedLastChannelGroupID, dismissed] in
@@ -487,15 +512,24 @@ public final class LibraryStore {
         }
     }
 
+    /// A hand-edited or corrupt `library.json` must not grow the in-memory state without bound:
+    /// every collection is capped here (and again on mutation).
     private func apply(_ file: LibraryFile) {
-        watchlist = file.watchlist
-        favoriteChannels = file.favoriteChannels
+        watchlist = Array(file.watchlist.prefix(Self.maxWatchlist))
+        favoriteChannels = Array(file.favoriteChannels.prefix(Self.maxFavoriteChannels))
         progress = Dictionary(file.progress.map { ($0.contentID, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
         pruneProgressIfNeeded()
         watched = Set(file.watched)
+        pruneWatchedIfNeeded()
         history = Array(file.history.prefix(Self.maxHistory))
-        preferredVariants = Dictionary(file.preferredVariants.map { (TitleID(rawValue: $0.key), $0.contentID) }, uniquingKeysWith: { a, _ in a })
-        preferredChannelVariants = Dictionary(file.preferredChannelVariants.map { ($0.key, $0.contentID) }, uniquingKeysWith: { a, _ in a })
+        preferredVariants = Dictionary(
+            file.preferredVariants.prefix(Self.maxPreferredEntries).map { (TitleID(rawValue: $0.key), $0.contentID) },
+            uniquingKeysWith: { a, _ in a }
+        )
+        preferredChannelVariants = Dictionary(
+            file.preferredChannelVariants.prefix(Self.maxPreferredEntries).map { ($0.key, $0.contentID) },
+            uniquingKeysWith: { a, _ in a }
+        )
         storedLastChannelGroupID = file.lastChannelGroupID
         dismissed = Array(file.dismissed.prefix(Self.maxDismissed))
     }

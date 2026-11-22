@@ -104,9 +104,21 @@ private struct TitleDetailContent: View {
             ?? inventory?.seasons.first
     }
     private var heroEpisode: Episode? {
-        guard let inventory else { return nil }
+        // Hidden pages skip every library read so playback ticks (~5 s) do not
+        // re-evaluate them; reads resume when the page becomes active again.
+        guard isPageActive, let inventory else { return nil }
         let library = app.library
-        let latest = inventory.latestProgress(in: library.progress)
+        // The store memoizes the per-title latest progress: when it belongs to
+        // this edition it is also the edition's latest (the common case while
+        // playing). Otherwise fall back to the per-edition scan, which also
+        // covers progress entries whose titleID was never recorded.
+        let latest: PlaybackProgress?
+        if let titleLatest = library.latestProgress(forTitle: title.id),
+           inventory.contains(titleLatest.contentID) {
+            latest = titleLatest
+        } else {
+            latest = inventory.latestProgress(in: library.progress)
+        }
         return inventory.nextEpisode(after: latest, isWatched: library.isWatched)
     }
     private var seasonLookup: SeasonLookup {
@@ -229,7 +241,7 @@ private struct TitleDetailContent: View {
         let episode = heroEpisode
         let edition = title.kind == .series ? inventory?.edition ?? activeEdition : activeEdition
         let option = edition.flatMap { TitlePlaybackOption(edition: $0, episode: episode) }
-        let progress = option.flatMap { resumeProgress(for: $0) }
+        let progress = isPageActive ? option.flatMap { resumeProgress(for: $0) } : nil
         let resuming = progress != nil
         let facts = [
             title.kind == .series ? "Série" : "Film",
@@ -362,8 +374,10 @@ private struct TitleDetailContent: View {
     }
 
     private func episodeCard(_ episode: Episode, metadata: TMDBEpisodeInfo?) -> some View {
-        let progress = app.library.progress(for: episode.id)
-        let watched = app.library.isWatched(episode.id)
+        // Skip library reads while the page is hidden: they would subscribe this
+        // subtree to every playback tick for an invisible page.
+        let progress = isPageActive ? app.library.progress(for: episode.id) : nil
+        let watched = isPageActive ? app.library.isWatched(episode.id) : false
         return DetailEpisodeTile(
             episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched
         ) {

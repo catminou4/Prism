@@ -43,19 +43,28 @@ public enum XtreamDecoder {
     static func serverURL(_ info: JSONObject) -> URL? {
         guard let host = info.string("url") else { return nil }
         let scheme = info.string("server_protocol")?.lowercased() == "https" ? "https" : "http"
-        let port = scheme == "https" ? (info.string("https_port") ?? info.string("port")) : info.string("port")
-        var string = host.contains("://") ? host : "\(scheme)://\(host)"
-        if let port, !port.isEmpty, !host.contains("://"), Int(port) != nil, port != "80" || scheme != "http", port != "443" || scheme != "https" {
-            string += ":\(port)"
+        // `url` may be "host", "host:port", "//host" or already carry a scheme.
+        let string = host.hasPrefix("//") ? "\(scheme):\(host)" : host.contains("://") ? host : "\(scheme)://\(host)"
+        // Userinfo in a panel-reported URL is rejected rather than silently dropped.
+        guard var components = URLComponents(string: string),
+              components.user == nil, components.password == nil,
+              components.host != nil else { return nil }
+        if components.port == nil, !host.contains("://"),
+           let port = scheme == "https" ? (info.string("https_port") ?? info.string("port")) : info.string("port"),
+           let number = Int(port), (1...65_535).contains(number),
+           !(scheme == "http" && number == 80), !(scheme == "https" && number == 443) {
+            components.port = number
         }
-        return XtreamCredentials.normalizeServer(string)
+        return XtreamCredentials.normalizeServer(components.string ?? string)
     }
 
     // MARK: Categories
 
     public static func categories(_ data: Data, kind: MediaKind, sourceID: SourceID) throws -> [Category] {
+        let items = try elements(data)
         var result: [Category] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("category_id") else { continue }
             let raw = obj.string("category_name") ?? "Sans nom"
             result.append(Category(
@@ -78,8 +87,11 @@ public enum XtreamDecoder {
         let canTS = formats.isEmpty || formats.contains("ts") || formats.contains("mpegts")
         let primaryIsHLS = (preferHLS && canHLS) || !canTS
 
+        // Parse first so `data` is dead before the per-item mapping loop.
+        let items = try elements(data)
         var result: [Channel] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("stream_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Chaîne \(id)"
             let n = TitleNormalizer.normalize(rawName)
@@ -118,8 +130,10 @@ public enum XtreamDecoder {
     public static func vodStreams(
         _ data: Data, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
     ) throws -> [Movie] {
+        let items = try elements(data)
         var result: [Movie] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("stream_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Film \(id)"
             let n = TitleNormalizer.normalize(rawName)
@@ -157,8 +171,10 @@ public enum XtreamDecoder {
     // MARK: Series
 
     public static func series(_ data: Data, sourceID: SourceID, adultCategoryIDs: Set<String> = []) throws -> [Series] {
+        let items = try elements(data)
         var result: [Series] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("series_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Série \(id)"
             let n = TitleNormalizer.normalize(rawName)

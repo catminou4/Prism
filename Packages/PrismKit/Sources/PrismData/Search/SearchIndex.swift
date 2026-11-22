@@ -50,6 +50,9 @@ public final class SearchIndex: Sendable {
     /// Unique words in bytewise order, flattened; `wordOffsets.count == wordCount + 1`.
     let wordBytes: [UInt8]
     let wordOffsets: [Int32]
+    /// Per-word 64-bit signature of contained byte values (mod 64): the substring fallback
+    /// skips words that cannot contain the token's first byte without calling `memmem`.
+    let wordMasks: [UInt64]
     /// Entries containing each word (by rank), flattened; `postingOffsets.count == wordCount + 1`.
     let postings: [Int32]
     let postingOffsets: [Int32]
@@ -66,6 +69,7 @@ public final class SearchIndex: Sendable {
         nameBytes = []; nameOffsets = [0]
         entryWords = []; entryWordOffsets = [0]
         wordBytes = []; wordOffsets = [0]
+        wordMasks = []
         postings = []; postingOffsets = [0]
     }
 
@@ -73,7 +77,7 @@ public final class SearchIndex: Sendable {
         channels: [ChannelGroup], movies: [MediaTitle], series: [MediaTitle],
         baseScores: [UInt64],
         nameBytes: [UInt8], nameOffsets: [Int32], entryWords: [Int32], entryWordOffsets: [Int32],
-        wordBytes: [UInt8], wordOffsets: [Int32], postings: [Int32], postingOffsets: [Int32]
+        wordBytes: [UInt8], wordOffsets: [Int32], wordMasks: [UInt64], postings: [Int32], postingOffsets: [Int32]
     ) {
         self.channels = channels
         self.movies = movies
@@ -87,6 +91,7 @@ public final class SearchIndex: Sendable {
         self.entryWordOffsets = entryWordOffsets
         self.wordBytes = wordBytes
         self.wordOffsets = wordOffsets
+        self.wordMasks = wordMasks
         self.postings = postings
         self.postingOffsets = postingOffsets
     }
@@ -254,12 +259,23 @@ public final class SearchIndex: Sendable {
             }
         }
 
+        // Per-word byte-class signature for the substring fallback.
+        var wordMasks = [UInt64](repeating: 0, count: order.count)
+        for rank in 0..<order.count {
+            let w0 = Int(wordOffsets[rank]), w1 = Int(wordOffsets[rank + 1])
+            var mask: UInt64 = 0
+            for position in w0..<w1 {
+                mask |= UInt64(1) << (wordBytes[position] & 63)
+            }
+            wordMasks[rank] = mask
+        }
+
         return SearchIndex(
             channels: channels, movies: movies, series: series,
             baseScores: baseScores,
             nameBytes: nameBytes, nameOffsets: nameOffsets,
             entryWords: entryWords, entryWordOffsets: entryWordOffsets,
-            wordBytes: wordBytes, wordOffsets: wordOffsets,
+            wordBytes: wordBytes, wordOffsets: wordOffsets, wordMasks: wordMasks,
             postings: postings, postingOffsets: postingOffsets
         )
     }
@@ -371,6 +387,7 @@ public final class SearchIndex: Sendable {
         let entryWordOffsets: UnsafeBufferPointer<Int32>
         let wordBytes: UnsafeBufferPointer<UInt8>
         let wordOffsets: UnsafeBufferPointer<Int32>
+        let wordMasks: UnsafeBufferPointer<UInt64>
         let postings: UnsafeBufferPointer<Int32>
         let postingOffsets: UnsafeBufferPointer<Int32>
         var wordCount: Int { wordOffsets.count - 1 }
@@ -385,14 +402,15 @@ public final class SearchIndex: Sendable {
         entryWordOffsets.withUnsafeBufferPointer { entryWordOffsets in
         wordBytes.withUnsafeBufferPointer { wordBytes in
         wordOffsets.withUnsafeBufferPointer { wordOffsets in
+        wordMasks.withUnsafeBufferPointer { wordMasks in
         postings.withUnsafeBufferPointer { postings in
         postingOffsets.withUnsafeBufferPointer { postingOffsets in
             body(Raw(
                 baseScores: baseScores, nameBytes: nameBytes, nameOffsets: nameOffsets,
                 entryWords: entryWords, entryWordOffsets: entryWordOffsets, wordBytes: wordBytes,
-                wordOffsets: wordOffsets, postings: postings, postingOffsets: postingOffsets
+                wordOffsets: wordOffsets, wordMasks: wordMasks, postings: postings, postingOffsets: postingOffsets
             ))
-        }}}}}}}}}
+        }}}}}}}}}}
     }
 
     /// Returns `false` when no entry prefix-matches every token.
@@ -467,7 +485,11 @@ public final class SearchIndex: Sendable {
             maps.append(map)
             var volume = 0
             token.withUnsafeBufferPointer { t in
+                // First-byte prefilter: a word can only contain the token if it contains the
+                // token's first byte, so words lacking that byte class are skipped outright.
+                let needed = UInt64(1) << (t[0] & 63)
                 for rank in 0..<wordCount {
+                    guard raw.wordMasks[rank] & needed != 0 else { continue }
                     let w0 = Int(raw.wordOffsets[rank]), w1 = Int(raw.wordOffsets[rank + 1])
                     if containsBytes(raw.wordBytes, w0, w1 - w0, t) {
                         map[rank] = 1

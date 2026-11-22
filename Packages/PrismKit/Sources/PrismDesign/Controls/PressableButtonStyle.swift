@@ -51,12 +51,19 @@ public struct CardButtonStyle: ButtonStyle {
         @State private var isHovered = false
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
         @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.prismIsScrollingContent) private var isScrollingContent
 
         var body: some View {
             configuration.label
                 .contentShape(.rect)
-                .hoverLiftEffect(isHovered: isHovered && isEnabled, isPressed: configuration.isPressed, scale: hoverScale, pressedScale: pressedScale, shadow: shadow, reduceMotion: reduceMotion)
-                .onHover { isHovered = $0 }
+                .hoverLiftEffect(isHovered: isHovered && isEnabled && !isScrollingContent, isPressed: configuration.isPressed, scale: hoverScale, pressedScale: pressedScale, shadow: shadow, reduceMotion: reduceMotion)
+                .onHover { inside in
+                    guard !isScrollingContent else { return }
+                    isHovered = inside
+                }
+                .onChange(of: isScrollingContent) { _, scrolling in
+                    if !scrolling { isHovered = false }
+                }
         }
     }
 }

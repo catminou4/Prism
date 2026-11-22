@@ -1,0 +1,199 @@
+import Foundation
+import PrismCore
+import Testing
+@testable import PrismData
+
+/// Coverage for the bounded caches, cheap archive-header reads, disk hygiene and the
+/// in-flight deduplication added for the 120 Hz fluidity pass.
+struct BoundedCachesTests {
+    typealias F = Fixture
+
+    @Test func boundedCacheEvictsOldestAndRefreshesOrder() {
+        var cache = BoundedCache<String, Int>(limit: 3)
+        cache.insert(1, for: "a")
+        cache.insert(2, for: "b")
+        cache.insert(3, for: "c")
+        #expect(cache.count == 3)
+        #expect(cache.value(for: "a") == 1) // read marks "a" as recent: "b" is now the oldest
+        cache.insert(4, for: "d")
+        #expect(cache.value(for: "b") == nil)
+        #expect(cache.value(for: "a") == 1)
+        #expect(cache.value(for: "d") == 4)
+        #expect(cache.count == 3)
+        // Reads refreshed "a" and "d"; "c" is now the least recently used entry.
+        cache.insert(5, for: "e")
+        #expect(cache.value(for: "c") == nil, "inserting past the limit evicts the least recently used")
+        #expect(cache.value(for: "a") == 1)
+        #expect(cache.value(for: "e") == 5)
+        #expect(cache.count == 3)
+    }
+
+    @Test func epgFetchedAtReadsTheArchiveHeaderOnly() async throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let cache = EPGCache(directories: directories, version: EPGCache.formatVersion)
+        #expect(await cache.fetchedAt(F.a) == nil)
+        let programs = [F.program("tf1.fr", 0, 30, "Journal")]
+        try await cache.save(.init(programs: programs, fetchedAt: F.reference), for: F.a)
+        #expect(await cache.fetchedAt(F.a) == F.reference)
+        #expect(await cache.fetchedAt(F.b) == nil, "another source id never matches the header")
+    }
+
+    @Test func obsoleteArchiveVersionsArePurged() async throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let directory = directories.caches.appending(path: "Catalogs", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let catalog = SourceCatalog(sourceID: F.a, fetchedAt: F.reference)
+        let current = try await CatalogCache.encode(catalog, version: CatalogCache.formatVersion)
+        let foreign = try await CatalogCache.encode(catalog, version: CatalogCache.formatVersion + 1)
+        let urls = ["good.catalog", "old.catalog", "junk.catalog", "note.txt"]
+        for (name, data) in zip(urls, [current, foreign, Data("junk".utf8), Data("keep".utf8)]) {
+            try data.write(to: directory.appending(path: name))
+        }
+        try FileManager.default.createDirectory(at: directory.appending(path: "dir.catalog"), withIntermediateDirectories: true)
+
+        await Task.detached(priority: .utility) {
+            SegmentedArchive.purgeObsoleteFiles(in: directory, version: CatalogCache.formatVersion, suffix: "catalog")
+        }.value
+
+        #expect(FileManager.default.fileExists(atPath: directory.appending(path: "good.catalog").path))
+        #expect(!FileManager.default.fileExists(atPath: directory.appending(path: "old.catalog").path))
+        #expect(!FileManager.default.fileExists(atPath: directory.appending(path: "junk.catalog").path))
+        #expect(FileManager.default.fileExists(atPath: directory.appending(path: "note.txt").path), "other suffixes are untouched")
+        #expect(FileManager.default.fileExists(atPath: directory.appending(path: "dir.catalog").path), "directories are untouched")
+    }
+
+    @MainActor
+    @Test func loadedLibraryCollectionsAreCapped() throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        var file = LibraryFile(
+            watchlist: [], favoriteChannels: [], progress: [], watched: [], history: [],
+            preferredVariants: [], preferredChannelVariants: [], lastChannelGroupID: nil, dismissed: []
+        )
+        file.watchlist = (0..<(LibraryStore.maxWatchlist + 25)).map { TitleID(rawValue: "movie:w\($0):") }
+        file.favoriteChannels = (0..<(LibraryStore.maxFavoriteChannels + 5)).map { "group-\($0)" }
+        file.watched = (0..<(LibraryStore.maxWatched + 10)).map {
+            ContentID(source: F.a, kind: .movie, nativeID: "w\($0)")
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(file).write(to: directories.libraryFile)
+
+        let store = LibraryStore(directories: directories)
+        #expect(store.watchlist.count == LibraryStore.maxWatchlist)
+        #expect(store.favoriteChannels.count == LibraryStore.maxFavoriteChannels)
+        #expect(store.watched.count == LibraryStore.maxWatched)
+    }
+
+    @Test func concurrentSeriesCastLookupsShareOneRequest() async throws {
+        let host = StubURLProtocol.uniqueHost("tvmaze-dedup")
+        StubURLProtocol.register(host: host) { request in
+            Thread.sleep(forTimeInterval: 0.15)
+            switch request.url?.path {
+            case "/search/shows":
+                return .json(#"[{"show":{"id":51,"name":"Lupin","premiered":"2021-01-08","url":"https://www.tvmaze.com/shows/51/lupin"}}]"#)
+            case "/shows/51/cast":
+                return .json(#"[{"person":{"id":4,"name":"Omar Sy","image":null},"character":{"name":"Assane Diop"}}]"#)
+            default:
+                return .text("Missing", status: 404)
+            }
+        }
+        defer { StubURLProtocol.unregister(host: host) }
+        let repository = SeriesCastRepository(session: StubURLProtocol.session(), host: host)
+        async let first = repository.cast(title: "Lupin", year: 2021)
+        async let second = repository.cast(title: "Lupin", year: 2021)
+        let (a, b) = await (first, second)
+        #expect(a?.people.count == 1)
+        #expect(b?.people.count == 1)
+        #expect(StubURLProtocol.requestCount(host: host) == 2, "one search + one cast request, shared")
+    }
+
+    @Test func concurrentEPGRefreshesShareOneDownload() async throws {
+        let host = StubURLProtocol.uniqueHost("epg-dedup")
+        StubURLProtocol.register(host: host) { _ in
+            Thread.sleep(forTimeInterval: 0.15)
+            return .text(Self.xmltvBody)
+        }
+        defer { StubURLProtocol.unregister(host: host) }
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let repository = EPGRepository(directories: directories, credentials: InMemoryCredentialStore(), session: StubURLProtocol.session())
+        let source = Source(id: "epg-dedup-src", name: "Nova", kind: .m3uURL, serverURL: URL(string: "https://\(host)/list.m3u"))
+        let feed = URL(string: "https://\(host)/epg.xml")!
+        async let first = repository.refresh(source, playlistEPGURLs: [feed])
+        async let second = repository.refresh(source, playlistEPGURLs: [feed])
+        let (a, b) = try await (first, second)
+        #expect(a.programCount == b.programCount)
+        #expect(StubURLProtocol.requestCount(host: host) == 1, "one XMLTV download shared by both callers")
+        #expect(await repository.lastFetched(source.id) != nil)
+    }
+
+    @Test func epgRefreshDownloadsFeedsInParallelAndMergesThem() async throws {
+        let host = StubURLProtocol.uniqueHost("epg-parallel")
+        StubURLProtocol.register(host: host) { request in
+            Thread.sleep(forTimeInterval: 0.05)
+            return .text(request.url?.lastPathComponent == "a.xml" ? Self.xmltvBodyA : Self.xmltvBodyB)
+        }
+        defer { StubURLProtocol.unregister(host: host) }
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let repository = EPGRepository(directories: directories, credentials: InMemoryCredentialStore(), session: StubURLProtocol.session())
+        let source = Source(id: "epg-parallel-src", name: "Nova", kind: .m3uURL, serverURL: URL(string: "https://\(host)/list.m3u"))
+        let guide = try await repository.refresh(source, playlistEPGURLs: [
+            URL(string: "https://\(host)/a.xml")!, URL(string: "https://\(host)/b.xml")!,
+        ])
+        #expect(StubURLProtocol.requestCount(host: host) == 2)
+        #expect(guide.programCount == 2, "one programme per feed, merged")
+        #expect(Set(guide.allPrograms.map(\.channelID)) == ["ch.a", "ch.b"])
+    }
+
+    // MARK: - XMLTV fixtures (dates inside the refresh window)
+
+    private static var xmltvBody: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        let now = Date.now
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <tv>
+          <channel id="ch.a"><display-name>Chaîne A</display-name></channel>
+          <programme start="\(formatter.string(from: now.addingTimeInterval(-1_800)))" stop="\(formatter.string(from: now.addingTimeInterval(1_800)))" channel="ch.a"><title>Journal</title></programme>
+        </tv>
+        """
+    }
+
+    private static var xmltvBodyA: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        let now = Date.now
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <tv>
+          <channel id="ch.a"><display-name>Chaîne A</display-name></channel>
+          <programme start="\(formatter.string(from: now.addingTimeInterval(-1_800)))" stop="\(formatter.string(from: now.addingTimeInterval(1_800)))" channel="ch.a"><title>A</title></programme>
+        </tv>
+        """
+    }
+
+    private static var xmltvBodyB: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        let now = Date.now
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <tv>
+          <channel id="ch.b"><display-name>Chaîne B</display-name></channel>
+          <programme start="\(formatter.string(from: now.addingTimeInterval(-1_800)))" stop="\(formatter.string(from: now.addingTimeInterval(1_800)))" channel="ch.b"><title>B</title></programme>
+        </tv>
+        """
+    }
+}

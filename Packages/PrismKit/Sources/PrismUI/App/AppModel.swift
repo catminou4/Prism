@@ -61,7 +61,12 @@ public final class AppModel {
     /// Last refresh error per source (French, user-facing).
     public private(set) var errors: [SourceID: String] = [:]
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
+    /// `true` while at least one EPG refresh runs (was a plain flag that flipped
+    /// back early when a second refresh overlapped).
     public private(set) var isRefreshingGuide = false
+    /// Grouped-item counts per source, computed once per catalogue publish
+    /// (`countsBySource`) — replaces the per-page O(catalogue) `Catalog.counts(for:)`.
+    public private(set) var sourceCounts: [SourceID: ImportCounts] = [:]
     public private(set) var isMetadataEnabled = false
     /// Signals behind the curated shelves; rebuilt in the background after each catalogue.
     @ObservationIgnored public private(set) var curationIndex = CurationIndex.empty
@@ -91,7 +96,18 @@ public final class AppModel {
     @ObservationIgnored private var rebuildGeneration = 0
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceCountsTask: Task<Void, Never>?
     @ObservationIgnored private var didBootstrap = false
+    /// Guide refreshes in flight, one per source: concurrent requests for the same
+    /// source share the task instead of downloading the XMLTV twice.
+    @ObservationIgnored private var guideTasks: [SourceID: Task<Int, Never>] = [:]
+    /// Number of EPG refreshes running (drives `isRefreshingGuide`).
+    @ObservationIgnored private var activeGuideRefreshes = 0
+    /// Bounded import concurrency: catalogue refreshes fetch + decode whole playlists,
+    /// so `refreshAll`/bootstrap/import must not fan out unboundedly.
+    @ObservationIgnored private var importSlots = 0
+    @ObservationIgnored private var importSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    private static let maxConcurrentImports = 3
 
     private enum Keys {
         static let hideAdult = "prism.hideAdultContent"
@@ -339,7 +355,7 @@ public final class AppModel {
                        self.source(source.id) != nil {
                         self.remove(source.id)
                     } else if !isNew, !(error is CancellationError), !(error is SourceImportBusy) {
-                        self.errors[source.id] = error.localizedDescription
+                        self.errors[source.id] = UserFacingError.message(for: error)
                     }
                     continuation.finish(throwing: error)
                 }
@@ -360,8 +376,11 @@ public final class AppModel {
         do {
             try await performImport(id) { _ in }
         } catch is CancellationError {
+        } catch is SourceImportBusy {
+            // Another import grabbed the slot first: silent no-op, like the
+            // early `imports[id]` guard above.
         } catch {
-            errors[id] = error.localizedDescription
+            errors[id] = UserFacingError.message(for: error)
         }
     }
 
@@ -381,7 +400,7 @@ public final class AppModel {
             do {
                 try credentials.setPassword(password, for: source.id)
             } catch {
-                errors[source.id] = error.localizedDescription
+                errors[source.id] = UserFacingError.message(for: error)
                 return false
             }
         }
@@ -487,15 +506,27 @@ public final class AppModel {
     @discardableResult
     public func refreshGuide(for id: SourceID) async -> Int {
         guard let source = source(id), source.isEnabled else { return 0 }
-        isRefreshingGuide = true
-        defer { isRefreshingGuide = false }
-        do {
-            let sourceGuide = try await epgRepository.refresh(source, playlistEPGURLs: catalogRepository.playlistEPGURLs(for: id))
-            guide = await epgRepository.currentGuide(for: sources)
-            return sourceGuide.programCount
-        } catch {
-            return 0
+        // Une seule requête EPG par source à la fois : les appels concurrents
+        // (bouton « Actualiser », fin d'import, bootstrap) partagent la tâche.
+        if let task = guideTasks[id] { return await task.value }
+        let task = Task { @MainActor in
+            defer {
+                guideTasks[id] = nil
+                activeGuideRefreshes -= 1
+                isRefreshingGuide = activeGuideRefreshes > 0
+            }
+            do {
+                let sourceGuide = try await epgRepository.refresh(source, playlistEPGURLs: catalogRepository.playlistEPGURLs(for: id))
+                guide = await epgRepository.currentGuide(for: sources)
+                return sourceGuide.programCount
+            } catch {
+                return 0
+            }
         }
+        guideTasks[id] = task
+        activeGuideRefreshes += 1
+        isRefreshingGuide = true
+        return await task.value
     }
 
     // MARK: Private
@@ -520,12 +551,32 @@ public final class AppModel {
     }
 
     private func performImport(_ id: SourceID, report: (ImportProgress) -> Void) async throws {
+        guard source(id) != nil else { return }
+        // Au plus `maxConcurrentImports` imports lourds (fetch + décodage) en
+        // parallèle, que ce soit via `refreshAll`, le bootstrap ou l'onboarding.
+        try await withImportSlot {
+            // Une source supprimée ou déjà importée pendant l'attente du slot
+            // ne doit pas repartir : `imports[id]` n'est posé qu'une fois le slot acquis.
+            guard imports[id] == nil else { throw SourceImportBusy() }
+            try await performImportHeld(id, report: report)
+        }
+    }
+
+    private func performImportHeld(_ id: SourceID, report: (ImportProgress) -> Void) async throws {
+        try Task.checkCancellation()
         guard let source = source(id) else { return }
         errors[id] = nil
         imports[id] = ImportProgress(stage: .connecting, fraction: 0)
         defer { imports[id] = nil }
 
         var finished: ImportProgress?
+        // `imports` est une seule propriété observée : chaque écriture réévalue
+        // toutes ses lectrices (badges latéraux, barre de progression). Les
+        // événements arrivent toutes les ~512 Ko ; on n'écrit qu'au changement
+        // de pourcent ou au plus ~8×/s. Le flux `report` (fiche d'import)
+        // continue de recevoir chaque étape.
+        var lastProgressWrite = Date.distantPast
+        var lastProgressPercent = -1
         for try await progress in catalogRepository.refresh(source) {
             try Task.checkCancellation()
             if progress.stage == .finished {
@@ -533,7 +584,13 @@ public final class AppModel {
             } else {
                 var playlistProgress = progress
                 playlistProgress.fraction *= 0.91
-                imports[id] = playlistProgress
+                let percent = Int((playlistProgress.fraction * 100).rounded())
+                let now = Date.now
+                if percent != lastProgressPercent || now.timeIntervalSince(lastProgressWrite) >= 0.12 {
+                    imports[id] = playlistProgress
+                    lastProgressPercent = percent
+                    lastProgressWrite = now
+                }
                 report(playlistProgress)
             }
         }
@@ -558,7 +615,12 @@ public final class AppModel {
         let guideDone = ImportProgress(stage: .guide(counts.programs), counts: counts, fraction: 0.98)
         imports[id] = guideDone
         report(guideDone)
-        await waitForCurrentCatalog(includingSearch: true)
+        // L'index de recherche et l'index de curation continuent de se construire
+        // en arrière-plan : la fiche peut afficher « Tout est prêt » sans attendre
+        // (les écrans gèrent l'index absent — placeholder de recherche, shelves
+        // recomposées à la première `curationRevision`). On attend seulement le
+        // catalogue courant, ce qui protège contre un rebuild concurrent.
+        await waitForCurrentCatalog()
         try Task.checkCancellation()
         report(ImportProgress(stage: .finished, counts: counts, fraction: 1, catalog: catalog, epgURLs: finished.epgURLs))
     }
@@ -611,6 +673,44 @@ public final class AppModel {
         }
         searchTask?.cancel()
         searchTask = nil
+        // Comptages par source pour les fiches Sources : un seul passage sur le
+        // catalogue par publication, au lieu de 3 scans O(catalogue) par page.
+        sourceCountsTask?.cancel()
+        let countsRevision = catalogRevision
+        sourceCountsTask = Task { [weak self] in
+            let counts = await Self.countsBySource(in: built)
+            guard !Task.isCancelled, let self, self.catalogRevision == countsRevision else { return }
+            self.sourceCounts = counts
+        }
+    }
+
+    /// One pass over the catalogue: how many grouped items offer a variant per
+    /// source (same semantics as `Catalog.counts(for:)`, for every source at once).
+    @concurrent private static func countsBySource(in catalog: Catalog) async -> [SourceID: ImportCounts] {
+        var channels: [SourceID: Int] = [:]
+        var movies: [SourceID: Int] = [:]
+        var series: [SourceID: Int] = [:]
+        for group in catalog.channels {
+            for source in Set(group.variants.map(\.sourceID)) {
+                channels[source, default: 0] += 1
+            }
+        }
+        for title in catalog.movies {
+            for source in Set(title.variants.map(\.sourceID)) {
+                movies[source, default: 0] += 1
+            }
+        }
+        for title in catalog.series {
+            for source in Set(title.variants.map(\.sourceID)) {
+                series[source, default: 0] += 1
+            }
+        }
+        var result: [SourceID: ImportCounts] = [:]
+        for id in Set(channels.keys).union(movies.keys).union(series.keys) {
+            result[id] = ImportCounts(channels: channels[id] ?? 0, movies: movies[id] ?? 0,
+                                      series: series[id] ?? 0)
+        }
+        return result
     }
 
     /// Warm the index when Search opens or when a caller explicitly awaits a searchable catalogue.
@@ -624,6 +724,44 @@ public final class AppModel {
             guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
             self.searchIndex = index
             self.searchTask = nil
+        }
+    }
+
+    /// Runs `body` holding one of `maxConcurrentImports` slots; extra callers wait
+    /// FIFO. Cancellation while waiting resumes with `false` so no waiter is stuck.
+    private func withImportSlot<T>(_ body: () async throws -> T) async throws -> T {
+        guard await acquireImportSlot() else { throw CancellationError() }
+        defer { releaseImportSlot() }
+        return try await body()
+    }
+
+    private func acquireImportSlot() async -> Bool {
+        if importSlots < Self.maxConcurrentImports {
+            importSlots += 1
+            return true
+        }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                importSlotWaiters.append((id, continuation))
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let index = self.importSlotWaiters.firstIndex(where: { $0.id == id })
+                else { return }
+                self.importSlotWaiters.remove(at: index).continuation.resume(returning: false)
+            }
+        }
+    }
+
+    private func releaseImportSlot() {
+        // The slot transfers straight to the next waiter instead of being freed.
+        if let next = importSlotWaiters.first {
+            importSlotWaiters.removeFirst()
+            next.continuation.resume(returning: true)
+        } else {
+            importSlots -= 1
         }
     }
 
@@ -644,4 +782,26 @@ public final class AppModel {
 
 private struct SourceImportBusy: LocalizedError {
     var errorDescription: String? { "Cette source est déjà en cours d’importation." }
+}
+
+/// French, user-facing error messages for `AppModel.errors` and the source sheet.
+/// `AddSourceView.displayError` delegates here so both surfaces share the same wording
+/// (raw `localizedDescription` can leak English URLError/CocoaError text).
+enum UserFacingError {
+    static func message(for error: any Error) -> String {
+        if error is KeychainError { return error.localizedDescription }
+        if let error = error as? SourceError {
+            if case .network = error {
+                return "Connexion à la source impossible. Vérifiez l’adresse et réessayez."
+            }
+            return error.localizedDescription
+        }
+        if let error = error as? XtreamError {
+            if case .network = error {
+                return "Connexion au serveur impossible. Vérifiez l’adresse et réessayez."
+            }
+            return error.localizedDescription
+        }
+        return "L’importation a échoué. Vérifiez les informations de la source et réessayez."
+    }
 }

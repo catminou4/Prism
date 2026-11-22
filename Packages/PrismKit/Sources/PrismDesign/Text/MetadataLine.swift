@@ -2,13 +2,13 @@ import SwiftUI
 
 /// `[glyph] Série TV · Thriller · Mystery [16+]` — items joined with ` · `.
 public struct MetadataLine<Trailing: View>: View {
-    private let items: [String]
+    private let text: String
     private let leadingGlyph: Image?
     private let font: Font
     private let trailing: Trailing
 
     public init(items: [String], leadingGlyph: Image? = nil, font: Font = PrismFont.heroMeta, @ViewBuilder trailingBadge: () -> Trailing) {
-        self.items = items.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        text = items.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.joined(separator: " · ")
         self.leadingGlyph = leadingGlyph
         self.font = font
         self.trailing = trailingBadge()
@@ -22,7 +22,7 @@ public struct MetadataLine<Trailing: View>: View {
                     .scaledToFit()
                     .frame(width: 14, height: 14)
             }
-            Text(items.joined(separator: " · "))
+            Text(text)
                 .font(font)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -40,18 +40,18 @@ extension MetadataLine where Trailing == EmptyView {
 
 /// `2022 · 57 min` followed by badges — the hero tech line.
 public struct TechLine: View {
-    private let items: [String]
+    private let text: String
     private let badges: [BadgeSpec]
 
     public init(items: [String], badges: [BadgeSpec] = []) {
-        self.items = items.filter { !$0.isEmpty }
+        text = items.filter { !$0.isEmpty }.joined(separator: " · ")
         self.badges = badges
     }
 
     public var body: some View {
         HStack(spacing: 8) {
-            if !items.isEmpty {
-                Text(items.joined(separator: " · "))
+            if !text.isEmpty {
+                Text(text)
                     .font(PrismFont.techLine)
                     .lineLimit(1)
                     .fixedSize()

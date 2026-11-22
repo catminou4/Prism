@@ -388,9 +388,18 @@ enum M3UBytes {
         guard end > start else { return "" }
         let slice = UnsafeBufferPointer(start: b + start, count: end - start)
         if let string = String(validating: slice, as: UTF8.self) { return string }
-        var scalars = String.UnicodeScalarView()
-        for byte in slice { scalars.append(Unicode.Scalar(byte)) }
-        return String(scalars)
+        // Latin-1: each byte is one scalar (U+0000…U+00FF); encode straight to UTF-8.
+        var utf8: [UInt8] = []
+        utf8.reserveCapacity(slice.count * 2)
+        for byte in slice {
+            if byte < 0x80 {
+                utf8.append(byte)
+            } else {
+                utf8.append(0xC0 | (byte >> 6))
+                utf8.append(0x80 | (byte & 0x3F))
+            }
+        }
+        return String(decoding: utf8, as: UTF8.self)
     }
 
     private static let urlAllowed: CharacterSet = {

@@ -16,6 +16,7 @@ public struct LiveScreen: View {
     @State private var query = ""
     @State private var results: FilteredChannels?
     @State private var guideStart: Date?
+    @State private var guideRefreshTask: Task<Void, Never>?
 
     private let favoritesOnly: Bool
 
@@ -34,15 +35,41 @@ public struct LiveScreen: View {
 
     private nonisolated struct Filter: Hashable, Sendable {
         let category: String?
+        /// Fingerprint of `favorites`: `LibraryStore` exposes no favorites revision,
+        /// so the hash memoizes identity — task-id comparisons stay O(1) instead of
+        /// rescanning the whole array on every body evaluation.
+        let favoritesKey: Int
         let favorites: [String]?
         let query: String
         let revision: Int
         let isActive: Bool
 
+        init(category: String?, favorites: [String]?, query: String, revision: Int, isActive: Bool) {
+            self.category = category
+            self.favoritesKey = favorites.hashValue
+            self.favorites = favorites
+            self.query = query
+            self.revision = revision
+            self.isActive = isActive
+        }
+
         var isUnfiltered: Bool { category == nil && favorites == nil && query.isEmpty }
 
         func hasSameScope(as other: Self) -> Bool {
-            revision == other.revision && category == other.category && favorites == other.favorites
+            revision == other.revision && category == other.category && favoritesKey == other.favoritesKey
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.category == rhs.category && lhs.favoritesKey == rhs.favoritesKey
+                && lhs.query == rhs.query && lhs.revision == rhs.revision && lhs.isActive == rhs.isActive
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(category)
+            hasher.combine(favoritesKey)
+            hasher.combine(query)
+            hasher.combine(revision)
+            hasher.combine(isActive)
         }
     }
 
@@ -202,7 +229,7 @@ public struct LiveScreen: View {
                         symbol: "calendar.badge.exclamationmark", title: "Aucun programme disponible",
                         message: "Vérifiez l’adresse XMLTV dans les réglages de votre source ou actualisez le guide.",
                         actionTitle: model.isRefreshingGuide ? nil : "Actualiser le guide"
-                    ) { Task { await refreshGuide() } }
+                    ) { refreshGuide() }
                     .overlay(alignment: .bottom) {
                         if model.isRefreshingGuide { ProgressView().controlSize(.small).padding(32) }
                     }
@@ -210,7 +237,7 @@ public struct LiveScreen: View {
                 } else {
                     LiveGuide(
                         channels: channels, guide: model.guide, start: $guideStart,
-                        isRefreshing: model.isRefreshingGuide, onRefresh: { Task { await refreshGuide() } },
+                        isRefreshing: model.isRefreshingGuide, onRefresh: { refreshGuide() },
                         onPlay: { play($0, program: $1) },
                         onReplay: replayAction,
                         channelMenu: { group, program in channelMenu(group, program: program) }
@@ -319,10 +346,16 @@ public struct LiveScreen: View {
         return { playItem(replay.item, .channel(groupID: channel.id), replay.variant.id) }
     }
 
-    private func refreshGuide() async {
-        for source in model.sources where source.isEnabled {
-            guard !Task.isCancelled else { return }
-            await model.refreshGuide(for: source.id)
+    /// One guide refresh at a time per screen: the task handle is assigned
+    /// synchronously so rapid taps cannot start overlapping per-source loops.
+    private func refreshGuide() {
+        guard guideRefreshTask == nil, !model.isRefreshingGuide else { return }
+        guideRefreshTask = Task {
+            defer { guideRefreshTask = nil }
+            for source in model.sources where source.isEnabled {
+                guard !Task.isCancelled else { return }
+                await model.refreshGuide(for: source.id)
+            }
         }
     }
 

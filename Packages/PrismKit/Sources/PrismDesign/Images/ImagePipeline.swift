@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import SwiftUI
+import Synchronization
 
 /// Shared image loader: request de-duplication, memory cache (≈ 160 MiB, byte cost), disk cache
 /// (1 GB, survives relaunch), ImageIO downsampling off the main thread.
@@ -50,7 +51,6 @@ public actor ImagePipeline {
         let blur: Int
 
         var target: CGSize { CGSize(width: width, height: height) }
-        var cacheKey: NSString { "\(width)x\(height)|\(fitting.rawValue)|\(blur)|\(url.absoluteString)" as NSString }
 
         func showsSameArtwork(as other: Key) -> Bool {
             url == other.url && fitting == other.fitting && blur == other.blur
@@ -75,7 +75,6 @@ public actor ImagePipeline {
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
     private var failedRequests: [URL: ContinuousClock.Instant] = [:]
-    private var prefetches: [URL: Task<Void, Never>] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
     private var warmQueue: [ArtworkURL.Resolved] = []
@@ -163,21 +162,15 @@ public actor ImagePipeline {
         Task(priority: .utility) { await self.enqueueWarm(urls, target: target, fitting: fitting) }
     }
 
-    /// Warms the caches for upcoming items (low priority, de-duplicated).
+    /// Kept for API compatibility: prefetching now means warming the encoded bytes
+    /// (what `warm` does); there is no separate decode-level prefetch anymore.
     public nonisolated func prefetch(_ urls: [URL], maxPixelSize: CGFloat) {
-        guard !urls.isEmpty else { return }
-        Task(priority: .utility) { await self.startPrefetch(urls, pixelSize: CGSize(width: maxPixelSize, height: maxPixelSize), fitting: .fit) }
+        warm(urls, pixelSize: CGSize(width: maxPixelSize, height: maxPixelSize), fitting: .fit)
     }
 
-    /// Warms the caches for a fill target (same key as `RemoteImage` with that size).
+    /// Kept for API compatibility — see `prefetch(_:maxPixelSize:)`.
     public nonisolated func prefetch(_ urls: [URL], pixelSize: CGSize) {
-        guard !urls.isEmpty else { return }
-        Task(priority: .utility) { await self.startPrefetch(urls, pixelSize: pixelSize, fitting: .fill) }
-    }
-
-    /// Cancels pending prefetches for `urls` (all when `nil`).
-    public nonisolated func cancelPrefetch(_ urls: [URL]? = nil) {
-        Task { await self.stopPrefetch(urls) }
+        warm(urls, pixelSize: pixelSize)
     }
 
     /// Average (vibrance-boosted) colour of the image, cached per URL.
@@ -186,18 +179,28 @@ public actor ImagePipeline {
     }
 
     /// Average colour as plain components (for gradients/tinting maths).
+    ///
+    /// Reuses the decode a visible card already runs for the same URL (any size/fitting) —
+    /// decoded images feed `averageColors` — so no second download or decode is needed.
+    /// Falls back to a tiny 64 px decode only when nothing is in flight.
     public func averageRGBA(for url: URL) async -> RGBA? {
         if let cached = averageColors[url] { return cached }
+        let candidates = inFlight.compactMap { $0.key.url == url && $0.key.blur == 0 ? $0.value : nil }
+        for entry in candidates {
+            if let image = await entry.task.value {
+                return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
+            }
+        }
         guard let image = await image(for: url, maxPixelSize: 64) else { return nil }
-        let rgba = await ImageDecoder.averageColor(of: image)
-        averageColors[url] = rgba
-        if averageColors.count > 4000 { averageColors.removeAll(keepingCapacity: true) }
-        return rgba
+        return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
     }
 
-    /// Synchronous lookup of an already computed average colour.
-    public func cachedAverageColor(for url: URL) -> Color? {
-        averageColors[url]??.color
+    /// Memoizes a sampled colour (a `nil` sample is memoized too) and keeps the table bounded.
+    @discardableResult
+    private func storeAverageColor(_ url: URL, _ rgba: RGBA?) -> RGBA? {
+        averageColors[url] = rgba
+        if averageColors.count > 16_384 { averageColors.removeAll(keepingCapacity: true) }
+        return rgba
     }
 
     /// Drops the memory cache (e.g. on memory pressure); the disk cache is kept.
@@ -262,6 +265,13 @@ public actor ImagePipeline {
             }
             if let image, !Task.isCancelled {
                 memory.insert(image, for: key)
+                // Feed the colour memo from the decode that already happened: `averageRGBA`
+                // then never needs a second download for artwork on screen. Blurred variants
+                // would tint the sample, so only sharp decodes count.
+                if key.blur == 0 {
+                    let rgba = await ImageDecoder.averageColor(of: image)
+                    await self.storeAverageColor(key.url, rgba)
+                }
             }
             return image
         }
@@ -301,7 +311,10 @@ public actor ImagePipeline {
                     let now = ContinuousClock.now
                     failedRequests = failedRequests.filter { $0.value > now }
                     if failedRequests.count >= 2_048 {
-                        for key in Array(failedRequests.keys.prefix(128)) { failedRequests[key] = nil }
+                        // Evict the entries closest to expiry: they are the least valuable.
+                        for (key, _) in failedRequests.sorted(by: { $0.value < $1.value }).prefix(128) {
+                            failedRequests[key] = nil
+                        }
                     }
                 }
                 failedRequests[url] = ContinuousClock.now.advanced(by: .seconds(120))
@@ -322,26 +335,51 @@ public actor ImagePipeline {
         return false
     }
 
-    /// Disk hit, else network (validated as an image before being stored). A resized TMDB request
-    /// falls back to the provider's own URL, from disk when its copy is large enough, else online.
+    /// Largest encoded payload accepted. Checked on `Content-Length` before the body is read
+    /// and while streaming, so a hostile or broken "image" URL can neither balloon memory nor
+    /// disk beyond this. Overshooting by a few KiB between checks is harmless.
+    private static let maxImageBytes = 48 << 20
+
+    /// Disk hit, else network. Bytes are validated (status, MIME, size cap) and — when no
+    /// fallback exists — stored even if undecodable, which prevents a refetch loop for dead
+    /// artwork URLs. `isDecodable` gates the return value so `encodedData` falls through to
+    /// the provider's own URL; the decode step downstream is the image validator.
     @concurrent private nonisolated static func encodedData(for request: ArtworkURL.Resolved, disk: ImageDiskCache, session: URLSession) async -> Data? {
         if let data = disk.data(for: request.primary) { return data }
         if request.fallbackIsLarger, let fallback = request.fallback, let data = disk.data(for: fallback) { return data }
-        if let data = await download(request.primary, disk: disk, session: session) { return data }
+        // Storing undecodable bytes for the primary would shadow the fallback on later
+        // requests (the disk hit always wins), so only fallback-less URLs keep them.
+        if let data = await download(request.primary, disk: disk, session: session, storeUndecodable: request.fallback == nil) { return data }
         guard !Task.isCancelled, let fallback = request.fallback else { return nil }
         if !request.fallbackIsLarger, let data = disk.data(for: fallback) { return data }
-        return await download(fallback, disk: disk, session: session)
+        return await download(fallback, disk: disk, session: session, storeUndecodable: true)
     }
 
-    @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession) async -> Data? {
+    /// Streams the body with `URLSession.AsyncBytes` instead of buffering the whole response:
+    /// memory stays flat whatever the payload size, and reading stops as soon as the cap is hit.
+    @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession, storeUndecodable: Bool) async -> Data? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
         do {
-            let (data, response) = try await session.data(from: url)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
+            let (stream, response) = try await session.bytes(from: url)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
             if let mime = response.mimeType?.lowercased(), mime.hasPrefix("text/") || mime.contains("json") || mime.contains("html") {
                 return nil
             }
-            guard ImageDecoder.isDecodable(data) else { return nil }
+            // Headers arrive before the body: refuse oversized payloads without consuming them.
+            if response.expectedContentLength > Int64(maxImageBytes) { return nil }
+            var bytes: [UInt8] = []
+            let expected = response.expectedContentLength
+            bytes.reserveCapacity(expected > 0 ? min(Int(expected), maxImageBytes) : 0)
+            for try await byte in stream {
+                bytes.append(byte)
+                if bytes.count & 0x3FFF == 0, Task.isCancelled || bytes.count > maxImageBytes { return nil }
+            }
+            guard bytes.count <= maxImageBytes, !bytes.isEmpty else { return nil }
+            let data = Data(bytes)
+            guard ImageDecoder.isDecodable(data) else {
+                if storeUndecodable { disk.store(data, for: url) }
+                return nil
+            }
             disk.store(data, for: url)
             return data
         } catch {
@@ -404,28 +442,6 @@ public actor ImagePipeline {
             inFlight[key] = nil
         }
     }
-
-    private func startPrefetch(_ urls: [URL], pixelSize: CGSize, fitting: Fitting) {
-        for url in urls where prefetches[url] == nil {
-            guard let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: 0),
-                  memory.image(for: key) == nil else { continue }
-            prefetches[url] = Task(priority: .utility) {
-                _ = await self.image(for: key)
-                self.prefetchFinished(url)
-            }
-        }
-    }
-
-    private func prefetchFinished(_ url: URL) { prefetches[url] = nil }
-
-    private func stopPrefetch(_ urls: [URL]?) {
-        if let urls {
-            for url in urls { prefetches.removeValue(forKey: url)?.cancel() }
-        } else {
-            prefetches.values.forEach { $0.cancel() }
-            prefetches.removeAll()
-        }
-    }
 }
 
 /// Bound expensive ImageIO work even when multiple shelves become visible at once.
@@ -479,27 +495,64 @@ private actor ImageDecodeQueue {
     }
 }
 
-/// Thread-safe byte-cost memory cache.
+/// Thread-safe byte-cost memory cache keyed by the decode `Key`.
+///
+/// A plain dictionary + mutex replaces `NSCache<NSString, …>`: lookups hash the `Key` directly,
+/// so the hot `RemoteImage.body` path allocates nothing (no per-eval `NSString` for the cache
+/// key). Eviction approximates LRU — reads refresh a stamp — batched to ~20 % headroom so
+/// inserts stay amortised O(1) apart from the occasional sort.
 nonisolated final class MemoryCache: @unchecked Sendable {
-    private final class Box {
+    private struct Entry {
         let image: CGImage
-        init(_ image: CGImage) { self.image = image }
+        let bytes: Int
+        var stamp: UInt64
     }
 
-    private let cache = NSCache<NSString, Box>()
-
-    init(costLimit: Int) {
-        cache.totalCostLimit = costLimit
-        cache.countLimit = 4000
+    private struct State {
+        var entries: [ImagePipeline.Key: Entry] = [:]
+        var bytes = 0
+        var clock: UInt64 = 0
     }
+
+    private let state = Mutex(State())
+    private let byteLimit: Int
+    private static let countLimit = 4096
+
+    init(costLimit: Int) { byteLimit = costLimit }
 
     func image(for key: ImagePipeline.Key) -> CGImage? {
-        cache.object(forKey: key.cacheKey)?.image
+        state.withLock { state in
+            state.clock &+= 1
+            guard var entry = state.entries[key] else { return nil }
+            entry.stamp = state.clock
+            state.entries[key] = entry
+            return entry.image
+        }
     }
 
     func insert(_ image: CGImage, for key: ImagePipeline.Key) {
-        cache.setObject(Box(image), forKey: key.cacheKey, cost: image.bytesPerRow * image.height)
+        let bytes = image.bytesPerRow * image.height
+        state.withLock { state in
+            state.clock &+= 1
+            if let old = state.entries.updateValue(Entry(image: image, bytes: bytes, stamp: state.clock), forKey: key) {
+                state.bytes -= old.bytes
+            }
+            state.bytes += bytes
+            evict(&state)
+        }
     }
 
-    func removeAll() { cache.removeAllObjects() }
+    /// Drops the stalest entries until back under ~80 % of both budgets.
+    private func evict(_ state: inout State) {
+        let byteTarget = byteLimit * 8 / 10
+        let countTarget = Self.countLimit * 8 / 10
+        guard state.bytes > byteTarget || state.entries.count > Self.countLimit else { return }
+        for (key, entry) in state.entries.sorted(by: { $0.value.stamp < $1.value.stamp }) {
+            guard state.bytes > byteTarget || state.entries.count > countTarget else { break }
+            state.entries[key] = nil
+            state.bytes -= entry.bytes
+        }
+    }
+
+    func removeAll() { state.withLock { $0 = State() } }
 }

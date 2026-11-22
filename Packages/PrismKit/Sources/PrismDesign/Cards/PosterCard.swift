@@ -9,10 +9,12 @@ public struct PosterCard<MenuContent: View>: View {
     private let showsTitle: Bool
     private let badge: String?
     private let rank: Int?
+    private let rankText: Text?
     private let progress: Double?
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -26,7 +28,7 @@ public struct PosterCard<MenuContent: View>: View {
         progress: Double? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
         self.imageURL = imageURL
         self.seed = seed ?? title
@@ -35,10 +37,12 @@ public struct PosterCard<MenuContent: View>: View {
         self.showsTitle = showsTitle
         self.badge = badge
         self.rank = rank
+        rankText = rank.map { Text($0, format: .number) }
         self.progress = progress
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        accessibilityText = Text([title, subtitle, rank.map { "Rang \($0)" }].compactMap { $0 }.joined(separator: ", "))
     }
 
     private var resolvedWidth: CGFloat { width ?? shelfWidth ?? PrismMetrics.posterWidth }
@@ -46,8 +50,7 @@ public struct PosterCard<MenuContent: View>: View {
     public var body: some View {
         let w = resolvedWidth
         let artworkSize = CGSize(width: w, height: (w / PrismMetrics.posterAspectRatio).rounded())
-        let label = [title, subtitle, rank.map { "Rang \($0)" }].compactMap { $0 }.joined(separator: ", ")
-        CardContainer(accessibilityLabel: Text(label), action: action, menu: menu) { _ in
+        CardContainer(accessibilityLabel: accessibilityText, action: action, menu: menu) { _ in
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkSurface(radius: PrismMetrics.posterRadius) {
                     artwork(size: artworkSize)
@@ -86,8 +89,8 @@ public struct PosterCard<MenuContent: View>: View {
                     }
                 }
                 .overlay(alignment: .topLeading) {
-                    if let rank {
-                        Text(rank, format: .number)
+                    if let rankText {
+                        rankText
                             .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
                             .foregroundStyle(.white)
                             .frame(minWidth: 34, minHeight: 30)

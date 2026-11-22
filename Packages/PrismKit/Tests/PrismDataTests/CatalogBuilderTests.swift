@@ -314,6 +314,28 @@ struct CatalogBuilderTests {
         #expect(catalog.recentlyAdded(.movie, limit: 2).map(\.title) == ["New", "Old"])
     }
 
+    @Test func providerLanguagesAreResolvedOncePerVariant() async throws {
+        // The build-time cache must mirror `providerLanguages(for:)` exactly, including the
+        // native→canonical category id fallback for older imports.
+        let french = F.category(F.a, .movie, "10", "┃FR┃ Films - Nouveautés")
+        let movie = F.movie(F.a, "fr", "Inception", year: 2010, category: french.nativeID)
+        let uncategorised = F.movie(F.a, "x", "Titre", year: 2020)
+        let catalog = await F.build(
+            [F.source(F.a)],
+            [SourceCatalog(sourceID: F.a, categories: [french], movies: [movie, uncategorised])]
+        )
+        let titles = Dictionary(uniqueKeysWithValues: catalog.movies.flatMap { title in
+            title.variants.map { ($0.id, title) }
+        })
+        for title in catalog.movies {
+            for variant in title.variants {
+                #expect(catalog.indexes.providerLanguages[variant.id] == catalog.providerLanguages(for: variant))
+            }
+        }
+        #expect(catalog.providerLanguages(for: .movie(movie)) == ["fr"])
+        #expect(titles.count == 2)
+    }
+
     @Test func emptyInputGivesEmptyCatalog() async {
         let catalog = await F.build([], [])
         #expect(catalog.isEmpty)

@@ -38,11 +38,18 @@ private struct HoverLiftModifier: ViewModifier {
     let shadow: Bool
     @State private var isHovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismIsScrollingContent) private var isScrollingContent
 
     func body(content: Content) -> some View {
         content
-            .hoverLiftEffect(isHovered: isHovered, isPressed: false, scale: scale, pressedScale: 1, shadow: shadow, reduceMotion: reduceMotion)
-            .onHover { isHovered = $0 }
+            .hoverLiftEffect(isHovered: isHovered && !isScrollingContent, isPressed: false, scale: scale, pressedScale: 1, shadow: shadow, reduceMotion: reduceMotion)
+            .onHover { inside in
+                guard !isScrollingContent else { return }
+                isHovered = inside
+            }
+            .onChange(of: isScrollingContent) { _, scrolling in
+                if !scrolling { isHovered = false }
+            }
     }
 }
 

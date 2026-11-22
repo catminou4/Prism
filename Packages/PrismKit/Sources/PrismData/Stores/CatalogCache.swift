@@ -32,6 +32,12 @@ public actor CatalogCache {
 
     public init(directories: AppDirectories) {
         self.init(directories: directories, version: Self.formatVersion)
+        // Archives written by another format version can never be decoded: drop them once,
+        // off the main actor (the versioned test init skips this on purpose).
+        let directory = directories.caches.appending(path: "Catalogs", directoryHint: .isDirectory)
+        Task.detached(priority: .utility) {
+            SegmentedArchive.purgeObsoleteFiles(in: directory, version: Self.formatVersion, suffix: "catalog")
+        }
     }
 
     init(directories: AppDirectories, version: UInt32) {
@@ -162,6 +168,10 @@ public actor EPGCache {
 
     public init(directories: AppDirectories) {
         self.init(directories: directories, version: Self.formatVersion)
+        let directory = directories.caches.appending(path: "EPG", directoryHint: .isDirectory)
+        Task.detached(priority: .utility) {
+            SegmentedArchive.purgeObsoleteFiles(in: directory, version: Self.formatVersion, suffix: "epg")
+        }
     }
 
     init(directories: AppDirectories, version: UInt32) {
@@ -169,13 +179,29 @@ public actor EPGCache {
         self.version = version
     }
 
+    /// Archive header (meta segment + raw segments), or `nil` when missing/unreadable/foreign.
+    private static func header(in data: Data, version: UInt32, expecting id: SourceID) -> (meta: Meta, segments: [SegmentedArchive.Segment])? {
+        guard let segments = SegmentedArchive.unpack(data, version: version),
+              let first = segments.first, first.tag == 0,
+              let meta = SegmentedArchive.decodeSegment(Meta.self, from: first), meta.sourceID == id
+        else { return nil }
+        return (meta, segments)
+    }
+
+    /// Fetch date stored in the archive header, without decoding the programme segments.
+    @concurrent
+    public nonisolated func fetchedAt(_ id: SourceID) async -> Date? {
+        guard let data = try? Data(contentsOf: directories.epgCacheFile(for: id), options: [.mappedIfSafe]),
+              let header = Self.header(in: data, version: version, expecting: id) else { return nil }
+        return header.meta.fetchedAt
+    }
+
     @concurrent
     public nonisolated func load(_ id: SourceID) async -> Entry? {
         guard let data = try? Data(contentsOf: directories.epgCacheFile(for: id), options: [.mappedIfSafe]),
-              let segments = SegmentedArchive.unpack(data, version: version),
-              let first = segments.first, first.tag == 0,
-              let meta = SegmentedArchive.decodeSegment(Meta.self, from: first), meta.sourceID == id else { return nil }
-        guard let programs = await SegmentedArchive.decodeChunks(segments.dropFirst(), into: [EPGProgram](), decode: { segment in
+              let header = Self.header(in: data, version: version, expecting: id) else { return nil }
+        let meta = header.meta
+        guard let programs = await SegmentedArchive.decodeChunks(header.segments.dropFirst(), into: [EPGProgram](), decode: { segment in
             guard segment.tag == 1 else { return nil }
             return SegmentedArchive.decodeSegment([EPGProgram].self, from: segment)
         }, append: { $0 += $1 }), programs.count == meta.programCount else { return nil }

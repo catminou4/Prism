@@ -273,7 +273,10 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 .help("Image dans l’image")
                 .accessibilityLabel("Image dans l’image")
             }
-            PlayerAirPlayButton(player: controller.routingPlayer)
+            // VLC has no AVPlayer to route: an empty picker would only mirror app audio.
+            if controller.routingPlayer != nil {
+                PlayerAirPlayButton(player: controller.routingPlayer)
+            }
             if let onShare {
                 Button(action: onShare) { Image(systemName: "square.and.arrow.up") }
                     .buttonStyle(PlayerCapsuleButtonStyle())

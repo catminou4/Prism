@@ -98,7 +98,9 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
         }
         let asset = AVURLAsset(url: url, options: options)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = isLive ? 3 : 0
+        // Live HLS segments run 4–10 s: 3 s of buffer underruns at every bitrate
+        // spike. ~2 segments of headroom keeps the live edge smooth (+latency).
+        item.preferredForwardBufferDuration = isLive ? 15 : 0
         item.textStyleRules = Self.textStyleRules(for: subtitleStyle)
         player.automaticallyWaitsToMinimizeStalling = !isLive
         currentItem = item
@@ -120,7 +122,10 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     func seek(to seconds: TimeInterval) async {
         guard currentItem != nil, seconds.isFinite else { return }
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-        let tolerance = isLive ? CMTime(seconds: 2, preferredTimescale: 600) : .zero
+        // Exact seeks decode forward from the previous keyframe (IPTV GOPs run
+        // 5–10 s): a small tolerance lets AVPlayer land on a nearby sync sample —
+        // imperceptible for skipping/scrubbing, far less decode work.
+        let tolerance = CMTime(seconds: isLive ? 2 : 1.5, preferredTimescale: 600)
         _ = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
     }
 

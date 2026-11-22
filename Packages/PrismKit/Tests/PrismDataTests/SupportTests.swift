@@ -17,6 +17,27 @@ struct SupportTests {
         #expect(words.map { String(decoding: $0, as: UTF8.self) } == ["le", "fabuleux", "destin", "d", "amelie", "poulain", "2001"])
     }
 
+    @Test func unicodePunctuationNeverGluesToWords() {
+        // Guillemets and CJK punctuation are separators: every UTF-8 byte ≥ 0x80 used to count
+        // as a word byte, gluing «» and 。 onto neighbouring words in the search postings.
+        let french = TextFolding.words(ofFolded: TextFolding.fold("« Amour »"))
+        #expect(french.map { String(decoding: $0, as: UTF8.self) } == ["amour"])
+        let cjk = TextFolding.words(ofFolded: TextFolding.fold("。SAC"))
+        #expect(cjk.map { String(decoding: $0, as: UTF8.self) } == ["sac"])
+        // Letters from non-Latin scripts stay word characters.
+        let cyrillic = TextFolding.words(ofFolded: TextFolding.fold("\u{41C}\u{43E}\u{441}\u{43A}\u{432}\u{430} 2024"))
+        #expect(cyrillic.map { String(decoding: $0, as: UTF8.self) } == ["\u{43C}\u{43E}\u{441}\u{43A}\u{432}\u{430}", "2024"])
+    }
+
+    @Test func forEachWordSkipsUnicodePunctuation() {
+        var words: [String] = []
+        var buffer: [UInt8] = []
+        TextFolding.forEachWord(in: "«Dune» 。", buffer: &buffer) { word in
+            words.append(String(decoding: word, as: UTF8.self))
+        }
+        #expect(words == ["dune"])
+    }
+
     @Test func naturalness() {
         #expect(TextFolding.naturalnessScore("Amélie") > TextFolding.naturalnessScore("AMELIE"))
         #expect(TextFolding.naturalnessScore("Amélie") > TextFolding.naturalnessScore("Amelie"))

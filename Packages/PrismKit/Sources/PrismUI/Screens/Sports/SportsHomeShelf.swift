@@ -15,14 +15,18 @@ struct SportsHomeShelf: View {
             if let sports {
                 let fixtures = Self.homeFixtures(sports.fixtures, now: sports.now)
                 if !fixtures.isEmpty {
-                    Shelf(title: "Sport", items: fixtures, sizing: .wide, onHeaderTap: { navigation.select(.sports) }) { fixture in
-                        SportsHomeCard(fixture: fixture, now: sports.now) {
-                            let broadcasts = fixture.liveBroadcasts(at: .now)
-                            if let broadcast = broadcasts.first, broadcasts.count == 1 {
-                                SportsPlayback(app: app, play: playItem)(broadcast)
-                            } else {
-                                sports.destination = SportsDestination(fixture, now: .now)
-                                navigation.select(.sports)
+                    // One union pass for the per-card status/source badges instead of
+                    // ~16 independent glass effects across the shelf.
+                    GlassEffectContainer(spacing: 8) {
+                        Shelf(title: "Sport", items: fixtures, sizing: .wide, onHeaderTap: { navigation.select(.sports) }) { fixture in
+                            SportsHomeCard(fixture: fixture, now: sports.now) {
+                                let broadcasts = fixture.liveBroadcasts(at: .now)
+                                if let broadcast = broadcasts.first, broadcasts.count == 1 {
+                                    SportsPlayback(app: app, play: playItem)(broadcast)
+                                } else {
+                                    sports.destination = SportsDestination(fixture, now: .now)
+                                    navigation.select(.sports)
+                                }
                             }
                         }
                     }

@@ -49,6 +49,11 @@ public struct PageEntry: Identifiable, Hashable, Sendable {
 public final class NavigationModel {
     public private(set) var selection: SidebarItem = .home
     public private(set) var stacks: [SidebarItem: [PageEntry]] = [:]
+    /// Quand la section affichée a changé pour la dernière fois. `List(selection:)`
+    /// ne re-notifie pas toujours la valeur identique : un clic sur la ligne déjà
+    /// active doit déclencher `popToRoot`, sans confondre avec la bascule qui
+    /// vient d'avoir lieu (le geste et la sélection arrivent quasi ensemble).
+    public private(set) var lastSelectionChange = Date.distantPast
 
     public init(selection: SidebarItem = .home) {
         self.selection = selection
@@ -62,8 +67,14 @@ public final class NavigationModel {
         if item == selection {
             popToRoot()
         } else {
-            selection = item
+            setSelection(item)
         }
+    }
+
+    private func setSelection(_ item: SidebarItem) {
+        guard item != selection else { return }
+        selection = item
+        lastSelectionChange = .now
     }
 
     public func push(_ route: Route) {
@@ -89,7 +100,7 @@ public final class NavigationModel {
 
     /// Switches section and pushes a route (e.g. a search result opening a title).
     public func open(_ route: Route, in item: SidebarItem? = nil) {
-        if let item, item != selection { selection = item }
+        if let item { setSelection(item) }
         push(route)
     }
 
@@ -98,7 +109,7 @@ public final class NavigationModel {
         for key in stacks.keys {
             stacks[key]?.removeAll { $0.route == .source(source) }
         }
-        if selection == .source(source) { selection = .home }
+        if selection == .source(source) { setSelection(.home) }
     }
 }
 

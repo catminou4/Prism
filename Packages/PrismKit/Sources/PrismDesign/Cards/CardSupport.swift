@@ -5,6 +5,8 @@ extension EnvironmentValues {
     @Entry public var prismCardWidth: CGFloat? = nil
     /// The enclosing card is hovered: its artwork casts the lift shadow.
     @Entry var prismCardLifted: Bool = false
+    /// A scroll container is scrolling: cards suspend hover lift/shadow and skip hover tracking.
+    @Entry public var prismIsScrollingContent: Bool = false
 }
 
 extension View {
@@ -82,11 +84,12 @@ struct ExtendedArtwork: View {
 /// `…` button revealed at full opacity on hover; opens the card menu.
 struct CardMenuButton<MenuContent: View>: View {
     let isHovered: Bool
-    let menu: MenuContent
+    /// Evaluated when the menu opens, not on every card render.
+    let menu: () -> MenuContent
 
     var body: some View {
         Menu {
-            menu
+            menu()
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .bold))
@@ -125,20 +128,22 @@ struct CardContainer<Content: View, MenuContent: View>: View {
     let accessibilityLabel: Text
     let action: (() -> Void)?
     var hoverScale: CGFloat = 1.04
-    let menu: MenuContent
+    /// Built lazily: context menu and `…` menu only evaluate it when opened.
+    let menu: () -> MenuContent
     let content: (_ isHovered: Bool) -> Content
 
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotHover) private var forcedHover
+    @Environment(\.prismIsScrollingContent) private var isScrollingContent
 
-    private var isHovered: Bool { hovering || forcedHover }
+    private var isHovered: Bool { (hovering || forcedHover) && !isScrollingContent }
 
     init(
         accessibilityLabel: Text,
         action: (() -> Void)?,
         hoverScale: CGFloat = 1.04,
-        menu: MenuContent,
+        menu: @escaping () -> MenuContent,
         @ViewBuilder content: @escaping (_ isHovered: Bool) -> Content
     ) {
         self.accessibilityLabel = accessibilityLabel
@@ -164,7 +169,15 @@ struct CardContainer<Content: View, MenuContent: View>: View {
             }
         }
         .environment(\.prismCardLifted, isHovered)
-        .onHover { hovering = $0 }
+        .onHover { inside in
+            // Hover churn while scrolling costs a full card re-evaluation per card crossed.
+            guard !isScrollingContent else { return }
+            hovering = inside
+        }
+        .onChange(of: isScrollingContent) { _, scrolling in
+            // Drop stale hover state: missed exits would otherwise leave a lift behind.
+            if !scrolling { hovering = false }
+        }
         .modifier(OptionalContextMenu(menu: menu))
         .focusEffectDisabled()
         .accessibilityElement(children: .combine)
@@ -174,15 +187,15 @@ struct CardContainer<Content: View, MenuContent: View>: View {
 }
 
 struct OptionalContextMenu<MenuContent: View>: ViewModifier {
-    let menu: MenuContent
+    let menu: () -> MenuContent
 
     func body(content: Content) -> some View {
         if MenuContent.self == EmptyView.self {
             content
         } else {
             content
-                .contextMenu { menu }
-                .accessibilityActions { menu }
+                .contextMenu { menu() }
+                .accessibilityActions { menu() }
         }
     }
 }

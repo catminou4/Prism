@@ -75,8 +75,8 @@ public struct HTTPClient: Sendable {
 
     static func isRetryable(_ error: URLError) -> Bool {
         switch error.code {
-        case .timedOut, .networkConnectionLost, .cannotConnectToHost, .dnsLookupFailed,
-             .cannotFindHost, .badServerResponse:
+        // Definitive DNS failures are not transient: retrying just delays the same error.
+        case .timedOut, .networkConnectionLost, .cannotConnectToHost, .badServerResponse:
             true
         default:
             false
@@ -86,7 +86,8 @@ public struct HTTPClient: Sendable {
     private static func backoff(attempt: Int, retryAfter: String?) async throws {
         var seconds = 0.5 * pow(2, Double(attempt - 1))
         if let retryAfter, let value = Double(retryAfter.trimmingCharacters(in: .whitespaces)) {
-            seconds = min(max(value, seconds), 5)
+            // Honor Retry-After (429 rate limits ask for real delays), capped at ~30 s.
+            seconds = min(max(value, seconds), 30)
         }
         try await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
     }

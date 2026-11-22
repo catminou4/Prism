@@ -3,14 +3,15 @@ import SwiftUI
 /// Top 10 poster: large white rank number inside the top-leading corner, optional genre
 /// centred at the bottom over a soft gradient.
 public struct RankedPosterCard<MenuContent: View>: View {
-    private let rank: Int
+    private let rankText: Text
     private let imageURL: URL?
     private let seed: String
     private let title: String
     private let genre: String?
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -21,22 +22,23 @@ public struct RankedPosterCard<MenuContent: View>: View {
         genre: String? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
-        self.rank = rank
+        rankText = Text(rank, format: .number)
         self.imageURL = imageURL
         self.seed = seed ?? title
         self.title = title
         self.genre = genre
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        accessibilityText = Text("Numéro \(rank), \(title)")
     }
 
     public var body: some View {
         let w = width ?? shelfWidth ?? PrismMetrics.posterWidth
         let size = CGSize(width: w, height: (w / PrismMetrics.posterAspectRatio).rounded())
-        CardContainer(accessibilityLabel: Text("Numéro \(rank), \(title)"), action: action, menu: menu) { _ in
+        CardContainer(accessibilityLabel: accessibilityText, action: action, menu: menu) { _ in
             ArtworkSurface(radius: PrismMetrics.posterRadius) {
                 RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: title)
                     .overlay(alignment: .top) {
@@ -50,7 +52,7 @@ public struct RankedPosterCard<MenuContent: View>: View {
                         }
                     }
                     .overlay(alignment: .topLeading) {
-                        Text(rank, format: .number)
+                        rankText
                             .font(PrismFont.rankNumber)
                             .tracking(PrismFont.rankNumberTracking)
                             .foregroundStyle(.white)

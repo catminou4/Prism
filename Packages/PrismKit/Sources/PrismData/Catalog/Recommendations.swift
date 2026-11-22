@@ -53,7 +53,9 @@ public struct Recommendations: Sendable {
             return editorial.title
         }
         var englishName: String?
-        for variant in media.variants {
+        // Audio hints are read off the best variants first; deeper editions rarely change the
+        // answer, so the scan stays bounded like the other per-title passes.
+        for variant in media.variants.prefix(24) {
             let audio = RecommendationBuilder.availableAudio(for: variant, original: nil, catalog: catalog)
             guard !audio.isDisjoint(with: languages),
                   RecommendationBuilder.hasLatinTitle(variant.title) else { continue }
@@ -178,7 +180,9 @@ public enum RecommendationBuilder {
         for item: MediaTitle, original: HomeAudioLanguage?, catalog: Catalog
     ) -> Set<HomeAudioLanguage> {
         var result: Set<HomeAudioLanguage> = []
-        for variant in item.variants {
+        // Variants are sorted best first; audio editions past the first few rarely matter and
+        // bounding the scan keeps per-title audio checks cheap on huge catalogs.
+        for variant in item.variants.prefix(24) {
             result.formUnion(availableAudio(for: variant, original: original, catalog: catalog))
             if result == HomeAudioLanguage.defaults { break }
         }

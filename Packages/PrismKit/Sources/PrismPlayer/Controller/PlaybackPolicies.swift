@@ -111,11 +111,13 @@ nonisolated public struct ReconnectPolicy: Sendable, Equatable {
 }
 
 /// Throttles `onProgress` callbacks (every `interval` seconds while playing, forced on events).
+/// 20 s keeps resume positions fresh enough while cutting disk writes ~4×; pause,
+/// seek, stop and end still report immediately via `reportProgress(force: true)`.
 nonisolated public struct ProgressThrottle: Sendable, Equatable {
     public var interval: TimeInterval
     public private(set) var lastReport: TimeInterval?
 
-    public init(interval: TimeInterval = 5) {
+    public init(interval: TimeInterval = 20) {
         self.interval = interval
     }
 

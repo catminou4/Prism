@@ -18,29 +18,35 @@ nonisolated public struct ChipItem: Identifiable, Hashable, Sendable {
 /// Horizontal glass category chips (Live TV categories, filters). The selected chip is
 /// white with black text; the white indicator slides between chips.
 public struct ChipBar: View {
+    /// Chip chrome. `.glass` is the Liquid Glass capsule; `.plain` is a flat fill —
+    /// cheaper per chip for very long lists (no `glassEffect`, no hover tracking).
+    public enum Style: Sendable, Hashable {
+        case glass
+        case plain
+    }
+
     private let items: [ChipItem]
     @Binding private var selection: String?
     private let horizontalMargin: CGFloat
+    private let style: Style
     @Namespace private var namespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(items: [ChipItem], selection: Binding<String?>, horizontalMargin: CGFloat = PrismMetrics.contentMargin) {
+    public init(items: [ChipItem], selection: Binding<String?>, horizontalMargin: CGFloat = PrismMetrics.contentMargin, style: Style = .glass) {
         self.items = items
         _selection = selection
         self.horizontalMargin = horizontalMargin
+        self.style = style
     }
 
     public var body: some View {
         ScrollView(.horizontal) {
-            GlassEffectContainer(spacing: 8) {
-                LazyHStack(spacing: 8) {
-                    ForEach(items) { item in
-                        Chip(item: item, isSelected: item.id == selection, namespace: namespace) {
-                            withAnimation(PrismMotion.standard) { selection = item.id }
-                        }
-                    }
+            Group {
+                if style == .glass {
+                    GlassEffectContainer(spacing: 8) { chips }
+                } else {
+                    chips
                 }
-                .scrollTargetLayout()
-                .padding(.vertical, 6)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -49,19 +55,32 @@ public struct ChipBar: View {
         .contentMargins(.horizontal, horizontalMargin, for: .scrollContent)
         .accessibilityElement(children: .contain)
     }
+
+    private var chips: some View {
+        LazyHStack(spacing: 8) {
+            ForEach(items) { item in
+                Chip(item: item, isSelected: item.id == selection, namespace: namespace, style: style) {
+                    withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.standard)) { selection = item.id }
+                }
+            }
+        }
+        .scrollTargetLayout()
+        .padding(.vertical, 6)
+    }
 }
 
 private struct Chip: View {
     let item: ChipItem
     let isSelected: Bool
     let namespace: Namespace.ID
+    let style: ChipBar.Style
     let action: () -> Void
     @State private var isHovered = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Button(action: action) {
+        let button = Button(action: action) {
             HStack(spacing: 6) {
                 if let symbol = item.systemImage {
                     Image(systemName: symbol).font(.system(size: 12, weight: .semibold))
@@ -78,24 +97,34 @@ private struct Chip: View {
             .foregroundStyle(foreground)
             .padding(.horizontal, 14)
             .frame(height: PrismMetrics.capsuleHeight)
-            .background {
-                if isSelected {
-                    Capsule()
-                        .fill(selectedFill)
-                        .matchedGeometryEffect(id: "chip.indicator", in: namespace)
-                } else if isHovered {
-                    Capsule().fill(Color.primary.opacity(0.06))
-                }
-            }
-            .prismGlass(.regular, in: .capsule, interactive: true)
+            .background { chipFill }
+            .modifier(ChipChrome(style: style))
             .contentShape(.capsule)
         }
         .buttonStyle(.pressable)
-        .onHover { hovering in
-            withAnimation(PrismMotion.quickFade) { isHovered = hovering }
-        }
         .focusEffectDisabled()
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+
+        if style == .glass {
+            button
+                .onHover { hovering in
+                    withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.quickFade)) { isHovered = hovering }
+                }
+        } else {
+            button
+        }
+    }
+
+    @ViewBuilder private var chipFill: some View {
+        if isSelected {
+            Capsule()
+                .fill(selectedFill)
+                .matchedGeometryEffect(id: "chip.indicator", in: namespace)
+        } else if style == .plain {
+            Capsule().fill(Color.primary.opacity(0.07))
+        } else if isHovered {
+            Capsule().fill(Color.primary.opacity(0.06))
+        }
     }
 
     private var selectedFill: Color { colorScheme == .dark ? .white : Color(white: 0.1) }
@@ -103,6 +132,22 @@ private struct Chip: View {
     private var foreground: Color {
         if isSelected { return colorScheme == .dark ? .black : .white }
         return .primary
+    }
+}
+
+/// Liquid Glass capsule for `.glass` chips; a hairline stroke for `.plain` ones.
+private struct ChipChrome: ViewModifier {
+    let style: ChipBar.Style
+
+    func body(content: Content) -> some View {
+        switch style {
+        case .glass:
+            content.prismGlass(.regular, in: .capsule, interactive: true)
+        case .plain:
+            content.overlay {
+                Capsule().strokeBorder(.primary.opacity(0.10), lineWidth: 0.5).allowsHitTesting(false)
+            }
+        }
     }
 }
 

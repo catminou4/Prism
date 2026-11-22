@@ -42,8 +42,20 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var lastVideoSize: CGSize = .zero
     private var nextTimeUpdate: ContinuousClock.Instant?
     private var nextMetadataPoll: ContinuousClock.Instant?
+    private var nextTrackPoll: ContinuousClock.Instant?
     private var bufferingCheck: Task<Void, Never>?
-    private var trackSignature = ""
+    /// Cheap "audio/subtitle/video track counts" probe, refreshed on a slow poll.
+    private var trackCountsSignature = ""
+    /// Names+counts fingerprint, only computed on elementary-stream events to catch
+    /// same-count track swaps without paying for it on every poll.
+    private var trackNamesSignature = ""
+    /// `seekableRange` hits libvlc locks; the controller polls it at 4 Hz for live.
+    private var seekableRangeCache: (range: ClosedRange<TimeInterval>?, at: ContinuousClock.Instant)?
+    /// Codec/FPS extracted from `tracksInformation` (expensive): computed once per
+    /// media, re-probed a bounded number of times while codecs are still missing
+    /// (adaptive streams fill it late), bitrates stay live via `statistics`.
+    private var codecSnapshot: (video: String?, audio: String?, fps: Double?)?
+    private var codecProbeCount = 0
     private var volumeValue: Float = 1
     private var mutedValue = false
     private var isStopped = false
@@ -77,7 +89,12 @@ final class VLCEngine: NSObject, PlaybackEngine {
         lastVideoSize = .zero
         nextTimeUpdate = nil
         nextMetadataPoll = nil
-        trackSignature = ""
+        nextTrackPoll = nil
+        trackCountsSignature = ""
+        trackNamesSignature = ""
+        seekableRangeCache = nil
+        codecSnapshot = nil
+        codecProbeCount = 0
         isStopped = false
 
         let media = VLCMedia(url: url)
@@ -87,10 +104,25 @@ final class VLCEngine: NSObject, PlaybackEngine {
         media.addOption(":http-reconnect")
         media.addOption(":no-video-title-show")
         media.addOption(":clock-jitter=0")
+        // Subtitle rendering is an input option in libvlc (applies to this media only;
+        // a runtime style change lands on the next loaded item).
+        switch subtitleStyle {
+        case .system:
+            break
+        case .large:
+            // Default rel-fontsize is 40; 56 ≈ the 140% "Grand texte" AVFoundation uses.
+            media.addOption(":freetype-rel-fontsize=56")
+        case .background:
+            media.addOption(":freetype-background-color=#000000")
+            media.addOption(":freetype-background-opacity=255")
+        case .yellow:
+            media.addOption(":freetype-color=#FFFF00")
+        }
         for (key, value) in headers where !value.isEmpty {
             switch key.lowercased() {
             case "user-agent": media.addOption(":http-user-agent=\(value)")
             case "referer", "referrer": media.addOption(":http-referrer=\(value)")
+            case "cookie": media.addOption(":http-cookie=\(value)")
             default: break  // libvlc has no generic header option.
             }
         }
@@ -116,12 +148,26 @@ final class VLCEngine: NSObject, PlaybackEngine {
 
     func pause() {
         wantsPlay = false
-        if player.canPause { player.pause() }
+        // `canPause` is always false on live streams and while opening; libvlc
+        // still honours pause() (and the `.playing` re-pause below covers the case
+        // where the pause lands before the stream is actually running).
+        player.pause()
     }
 
     func seek(to seconds: TimeInterval) async {
         guard seconds.isFinite, player.isSeekable else { return }
-        player.time = VLCTime(int: Int32(clamping: Int(max(0, seconds) * 1000)))
+        let target = max(0, seconds)
+        player.time = VLCTime(int: Int32(clamping: Int(target * 1000)))
+        // libvlc seeks asynchronously: hold this call until the playhead lands near
+        // the target so the controller keeps ignoring stale engine times (otherwise
+        // the scrubber rubber-bands back for the ~0.5–2 s the seek takes).
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !Task.isCancelled {
+            let position = TimeInterval(player.time.intValue) / 1000
+            if abs(position - target) <= 1 { return }
+            if ContinuousClock.now >= deadline { return }
+            try? await Task.sleep(for: .milliseconds(80))
+        }
     }
 
     func stop() {
@@ -183,10 +229,19 @@ final class VLCEngine: NSObject, PlaybackEngine {
     /// libvlc cannot restyle subtitles at runtime; the style applies on next load only.
     var subtitleStyle: SubtitleStyle
 
+    /// Cached ~1 s: every call crosses libvlc locks and the controller polls at 4 Hz.
     var seekableRange: ClosedRange<TimeInterval>? {
-        guard isLive, player.isSeekable else { return nil }
-        let length = TimeInterval(player.media?.length.intValue ?? 0) / 1000
-        return length > 0 ? 0...length : nil
+        guard isLive else { return nil }
+        let now = ContinuousClock.now
+        if let cache = seekableRangeCache, now - cache.at < .seconds(1) { return cache.range }
+        let range: ClosedRange<TimeInterval>?
+        if player.isSeekable, let length = player.media?.length.intValue, length > 0 {
+            range = 0...(TimeInterval(length) / 1000)
+        } else {
+            range = nil
+        }
+        seekableRangeCache = (range, now)
+        return range
     }
 
     // MARK: - Geometry
@@ -308,30 +363,45 @@ final class VLCEngine: NSObject, PlaybackEngine {
 
     var techInfo: StreamTechSnapshot {
         var info = StreamTechSnapshot(engineName: "VLC", url: currentURL)
-        let size = player.videoSize
-        if size.width > 0, size.height > 0 { info.resolution = size }
+        if lastVideoSize.width > 0, lastVideoSize.height > 0 { info.resolution = lastVideoSize }
         guard let media = player.media else { return info }
-        for case let track as [String: Any] in media.tracksInformation {
-            let type = track[VLCMediaTracksInformationType] as? String
-            let codec = (track[VLCMediaTracksInformationCodec] as? NSNumber).map { Self.fourCC($0.uint32Value) }
-            if type == VLCMediaTracksInformationTypeVideo, info.videoCodec == nil {
-                info.videoCodec = codec
-                if let rate = (track[VLCMediaTracksInformationFrameRate] as? NSNumber)?.doubleValue,
-                    let base = (track[VLCMediaTracksInformationFrameRateDenominator] as? NSNumber)?.doubleValue,
-                    base > 0, rate > 0
-                {
-                    info.framesPerSecond = rate / base
-                }
-            } else if type == VLCMediaTracksInformationTypeAudio, info.audioCodec == nil {
-                info.audioCodec = codec
-            }
+        // `tracksInformation` is expensive: probe once per media and re-probe only
+        // while a codec is still missing (bounded — video-only streams would
+        // otherwise pay for it forever), bitrates stay live below.
+        let missingCodec = codecSnapshot?.video == nil || codecSnapshot?.audio == nil
+        if codecSnapshot == nil || (missingCodec && codecProbeCount < 10) {
+            codecProbeCount += 1
+            codecSnapshot = Self.codecSnapshot(for: media)
         }
+        info.videoCodec = codecSnapshot?.video
+        info.audioCodec = codecSnapshot?.audio
+        info.framesPerSecond = codecSnapshot?.fps
         let stats = media.statistics
         // libvlc bitrates are in bytes per microsecond… × 8 000 000 → bits per second.
         if stats.demuxBitrate > 0 { info.indicatedBitrate = Double(stats.demuxBitrate) * 8_000_000 }
         if stats.inputBitrate > 0 { info.observedBitrate = Double(stats.inputBitrate) * 8_000_000 }
         info.droppedFrames = Int(stats.lostPictures)
         return info
+    }
+
+    private static func codecSnapshot(for media: VLCMedia) -> (video: String?, audio: String?, fps: Double?) {
+        var snapshot: (video: String?, audio: String?, fps: Double?) = (nil, nil, nil)
+        for case let track as [String: Any] in media.tracksInformation {
+            let type = track[VLCMediaTracksInformationType] as? String
+            let codec = (track[VLCMediaTracksInformationCodec] as? NSNumber).map { fourCC($0.uint32Value) }
+            if type == VLCMediaTracksInformationTypeVideo, snapshot.video == nil {
+                snapshot.video = codec
+                if let rate = (track[VLCMediaTracksInformationFrameRate] as? NSNumber)?.doubleValue,
+                    let base = (track[VLCMediaTracksInformationFrameRateDenominator] as? NSNumber)?.doubleValue,
+                    base > 0, rate > 0
+                {
+                    snapshot.fps = rate / base
+                }
+            } else if type == VLCMediaTracksInformationTypeAudio, snapshot.audio == nil {
+                snapshot.audio = codec
+            }
+        }
+        return snapshot
     }
 
     static func fourCC(_ value: UInt32) -> String {
@@ -372,18 +442,36 @@ final class VLCEngine: NSObject, PlaybackEngine {
             scheduleBufferingCheck()
         case .playing:
             markReady()
-            report(.playing)
-            refreshTracksIfNeeded()
+            if wantsPlay {
+                report(.playing)
+                refreshTracksIfNeeded()
+            } else {
+                // Paused while the stream was still opening (`canPause` was false):
+                // libvlc started anyway — pause it so the controller sees `.paused`
+                // instead of a wedged `.loading` with audio playing.
+                player.pause()
+            }
         case .paused:
             report(.paused)
         case .esAdded:
-            refreshTracksIfNeeded()
+            refreshTracksIfNeeded(deep: true)
         case .ended:
             reportTerminal(.ended)
         case .error:
             reportTerminal(.failed("VLC n’a pas pu ouvrir ce flux."))
         case .stopped:
-            if wantsPlay, didReportReady { reportTerminal(.ended) }
+            guard wantsPlay, didReportReady else { break }
+            // Natural EOF arrives as `.ended`; `.stopped` here means the stream died
+            // mid-playback. Only trust it as an ending when the playhead is actually
+            // near the end — otherwise fail so the next attempt resumes in place
+            // instead of marking the title watched.
+            if !isLive, let length = player.media?.length.intValue, length > 0,
+                player.time.intValue < length - 3000
+            {
+                reportTerminal(.failed("Le flux s’est arrêté avant la fin."))
+            } else {
+                reportTerminal(.ended)
+            }
         @unknown default:
             break
         }
@@ -423,8 +511,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         }
 
         if nextMetadataPoll.map({ now >= $0 }) ?? true {
-            // Track changes also arrive via the state delegate. Poll as a fallback
-            // for adaptive streams and for resolution changes without a state event.
+            // Resolution changes without a state event; 1 Hz is enough.
             nextMetadataPoll = now.advanced(by: .seconds(1))
             let size = player.videoSize
             if size.width > 0, size.height > 0, size != lastVideoSize {
@@ -432,6 +519,11 @@ final class VLCEngine: NSObject, PlaybackEngine {
                 eventHandler?(.videoSize(size))
                 applyGeometry()
             }
+        }
+        if nextTrackPoll.map({ now >= $0 }) ?? true {
+            // Track lists cross libvlc locks: poll slowly, real changes also
+            // arrive via `.esAdded` / `.playing` state events.
+            nextTrackPoll = now.advanced(by: .seconds(5))
             refreshTracksIfNeeded()
         }
         if !didReportFirstFrame, player.hasVideoOut || (seconds > 0.5 && player.numberOfVideoTracks == 0) {
@@ -452,10 +544,20 @@ final class VLCEngine: NSObject, PlaybackEngine {
         applyGeometry()
     }
 
-    private func refreshTracksIfNeeded() {
-        let signature = "\(player.audioTrackIndexes.count)/\(player.videoSubTitlesIndexes.count)"
-        guard signature != trackSignature else { return }
-        trackSignature = signature
+    /// `deep` additionally fingerprints track names: same-count swaps (adaptive
+    /// renditions) only surface on elementary-stream events, never on the slow poll.
+    private func refreshTracksIfNeeded(deep: Bool = false) {
+        let counts = "\(player.numberOfAudioTracks)/\(player.numberOfSubtitlesTracks)"
+        var changed = counts != trackCountsSignature
+        trackCountsSignature = counts
+        if deep {
+            let names = (player.audioTrackNames + player.videoSubTitlesNames)
+                .compactMap { $0 as? String }.joined(separator: "\u{1F}")
+            let signature = "\(counts)\u{1F}\(names)"
+            if signature != trackNamesSignature { changed = true }
+            trackNamesSignature = signature
+        }
+        guard changed else { return }
         eventHandler?(.tracksChanged)
     }
 

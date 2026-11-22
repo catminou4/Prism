@@ -35,12 +35,14 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     @State private var scrollAvailability = ScrollAvailability()
     @State private var measuredWidth: CGFloat = 0
     @State private var hovering = false
+    @State private var rowScrolling = false
     @Environment(\.prismShelfViewportWidth) private var layoutWidth
     @Environment(\.prismSnapshotHover) private var forcedHover
+    @Environment(\.prismIsScrollingContent) private var isScrollingContent
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
 
-    private var isHovered: Bool { hovering || forcedHover }
+    private var isHovered: Bool { (hovering || forcedHover) && !isScrollingContent }
 
     public init(
         title: String?,
@@ -137,6 +139,11 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .defaultScrollAnchor(.leading, for: .initialOffset)
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
         .scrollPosition(id: $leadingItem, anchor: .leading)
+        // Cards suspend hover lift/shadow while this row (or an ancestor scroller) moves.
+        .environment(\.prismIsScrollingContent, isScrollingContent || rowScrolling)
+        .onScrollPhaseChange { _, phase in
+            rowScrolling = phase.isScrolling
+        }
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
@@ -150,7 +157,14 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .prismCardWidth(itemWidth)
         .overlay(alignment: .leading) { chevron(.leading) }
         .overlay(alignment: .trailing) { chevron(.trailing) }
-        .onHover { inside in withAnimation(PrismMotion.quickFade) { hovering = inside } }
+        .animation(PrismMotion.quickFade, value: scrollAvailability)
+        .onHover { inside in
+            guard !isScrollingContent else { return }
+            withAnimation(PrismMotion.quickFade) { hovering = inside }
+        }
+        .onChange(of: isScrollingContent) { _, scrolling in
+            if !scrolling { hovering = false }
+        }
         .accessibilityScrollAction { edge in
             if edge == .leading && scrollAvailability.backward { page(.leading) }
             if edge == .trailing && scrollAvailability.forward { page(.trailing) }

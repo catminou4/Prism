@@ -99,6 +99,54 @@ struct CurationTests {
             #expect(shelf.items.allSatisfy { Library.comedies.contains($0.title) && $0.id != comedy.id })
         }
     }
+
+    @Test func artworklessProviderStillGetsAStrictEmptyFallback() async throws {
+        // M3U providers often ship no artwork at all: the strict ranking would be empty and every
+        // shelf gone. The degraded mode relaxes only the artwork clause, per kind.
+        let source: SourceID = "src-a"
+        let movies = (0..<12).map { offset in
+            Fixture.movie(source, "m\(offset)", "Film Sans Art", year: 2000 + offset, rating: 7 + Double(offset) / 10)
+        }
+        let catalog = await Fixture.build([Fixture.source(source)], [SourceCatalog(sourceID: source, movies: movies)])
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        #expect(!index.ranking(.movie).isEmpty, "artwork-less titles stay eligible so shelves render monograms")
+
+        // Mixed catalog: the fallback must not fire — artwork stays required while any eligible
+        // title has some.
+        let mixed = await Fixture.build(
+            [Fixture.source(source)],
+            [SourceCatalog(sourceID: source, movies: [
+                Fixture.movie(source, "art", "Avec Art", year: 2020, poster: "a.jpg", rating: 8),
+                Fixture.movie(source, "no", "Sans Art", year: 2020, rating: 8),
+            ])]
+        )
+        let mixedRecommendations = await RecommendationBuilder.build(for: mixed)
+        let mixedIndex = await CurationIndex.build(catalog: mixed, recommendations: mixedRecommendations, now: Fixture.reference)
+        #expect(mixedIndex.ranking(.movie).count == 1, "strict eligibility unchanged when artwork exists")
+    }
+
+    @Test func codecAndQualityTagsDoNotCountAsLanguages() async throws {
+        // Codec/container/release tags must not inflate the edition count used for reach scores.
+        let source: SourceID = "src-a"
+        let url = Fixture.url
+        let first = Movie(
+            sourceID: source, nativeID: "1", title: "Dune", rawName: "Dune", year: 2021,
+            posterURL: url("p.jpg"), streamURL: url("s1.mkv"), tags: ["FR"]
+        )
+        let second = Movie(
+            sourceID: source, nativeID: "2", title: "Dune", rawName: "Dune 4K", year: 2021,
+            posterURL: url("p.jpg"), streamURL: url("s2.mkv"),
+            tags: ["EN", "AAC", "DTS", "HDR10", "MKV", "WEB-DL"]
+        )
+        let catalog = await Fixture.build([Fixture.source(source)], [SourceCatalog(sourceID: source, movies: [first, second])])
+        #expect(catalog.movies.count == 1)
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        let signals = index.signals(.movie)
+        #expect(signals.count == 1)
+        #expect(signals[0].editions == 2, "only FR + EN count; codecs, quality and container tags are not languages")
+    }
 }
 
 /// A small but realistic provider list: Netflix thrillers, comedies, plus everything a curated page

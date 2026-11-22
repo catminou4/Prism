@@ -101,9 +101,9 @@ enum LenientValue {
     }
 
     /// Unix timestamp (seconds, or milliseconds when huge) as number or string; or a calendar date.
+    /// Bare small numbers ("2023") are dates, not 1970 epochs: only values past ~1973 count as timestamps.
     static func date(_ value: Any?) -> Date? {
-        if let seconds = double(value) {
-            guard seconds > 0 else { return nil }
+        if let seconds = double(value), seconds > 100_000 {
             return Date(timeIntervalSince1970: seconds > 1e11 ? seconds / 1000 : seconds)
         }
         return day(value)
@@ -126,6 +126,7 @@ enum LenientValue {
         let hh = digits.count > 3 ? digits[3] : 0
         let mm = digits.count > 4 ? digits[4] : 0
         let ss = digits.count > 5 ? digits[5] : 0
+        guard hh < 24, mm < 60, ss < 61 else { return nil }
         return civil(y, m, d, hh, mm, ss)
     }
 
@@ -198,16 +199,37 @@ enum LenientValue {
         return seconds > 0 && seconds <= 604_800 ? seconds : nil
     }
 
+    /// Letters, digits, whitespace and punctuation — the repertoire of readable text in any
+    /// script. Mojibake from coincidental base64 scatters into symbols and rare blocks.
+    private static let proseCharacters: CharacterSet = {
+        var set = CharacterSet.alphanumerics
+        set.formUnion(.whitespacesAndNewlines)
+        set.formUnion(.punctuationCharacters)
+        return set
+    }()
+
+    private static func proseScore(_ s: String) -> Double {
+        let count = s.unicodeScalars.count
+        guard count > 0 else { return 0 }
+        var good = 0
+        for scalar in s.unicodeScalars where proseCharacters.contains(scalar) { good += 1 }
+        return Double(good) / Double(count)
+    }
+
     /// Lenient base64 (missing padding, URL-safe alphabet, embedded whitespace). Falls back to the raw text.
+    /// The decoded text is only preferred when it reads better than the input: plain titles that
+    /// happen to be valid base64 must not turn into mojibake.
     static func base64Text(_ value: Any?) -> String? {
         guard let raw = string(value) else { return nil }
+        if raw.contains(" ") { return raw }
         var cleaned = raw.filter { !$0.isWhitespace }
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         let remainder = cleaned.count % 4
         if remainder > 0 { cleaned += String(repeating: "=", count: 4 - remainder) }
         if let data = Data(base64Encoded: cleaned), let text = String(data: data, encoding: .utf8),
-           !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }) {
+           !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }),
+           proseScore(text) >= 0.85, proseScore(text) >= proseScore(raw) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }

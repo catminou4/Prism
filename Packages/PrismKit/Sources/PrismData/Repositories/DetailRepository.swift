@@ -9,8 +9,12 @@ public actor DetailRepository {
     nonisolated let session: URLSession
     public static let timeToLive: TimeInterval = 3 * 86_400
 
-    private var movies: [ContentID: MovieDetail] = [:]
-    private var series: [ContentID: SeriesDetail] = [:]
+    /// In-memory entries kept per kind; older ones are evicted (a `SeriesDetail` holds every
+    /// season and episode, so unbounded caches grow fast while browsing).
+    public static let memoryLimit = 200
+
+    private var movies = BoundedCache<ContentID, MovieDetail>(limit: DetailRepository.memoryLimit)
+    private var series = BoundedCache<ContentID, SeriesDetail>(limit: DetailRepository.memoryLimit)
     private var movieTasks: [ContentID: Task<MovieDetail, any Error>] = [:]
     private var seriesTasks: [ContentID: Task<SeriesDetail, any Error>] = [:]
 
@@ -18,18 +22,23 @@ public actor DetailRepository {
         self.directories = directories
         self.credentials = credentials
         self.session = session
+        // Detail files older than the TTL can never be served fresh: drop them once at launch.
+        let directory = directories.detailCacheDirectory
+        Task.detached(priority: .utility) {
+            AppDirectories.purgeExpiredFiles(in: directory, ttl: Self.timeToLive)
+        }
     }
 
-    private struct Stored<Value: Codable>: Codable {
+    private struct Stored<Value: Codable & Sendable>: Codable {
         var savedAt: Date
         var value: Value
     }
 
     public func movieDetail(_ movie: Movie, source: Source) async throws -> MovieDetail {
         guard source.kind == .xtream, !DemoContent.isDemo(source) else { return Self.localDetail(movie) }
-        if let cached = movies[movie.id] { return cached }
-        if let fresh: MovieDetail = read("movie", movie.id, allowStale: false) {
-            movies[movie.id] = fresh
+        if let cached = movies.value(for: movie.id) { return cached }
+        if let fresh: MovieDetail = await read("movie", movie.id, allowStale: false) {
+            movies.insert(fresh, for: movie.id)
             return fresh
         }
         if let running = movieTasks[movie.id] { return try await running.value }
@@ -39,20 +48,20 @@ public actor DetailRepository {
         defer { movieTasks[movie.id] = nil }
         do {
             let detail = try await task.value
-            movies[movie.id] = detail
-            write(detail, kind: "movie", id: movie.id)
+            movies.insert(detail, for: movie.id)
+            await write(detail, kind: "movie", id: movie.id)
             return detail
         } catch {
-            if let stale: MovieDetail = read("movie", movie.id, allowStale: true) { return stale }
+            if let stale: MovieDetail = await read("movie", movie.id, allowStale: true) { return stale }
             throw error
         }
     }
 
     public func seriesDetail(_ value: Series, source: Source) async throws -> SeriesDetail {
         guard source.kind == .xtream, !DemoContent.isDemo(source) else { return Self.localDetail(value) }
-        if let cached = series[value.id] { return cached }
-        if let fresh: SeriesDetail = read("series", value.id, allowStale: false) {
-            series[value.id] = fresh
+        if let cached = series.value(for: value.id) { return cached }
+        if let fresh: SeriesDetail = await read("series", value.id, allowStale: false) {
+            series.insert(fresh, for: value.id)
             return fresh
         }
         if let running = seriesTasks[value.id] { return try await running.value }
@@ -62,11 +71,11 @@ public actor DetailRepository {
         defer { seriesTasks[value.id] = nil }
         do {
             let detail = try await task.value
-            series[value.id] = detail
-            write(detail, kind: "series", id: value.id)
+            series.insert(detail, for: value.id)
+            await write(detail, kind: "series", id: value.id)
             return detail
         } catch {
-            if let stale: SeriesDetail = read("series", value.id, allowStale: true) { return stale }
+            if let stale: SeriesDetail = await read("series", value.id, allowStale: true) { return stale }
             throw error
         }
     }
@@ -75,9 +84,9 @@ public actor DetailRepository {
     /// Opening the player does not start a separate provider request.
     public func cachedSeriesDetail(_ value: Series, source: Source) async -> SeriesDetail? {
         guard source.kind == .xtream, !DemoContent.isDemo(source) else { return Self.localDetail(value) }
-        if let cached = series[value.id] { return cached }
+        if let cached = series.value(for: value.id) { return cached }
         if let running = seriesTasks[value.id], let detail = try? await running.value { return detail }
-        return read("series", value.id, allowStale: true)
+        return await read("series", value.id, allowStale: true)
     }
 
     /// Empties the memory cache (disk entries expire on their own).
@@ -138,7 +147,10 @@ public actor DetailRepository {
         directories.detailCacheDirectory.appending(path: "\(kind)-\(SafeFileName.make(id.rawValue)).json", directoryHint: .notDirectory)
     }
 
-    private nonisolated func read<Value: Codable>(_ kind: String, _ id: ContentID, allowStale: Bool) -> Value? {
+    /// Disk IO runs off the actor: a synchronous `Data(contentsOf:)` + decode used to block it
+    /// for milliseconds on every detail open.
+    @concurrent
+    private nonisolated func read<Value: Codable & Sendable>(_ kind: String, _ id: ContentID, allowStale: Bool) async -> Value? {
         guard let data = try? Data(contentsOf: file(kind, id)) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -147,10 +159,54 @@ public actor DetailRepository {
         return stored.value
     }
 
-    private nonisolated func write<Value: Codable>(_ value: Value, kind: String, id: ContentID) {
+    @concurrent
+    private nonisolated func write<Value: Codable & Sendable>(_ value: Value, kind: String, id: ContentID) async {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(Stored(savedAt: .now, value: value)) else { return }
         try? data.write(to: file(kind, id), options: [.atomic])
+    }
+}
+
+/// Insertion-ordered LRU cache: reads and writes mark the key as most recently used, and the
+/// oldest entries are dropped past `limit`. Bounds repository memory caches.
+struct BoundedCache<Key: Hashable, Value> {
+    private(set) var values: [Key: Value] = [:]
+    private var order: [Key] = []
+    let limit: Int
+
+    init(limit: Int) { self.limit = limit }
+
+    var count: Int { values.count }
+
+    /// Returns the value and marks it as recently used.
+    mutating func value(for key: Key) -> Value? {
+        guard let value = values[key] else { return nil }
+        touch(key)
+        return value
+    }
+
+    /// Stores `value`, marks it as most recently used and evicts the oldest entries.
+    mutating func insert(_ value: Value, for key: Key) {
+        if values[key] == nil {
+            order.append(key)
+        } else {
+            touch(key)
+        }
+        values[key] = value
+        while order.count > limit {
+            values.removeValue(forKey: order.removeFirst())
+        }
+    }
+
+    mutating func removeAll() {
+        values.removeAll()
+        order.removeAll()
+    }
+
+    private mutating func touch(_ key: Key) {
+        guard let index = order.firstIndex(of: key) else { return }
+        order.remove(at: index)
+        order.append(key)
     }
 }

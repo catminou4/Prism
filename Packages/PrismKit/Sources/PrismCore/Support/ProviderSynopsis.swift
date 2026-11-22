@@ -1,8 +1,13 @@
 import Foundation
 import NaturalLanguage
+import Synchronization
 
 /// IPTV panels sometimes concatenate several translations in one synopsis field.
 public enum ProviderSynopsis {
+    /// Bounded memoization: `cleaned` runs regex + language recognition and the same provider
+    /// plot repeats across variants. `Mutex` keeps `@concurrent` callers safe.
+    private static let cache = CleanedCache()
+
     /// Editorial cards prefer a French synopsis, then an English one, across available editions.
     /// Unknown Latin-language text is a last resort. Another writing system stays off the card.
     public static func preferredFrenchOrEnglish(from values: [String?]) -> String? {
@@ -23,7 +28,15 @@ public enum ProviderSynopsis {
     }
 
     public static func cleaned(_ value: String?) -> String? {
-        guard let value, let first = value.unicodeScalars.first, let last = value.unicodeScalars.last else { return nil }
+        guard let value else { return nil }
+        if let hit = cache.value(for: value) { return hit }
+        let result = cleanedUncached(value)
+        cache.store(result, for: value)
+        return result
+    }
+
+    private static func cleanedUncached(_ value: String) -> String? {
+        guard let first = value.unicodeScalars.first, let last = value.unicodeScalars.last else { return nil }
         let whitespace = CharacterSet.whitespacesAndNewlines
         let text = whitespace.contains(first) || whitespace.contains(last)
             ? value.trimmingCharacters(in: whitespace) : value
@@ -116,5 +129,23 @@ public enum ProviderSynopsis {
         guard letters > 0, let latin else { return nil }
         let latinLetters = latin.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text))
         return latinLetters * 2 > letters
+    }
+}
+
+/// Thread-safe bounded memo for `ProviderSynopsis.cleaned` — plots are long, so the cap is
+/// smaller than the title cache's. `nil` results are cached too (`.some(nil)`).
+private final class CleanedCache: Sendable {
+    private let storage = Mutex<[String: String?]>([:])
+    private let limit = 10_000
+
+    func value(for key: String) -> String?? {
+        storage.withLock { $0[key] }
+    }
+
+    func store(_ value: String?, for key: String) {
+        storage.withLock { map in
+            if map.count >= limit { map.removeAll(keepingCapacity: true) }
+            map[key] = .some(value)
+        }
     }
 }

@@ -8,23 +8,27 @@ public struct MediaBadge: View {
         case filled
     }
 
-    private let text: String
+    /// Quality labels rendered filled; everything else outlined.
+    nonisolated static let filledLabels: Set<String> = ["4K", "UHD", "HD", "FHD", "HDR", "HDR10", "DV", "8K", "SD"]
+
+    private let displayText: String
+    private let accessibilityText: Text
     private let style: Style
 
     public init(_ text: String, style: Style = .outlined) {
-        self.text = text
+        displayText = text.uppercased()
+        accessibilityText = Text(Self.spokenLabel(text))
         self.style = style
     }
 
     /// Picks the Apple convention for well-known labels (quality → filled, others → outlined).
     public init(automatic text: String) {
-        let filled: Set<String> = ["4K", "UHD", "HD", "FHD", "HDR", "HDR10", "DV", "8K", "SD"]
-        self.init(text, style: filled.contains(text.uppercased()) ? .filled : .outlined)
+        self.init(text, style: Self.filledLabels.contains(text.uppercased()) ? .filled : .outlined)
     }
 
     public var body: some View {
         let shape = RoundedRectangle(cornerRadius: PrismMetrics.badgeRadius, style: .continuous)
-        Text(text.uppercased())
+        Text(displayText)
             .font(PrismFont.badge)
             .tracking(0.2)
             .lineLimit(1)
@@ -40,7 +44,7 @@ public struct MediaBadge: View {
                 }
             }
             .compositingGroup()
-            .accessibilityLabel(Text(MediaBadge.spokenLabel(text)))
+            .accessibilityLabel(accessibilityText)
     }
 
     static func spokenLabel(_ text: String) -> String {
@@ -68,8 +72,7 @@ nonisolated public struct BadgeSpec: Hashable, Sendable, Identifiable {
 
     /// Filled for quality labels, outlined otherwise.
     public init(automatic text: String) {
-        let filled: Set<String> = ["4K", "UHD", "HD", "FHD", "HDR", "HDR10", "DV", "8K", "SD"]
-        self.init(text, style: filled.contains(text.uppercased()) ? .filled : .outlined)
+        self.init(text, style: MediaBadge.filledLabels.contains(text.uppercased()) ? .filled : .outlined)
     }
 }
 
@@ -85,8 +88,9 @@ public struct BadgeRow: View {
 
     public var body: some View {
         HStack(spacing: spacing) {
-            ForEach(badges) { badge in
-                MediaBadge(badge.text, style: badge.style)
+            // Index ids: `BadgeSpec.id` is the text, which providers may repeat.
+            ForEach(badges.indices, id: \.self) { index in
+                MediaBadge(badges[index].text, style: badges[index].style)
             }
         }
     }

@@ -141,7 +141,16 @@ public actor TMDBClient {
     let auth: Auth?
     public nonisolated let language: String
     private let http: HTTPClient
-    private var cache: [String: TMDBMetadata] = [:]
+    /// Bounded LRU: stamps refresh on hit; past the cap the oldest half is evicted.
+    private var cache: [String: Entry] = [:]
+    private var cacheClock: UInt64 = 0
+
+    private struct Entry {
+        var metadata: TMDBMetadata
+        var stamp: UInt64
+    }
+
+    private static let cacheLimit = 500
 
     /// `credential` is either a v3 API key (32 hex chars → `api_key=` query) or a v4 read access
     /// token (JWT → `Authorization: Bearer`).
@@ -190,7 +199,10 @@ public actor TMDBClient {
         }
         guard let id else { return nil }
         let cacheKey = "\(type.rawValue):\(id)"
-        if let cached = cache[cacheKey] { return cached }
+        if let cached = cache[cacheKey] {
+            cache[cacheKey]?.stamp = cacheStamp()
+            return cached.metadata
+        }
         let append = type == .movie ? "images,credits,videos,release_dates" : "images,credits,videos,content_ratings"
         guard let data = try await get("/\(type.rawValue)/\(id)", query: [
             ("language", language),
@@ -199,8 +211,19 @@ public actor TMDBClient {
             ("include_video_language", "\(languageCode),en"),
         ]) else { return nil }
         let metadata = try Self.decodeMetadata(data, kind: kind == .movie ? .movie : .series, region: region)
-        cache[cacheKey] = metadata
+        cache[cacheKey] = Entry(metadata: metadata, stamp: cacheStamp())
+        if cache.count > Self.cacheLimit {
+            let excess = cache.count - Self.cacheLimit / 2
+            for (key, _) in cache.sorted(by: { $0.value.stamp < $1.value.stamp }).prefix(excess) {
+                cache.removeValue(forKey: key)
+            }
+        }
         return metadata
+    }
+
+    private func cacheStamp() -> UInt64 {
+        cacheClock &+= 1
+        return cacheClock
     }
 
     public func seasonEpisodes(tmdbID: Int, season: Int) async throws -> [TMDBEpisodeInfo] {

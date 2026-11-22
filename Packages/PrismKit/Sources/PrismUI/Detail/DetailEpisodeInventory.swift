@@ -40,6 +40,9 @@ nonisolated struct DetailEpisodeInventory: Sendable {
         return orderedEpisodes.lazy.compactMap { progress[$0.id] }.max(by: older)
     }
 
+    /// Whether `id` is one of this edition's episode streams.
+    func contains(_ id: ContentID) -> Bool { episodeIndices[id] != nil }
+
     func nextAvailableEpisode(after id: ContentID) -> Episode? {
         guard let index = episodeIndices[id], orderedEpisodes.indices.contains(index + 1) else { return nil }
         return orderedEpisodes[index + 1]

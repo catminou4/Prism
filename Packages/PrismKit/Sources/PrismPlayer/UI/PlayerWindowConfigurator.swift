@@ -102,6 +102,9 @@ public struct PlayerWindowConfigurator: NSViewRepresentable {
                 if let ratio = configuration.aspectRatio, ratio.width > 0, ratio.height > 0 {
                     window.contentAspectRatio = ratio
                 } else {
+                    // Explicitly release the previous item's aspect lock; leaving it
+                    // would keep constraining resizes after a zap to another item.
+                    window.contentAspectRatio = NSSize(width: 0, height: 0)
                     window.resizeIncrements = NSSize(width: 1, height: 1)
                 }
             }

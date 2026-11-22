@@ -8,6 +8,13 @@ public actor XtreamClient {
     private let http: HTTPClient
     /// Native category IDs flagged adult, per kind (filled by `categories(_:)`).
     private var adultCategories: [MediaKind: Set<String>] = [:]
+    /// In-flight `categories(_:)` fetch per kind so concurrent `adultIDs` calls share one request.
+    private var adultFetches: [MediaKind: Fetch] = [:]
+
+    private struct Fetch {
+        let id = UUID()
+        let task: Task<Void, Never>
+    }
 
     public init(credentials: XtreamCredentials, sourceID: SourceID, userAgent: String? = nil, session: URLSession? = nil) {
         self.credentials = credentials
@@ -17,7 +24,7 @@ public actor XtreamClient {
 
     public func authenticate() async throws -> XtreamAccount {
         let data = try await get(action: nil, timeout: 20)
-        return try XtreamDecoder.account(data, credentials: credentials)
+        return try await decode { try XtreamDecoder.account(data, credentials: self.credentials) }
     }
 
     /// live/movie/series → get_live_categories / get_vod_categories / get_series_categories.
@@ -30,7 +37,7 @@ public actor XtreamClient {
         }
         let resolvedKind: MediaKind = kind == .episode ? .series : kind
         let data = try await get(action: action)
-        let categories = try XtreamDecoder.categories(data, kind: resolvedKind, sourceID: sourceID)
+        let categories = try await decode { try XtreamDecoder.categories(data, kind: resolvedKind, sourceID: self.sourceID) }
         adultCategories[resolvedKind] = Set(categories.filter(\.isAdult).map(\.nativeID))
         return categories
     }
@@ -39,34 +46,36 @@ public actor XtreamClient {
     public func liveStreams(preferHLS: Bool, account: XtreamAccount?) async throws -> [Channel] {
         let adult = await adultIDs(.live)
         let data = try await get(action: "get_live_streams")
-        return try XtreamDecoder.liveStreams(
-            data, sourceID: sourceID, credentials: credentials, preferHLS: preferHLS,
-            allowedFormats: account?.allowedOutputFormats ?? [], adultCategoryIDs: adult
-        )
+        return try await decode {
+            try XtreamDecoder.liveStreams(
+                data, sourceID: self.sourceID, credentials: self.credentials, preferHLS: preferHLS,
+                allowedFormats: account?.allowedOutputFormats ?? [], adultCategoryIDs: adult
+            )
+        }
     }
 
     public func vodStreams() async throws -> [Movie] {
         let adult = await adultIDs(.movie)
         let data = try await get(action: "get_vod_streams")
-        return try XtreamDecoder.vodStreams(data, sourceID: sourceID, credentials: credentials, adultCategoryIDs: adult)
+        return try await decode { try XtreamDecoder.vodStreams(data, sourceID: self.sourceID, credentials: self.credentials, adultCategoryIDs: adult) }
     }
 
     public func series() async throws -> [Series] {
         let adult = await adultIDs(.series)
         let data = try await get(action: "get_series")
-        return try XtreamDecoder.series(data, sourceID: sourceID, adultCategoryIDs: adult)
+        return try await decode { try XtreamDecoder.series(data, sourceID: self.sourceID, adultCategoryIDs: adult) }
     }
 
     /// `get_vod_info&vod_id=`
     public func movieDetail(_ movie: Movie) async throws -> MovieDetail {
         let data = try await get(action: "get_vod_info", extra: [URLQueryItem(name: "vod_id", value: movie.nativeID)], timeout: 20)
-        return try XtreamDecoder.movieDetail(data, movie: movie)
+        return try await decode { try XtreamDecoder.movieDetail(data, movie: movie) }
     }
 
     /// `get_series_info&series_id=`
     public func seriesDetail(_ series: Series) async throws -> SeriesDetail {
         let data = try await get(action: "get_series_info", extra: [URLQueryItem(name: "series_id", value: series.nativeID)], timeout: 20)
-        return try XtreamDecoder.seriesDetail(data, series: series, credentials: credentials)
+        return try await decode { try XtreamDecoder.seriesDetail(data, series: series, credentials: self.credentials) }
     }
 
     /// `get_short_epg&stream_id=&limit=` (titles/descriptions are base64).
@@ -76,14 +85,32 @@ public actor XtreamClient {
             extra: [URLQueryItem(name: "stream_id", value: streamID), URLQueryItem(name: "limit", value: String(max(limit, 1)))],
             timeout: 15
         )
-        return try XtreamDecoder.shortEPG(data, streamID: streamID, epgChannelID: epgChannelID)
+        return try await decode { try XtreamDecoder.shortEPG(data, streamID: streamID, epgChannelID: epgChannelID) }
     }
 
     // MARK: - Private
 
+    /// JSONSerialization + per-item normalization of large payloads must not serialize on this
+    /// actor: decoding runs on the concurrent pool, with a cancellation check on both sides.
+    private func decode<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        return try await Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try operation()
+        }.value
+    }
+
     private func adultIDs(_ kind: MediaKind) async -> Set<String> {
         if let cached = adultCategories[kind] { return cached }
-        _ = try? await categories(kind)
+        let fetch: Fetch
+        if let running = adultFetches[kind] {
+            fetch = running
+        } else {
+            fetch = Fetch(task: Task { _ = try? await self.categories(kind) })
+            adultFetches[kind] = fetch
+        }
+        await fetch.task.value
+        if adultFetches[kind]?.id == fetch.id { adultFetches[kind] = nil }
         return adultCategories[kind] ?? []
     }
 

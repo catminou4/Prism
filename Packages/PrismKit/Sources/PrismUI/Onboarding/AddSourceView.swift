@@ -290,11 +290,19 @@ struct AddSourceView: View {
                 Button("Retour") {
                     changeStep {
                         kind = nil
-                        showsValidation = false
-                        error = nil
+                        // Full draft reset: nothing typed for one source kind leaks
+                        // into the next (the guide URL can carry credentials).
+                        name = ""
                         address = ""
                         username = ""
                         password = ""
+                        guideAddress = ""
+                        userAgent = ""
+                        file = nil
+                        advanced = false
+                        showsValidation = false
+                        error = nil
+                        focus = nil
                     }
                 }
                 .buttonStyle(.glass)
@@ -438,16 +446,7 @@ struct AddSourceView: View {
     }
 
     private func displayError(_ error: any Error) -> String {
-        if let error = error as? KeychainError { return error.localizedDescription }
-        if let error = error as? SourceError {
-            if case .network = error { return "Connexion à la source impossible. Vérifiez l’adresse et réessayez." }
-            return error.localizedDescription
-        }
-        if let error = error as? XtreamError {
-            if case .network = error { return "Connexion au serveur impossible. Vérifiez l’adresse et réessayez." }
-            return error.localizedDescription
-        }
-        return "L’importation a échoué. Vérifiez les informations de la source et réessayez."
+        UserFacingError.message(for: error)
     }
 }
 

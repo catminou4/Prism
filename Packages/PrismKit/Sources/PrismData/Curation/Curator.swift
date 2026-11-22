@@ -167,6 +167,10 @@ struct FeedBuilder {
     let day: Int
     var used: Set<TitleID> = []
     private var affinity = Affinity()
+    /// Memoized candidate scans, one per (kind set, facet): `used` never feeds them and every
+    /// other input is fixed for the builder's lifetime, so repeated shelf/"voir tout" lookups
+    /// extend a scan instead of re-filtering the whole ranking.
+    private var candidateScans: [CandidateKey: CandidateScan] = [:]
 
     init(
         catalog: Catalog, index: CurationIndex, recommendations: Recommendations, languages: Set<HomeAudioLanguage>,
@@ -409,7 +413,7 @@ struct FeedBuilder {
     }
 
     /// Ranked titles matching a query (presented names), not deduplicated against other shelves.
-    func titles(for query: CurationQuery, limit: Int) -> [MediaTitle] {
+    mutating func titles(for query: CurationQuery, limit: Int) -> [MediaTitle] {
         var result: [MediaTitle] = []
         for candidate in candidates(for: query, limit: limit + limit / 4 + 4) {
             let presented = present(titleAt(candidate.kind, candidate.index))
@@ -426,31 +430,89 @@ struct FeedBuilder {
         let index: Int32
     }
 
-    /// Ranked catalogue positions matching a query, before presentation.
-    func candidates(for query: CurationQuery, limit: Int) -> [Candidate] {
-        let kinds = query.kind.map { [$0] } ?? [.movie, .series]
-        var scored: [Candidate] = []
-        let poolLimit = limit * 4 + 40
-        var seed: (id: TitleID, kind: MediaKind, signals: TitleSignals)?
-        if case .because(let id) = query.facet {
-            guard let title = catalog.title(id), let signals = index.signals(for: title, in: catalog) else { return [] }
-            seed = (title.id, title.kind, signals)
+    /// Cache key for memoized candidate scans: kind set and facet fully determine the filtered
+    /// ranking; `limit` only controls how deep the scan is extended.
+    private struct CandidateKey: Hashable {
+        var kind: MediaKind?
+        var facet: CurationQuery.Facet
+    }
+
+    /// One (kind set, facet) scan: per-kind filtered candidates kept in ranking order plus how
+    /// far each kind's ranking has been consumed. `seed` is the resolved `.because` anchor.
+    private struct CandidateScan {
+        struct KindScan {
+            var kind: MediaKind
+            var candidates: [Candidate] = []
+            var rankPosition = 0
+            var exhausted = false
         }
+        var kinds: [KindScan]
+        var seed: (id: TitleID, kind: MediaKind, signals: TitleSignals)?
+        var seedChecked = false
+
+        init(kinds: [MediaKind]) {
+            self.kinds = kinds.map { KindScan(kind: $0) }
+        }
+    }
+
+    /// Ranked catalogue positions matching a query, before presentation.
+    /// Scans are memoized per (kind set, facet) and extended lazily to the depth each limit
+    /// needs; results are identical to rescanning because nothing but `limit` varies between
+    /// calls on the same query.
+    mutating func candidates(for query: CurationQuery, limit: Int) -> [Candidate] {
+        let key = CandidateKey(kind: query.kind, facet: query.facet)
+        var scan = candidateScans[key] ?? CandidateScan(kinds: query.kind.map { [$0] } ?? [.movie, .series])
+        let poolLimit = limit * 4 + 40
+        let followsGeneral = query.facet.followsGeneralScore
         let checksLanguage = index.hasLanguageEvidence
-        for kind in kinds {
+
+        // The "because" seed resolves once per scan; an unresolvable seed yields no candidates.
+        if case .because = query.facet, !scan.seedChecked {
+            scan.seedChecked = true
+            if case .because(let id) = query.facet,
+               let title = catalog.title(id), let signals = index.signals(for: title, in: catalog) {
+                scan.seed = (title.id, title.kind, signals)
+            }
+        }
+        if case .because = query.facet, scan.seed == nil {
+            candidateScans[key] = scan
+            return []
+        }
+        let seed = scan.seed
+
+        // Extend each kind's filtered scan to the depth this request needs (or to exhaustion
+        // for facets that do not follow the general ranking).
+        for kindIndex in scan.kinds.indices {
+            let target = followsGeneral ? poolLimit : Int.max
+            guard !scan.kinds[kindIndex].exhausted,
+                  scan.kinds[kindIndex].candidates.count < target else { continue }
+            let kind = scan.kinds[kindIndex].kind
             let signals = index.signals(kind)
             let titles = kind == .series ? catalog.series : catalog.movies
-            var taken = 0
-            for titleIndex in index.ranking(kind) {
+            let ranking = index.ranking(kind)
+            while scan.kinds[kindIndex].rankPosition < ranking.count,
+                  scan.kinds[kindIndex].candidates.count < target {
+                let titleIndex = ranking[scan.kinds[kindIndex].rankPosition]
+                scan.kinds[kindIndex].rankPosition += 1
                 let signal = signals[Int(titleIndex)]
                 guard !checksLanguage || signal.matches(audio: audioMask),
-                      let score = score(signal, kind: kind, index: titleIndex, for: query.facet, seed: seed),
+                      let facetScore = score(signal, kind: kind, index: titleIndex, for: query.facet, seed: seed),
                       profile.dismissed.isEmpty || !profile.dismissed.contains(titles[Int(titleIndex)].id) else { continue }
-                scored.append(Candidate(score: score, kind: kind, index: titleIndex))
-                taken += 1
-                // Rankings are sorted by the general score: once enough candidates are seen for facets
-                // that mostly follow it, the long tail cannot win.
-                if taken >= poolLimit, query.facet.followsGeneralScore { break }
+                scan.kinds[kindIndex].candidates.append(Candidate(score: facetScore, kind: kind, index: titleIndex))
+            }
+            scan.kinds[kindIndex].exhausted = scan.kinds[kindIndex].rankPosition >= ranking.count
+        }
+        candidateScans[key] = scan
+
+        var scored: [Candidate] = []
+        scored.reserveCapacity(scan.kinds.reduce(0) { $0 + min($1.candidates.count, followsGeneral ? poolLimit : $1.candidates.count) })
+        for kindScan in scan.kinds {
+            if followsGeneral {
+                // Rankings are sorted by the general score: once enough candidates are seen for
+                // facets that mostly follow it, the long tail cannot win.
+                scored.append(contentsOf: kindScan.candidates.prefix(poolLimit))
+            } else {
+                scored.append(contentsOf: kindScan.candidates)
             }
         }
         if scored.count > limit {
@@ -571,7 +633,7 @@ struct FeedBuilder {
 
     // MARK: Charts
 
-    private func top(_ kind: MediaKind, count: Int) -> [MediaTitle] {
+    private mutating func top(_ kind: MediaKind, count: Int) -> [MediaTitle] {
         titles(for: CurationQuery(kind: kind, facet: .top, title: ""), limit: count)
     }
 
@@ -590,7 +652,7 @@ struct FeedBuilder {
 
     // MARK: Rotation
 
-    private func rotatingPlatforms(kind: MediaKind?, limit: Int) -> [StreamingPlatform] {
+    private mutating func rotatingPlatforms(kind: MediaKind?, limit: Int) -> [StreamingPlatform] {
         let available = StreamingPlatform.allCases.filter { platform in
             candidates(for: CurationQuery(kind: kind, facet: .platform(platform), title: ""), limit: 12).count >= 12
         }
@@ -598,7 +660,7 @@ struct FeedBuilder {
     }
 
     /// Decades with a real choice of titles, rotated daily.
-    private func rotatingDecades(kind: MediaKind?, limit: Int) -> [Int] {
+    private mutating func rotatingDecades(kind: MediaKind?, limit: Int) -> [Int] {
         let decades = (kind == .series ? [1990, 2000, 2010] : [1970, 1980, 1990, 2000, 2010]).filter { decade in
             candidates(for: CurationQuery(kind: kind, facet: .decade(decade), title: ""), limit: minimumShelf * 2).count >= minimumShelf * 2
         }

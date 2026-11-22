@@ -67,6 +67,8 @@ struct BrowseScreen: View {
             .onScrollPhaseChange { _, phase in
                 if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
             }
+            // Les cartes lisent ce flag pour suspendre leur survol pendant le scroll.
+            .environment(\.prismIsScrollingContent, motion.isScrolling)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
                 BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
@@ -416,7 +418,10 @@ private struct HighlightPage: View {
                 }
                 HStack(spacing: PrismMetrics.heroButtonSpacing) {
                     if let quickPlay {
-                        let progress = app.library.latestProgress(forTitle: title.id)
+                        // `latestProgress` lit `library.progress` : on ne s'y
+                        // abonne que quand la page est réellement visible, sinon
+                        // chaque tick de lecture réévaluerait le héros caché.
+                        let progress = isActive ? app.library.latestProgress(forTitle: title.id) : nil
                         let resumable = progress.map { !$0.isFinished && $0.position >= 5 } ?? false
                         PrimaryCapsuleButton(
                             resumable ? "Reprendre" : "Lecture", systemImage: "play.fill",

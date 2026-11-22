@@ -31,18 +31,9 @@ public enum CatalogBuilder {
         let ordered = enabled.compactMap { catalogBySource[$0.id] }
         let context = Context(catalogs: ordered, priority: priority, options: options)
 
-        // Normalization keys, computed once and in parallel (the expensive part on 150k+ items).
-        async let movieKeys = parallelKeys(ordered.map(\.movies)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
-        async let seriesKeys = parallelKeys(ordered.map(\.series)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
-        async let channelKeys = parallelKeys(ordered.map(\.channels)) { channelKey($0) }
-        let keys = await (movies: movieKeys, series: seriesKeys, channels: channelKeys)
-        guard !Task.isCancelled else { return .empty }
-
-        // Grouping (each kind concurrently; title construction is itself chunked in parallel).
-        async let movieTitles = groupMedia(kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context)
-        async let seriesTitles = groupMedia(kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context)
-        async let channelGroups = groupChannels(lists: ordered.map(\.channels), keys: keys.channels, context: context)
-        let (movieGroups, seriesGroups, channelGrouping) = await (movieTitles, seriesTitles, channelGroups)
+        // Normalization keys, then grouping — kept in one scope so the per-item key strings
+        // are released when grouping finishes instead of living until `build` returns.
+        let (movieGroups, seriesGroups, channelGrouping) = await groupedTitles(ordered: ordered, context: context)
         guard !Task.isCancelled else { return .empty }
         let movies = movieGroups.titles, series = seriesGroups.titles, channels = channelGrouping.groups
 
@@ -62,6 +53,18 @@ public enum CatalogBuilder {
         for category in context.categories.values where category.kind == .movie || category.kind == .series {
             let languages = ProviderCategoryLanguage.codes(in: category.rawName)
             if !languages.isEmpty { indexes.categoryLanguages[category.id] = languages }
+        }
+        // Provider-language labels per variant, resolved once: `providerLanguages(for:)` sits on
+        // hot audio paths and would otherwise interpolate category prefixes on every call.
+        if !indexes.categoryLanguages.isEmpty {
+            var languages: [ContentID: Set<String>] = [:]
+            for title in movies {
+                for variant in title.variants { collectProviderLanguages(variant, categoryLanguages: indexes.categoryLanguages, into: &languages) }
+            }
+            for title in series {
+                for variant in title.variants { collectProviderLanguages(variant, categoryLanguages: indexes.categoryLanguages, into: &languages) }
+            }
+            indexes.providerLanguages = languages
         }
         indexes.movieByTitleID = movieGroups.titleIndex
         indexes.movieByContent = movieGroups.contentIndex
@@ -87,6 +90,44 @@ public enum CatalogBuilder {
             liveCategories: categoryResults[0].groups, movieCategories: categoryResults[1].groups,
             seriesCategories: categoryResults[2].groups, indexes: indexes
         )
+    }
+
+    /// Normalization keys (one String per raw item, the expensive part on 150k+ items) followed
+    /// by grouping of all three kinds concurrently. Kept in one scope so `keys` is released when
+    /// this returns instead of living until `build` returns (audit C5 memory peak).
+    private static func groupedTitles(
+        ordered: [SourceCatalog], context: Context
+    ) async -> (movies: MediaGroups, series: MediaGroups, channels: ChannelGroups) {
+        async let movieKeys = parallelKeys(ordered.map(\.movies)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
+        async let seriesKeys = parallelKeys(ordered.map(\.series)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
+        async let channelKeys = parallelKeys(ordered.map(\.channels)) { channelKey($0) }
+        let keys = await (movies: movieKeys, series: seriesKeys, channels: channelKeys)
+        guard !Task.isCancelled else { return (MediaGroups(), MediaGroups(), ChannelGroups()) }
+
+        // Grouping: each kind concurrently; title construction is itself chunked in parallel.
+        async let movieTitles = groupMedia(kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context)
+        async let seriesTitles = groupMedia(kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context)
+        async let channelGroups = groupChannels(lists: ordered.map(\.channels), keys: keys.channels, context: context)
+        return await (movieTitles, seriesTitles, channelGroups)
+    }
+
+    /// Records the declared language labels of one variant (empty when its category has none),
+    /// using the same canonical-category resolution as `Catalog.providerLanguages(for:)`.
+    private static func collectProviderLanguages(
+        _ variant: MediaVariant, categoryLanguages: [String: Set<String>], into result: inout [ContentID: Set<String>]
+    ) {
+        let category: (id: String?, kind: MediaKind) = switch variant {
+        case .movie(let movie): (movie.categoryID, .movie)
+        case .series(let series): (series.categoryID, .series)
+        }
+        guard let id = category.id else {
+            result[variant.id] = []
+            return
+        }
+        // Older imports can carry the native category ID instead of the canonical reference.
+        let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
+        let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
+        result[variant.id] = categoryLanguages[canonicalID] ?? []
     }
 
     // MARK: - Context
@@ -198,6 +239,109 @@ public enum CatalogBuilder {
         }
     }
 
+    // MARK: - Item resolution
+
+    /// Per-item resolution shared by media and channel grouping, computed once in parallel:
+    /// visibility after category filtering, the visible category id, the adult flag and the
+    /// grouping shard (key hash). `categories`/`adult` keep the sequential defaults for skipped
+    /// items so downstream lookups stay index-aligned.
+    struct ResolvedItems: Sendable {
+        var categories: [[String?]]
+        var adult: [[Bool]]
+        var visible: [[Bool]]
+        var shards: [[UInt8]]
+        var shardCount: Int
+        var hasTaggedEditions: Bool
+        var hasTMDBIdentity: Bool
+    }
+
+    /// One resolved range of a catalog, merged back by position.
+    private struct ResolvedPart: Sendable {
+        var catalog: Int
+        var lower: Int
+        var categories: [String?]
+        var adult: [Bool]
+        var visible: [Bool]
+        var shards: [UInt8]
+        var taggedEditions: Bool
+        var tmdbIdentity: Bool
+    }
+
+    /// Resolves category visibility, adult flags and shard assignment for every item in
+    /// parallel chunks (per catalog), preserving the exact sequential per-item decisions.
+    static func resolveItems<V: Sendable>(
+        _ lists: [[V]], keys: [[String]], context: Context, kind: MediaKind,
+        categoryID: @escaping @Sendable (V) -> String?,
+        isAdult: @escaping @Sendable (V) -> Bool,
+        tags: @escaping @Sendable (V) -> [String],
+        tmdbID: @escaping @Sendable (V) -> Int?
+    ) async -> ResolvedItems {
+        let total = lists.reduce(0) { $0 + $1.count }
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
+        let shardCount = max(1, min(workers, 8))
+        var result = ResolvedItems(
+            categories: lists.map { [String?](repeating: nil, count: $0.count) },
+            adult: lists.map { [Bool](repeating: false, count: $0.count) },
+            visible: lists.map { [Bool](repeating: false, count: $0.count) },
+            shards: lists.map { [UInt8](repeating: 0, count: $0.count) },
+            shardCount: shardCount,
+            hasTaggedEditions: false, hasTMDBIdentity: false
+        )
+        guard total > 0 else { return result }
+        let chunk = max(2_048, total / (workers * 2))
+        let parts: [ResolvedPart] = await withTaskGroup(of: ResolvedPart.self) { group in
+            for (catalogIndex, list) in lists.enumerated() {
+                var start = 0
+                while start < list.count {
+                    let lower = start, upper = min(start + chunk, list.count)
+                    group.addTask {
+                        let resolver = context.resolver(catalog: catalogIndex, kind: kind)
+                        var cats = [String?](repeating: nil, count: upper - lower)
+                        var adultFlags = [Bool](repeating: false, count: upper - lower)
+                        var visibleFlags = [Bool](repeating: false, count: upper - lower)
+                        var shardIDs = [UInt8](repeating: 0, count: upper - lower)
+                        var tagged = false
+                        var tmdb = false
+                        for index in lower..<upper {
+                            let item = list[index]
+                            let category = categoryID(item).flatMap { resolver[$0] }
+                            let adult = isAdult(item) || category?.isAdult == true
+                            let hidden = category?.isHidden == true || (adult && context.options.hideAdult)
+                            let offset = index - lower
+                            visibleFlags[offset] = !hidden
+                            guard !hidden else { continue }
+                            cats[offset] = category?.visibleID
+                            adultFlags[offset] = adult
+                            if !tagged, !tags(item).isEmpty { tagged = true }
+                            if !tmdb, let id = tmdbID(item), id > 0 { tmdb = true }
+                            shardIDs[offset] = UInt8(StableHash.fnv1a64(keys[catalogIndex][index]) % UInt64(shardCount))
+                        }
+                        return ResolvedPart(
+                            catalog: catalogIndex, lower: lower, categories: cats, adult: adultFlags,
+                            visible: visibleFlags, shards: shardIDs,
+                            taggedEditions: tagged, tmdbIdentity: tmdb
+                        )
+                    }
+                    start = upper
+                }
+            }
+            var collected: [ResolvedPart] = []
+            for await part in group { collected.append(part) }
+            return collected
+        }
+        for part in parts {
+            let catalog = part.catalog
+            let count = part.categories.count
+            result.categories[catalog].replaceSubrange(part.lower..<(part.lower + count), with: part.categories)
+            result.adult[catalog].replaceSubrange(part.lower..<(part.lower + count), with: part.adult)
+            result.visible[catalog].replaceSubrange(part.lower..<(part.lower + count), with: part.visible)
+            result.shards[catalog].replaceSubrange(part.lower..<(part.lower + count), with: part.shards)
+            result.hasTaggedEditions = result.hasTaggedEditions || part.taggedEditions
+            result.hasTMDBIdentity = result.hasTMDBIdentity || part.tmdbIdentity
+        }
+        return result
+    }
+
     // MARK: - Movies & series
 
     struct Ref: Hashable {
@@ -213,6 +357,12 @@ public enum CatalogBuilder {
         /// Category ids per title, in `titles` order.
         var categoryIDs: [Set<String>] = []
         var hasTaggedEditions = false
+    }
+
+    /// One key-hash shard's grouping output.
+    private struct MediaShard: Sendable {
+        var shard: Int
+        var groups: [MediaGroup]
     }
 
     /// Per-chunk output of the parallel title construction.
@@ -254,71 +404,100 @@ public enum CatalogBuilder {
         guard total > 0 else { return MediaGroups() }
         let categoryKind: MediaKind = kind == .series ? .series : .movie
 
-        var datedGroups: [NameIdentity: Int] = Dictionary(minimumCapacity: total)
-        /// Normalized title → its only dated group, or -1 when several years exist.
-        var yearsByKey: [String: Int] = Dictionary(minimumCapacity: total)
-        var undatedGroups: [String: Int] = [:]
-        var mediaGroups: [MediaGroup] = []
-        mediaGroups.reserveCapacity(total)
-        var pendingNoYear: [(key: String, ref: Ref)] = []
-        var resolvedCategories: [[String?]] = []
-        var adultFlags: [[Bool]] = []
-        var hasTMDBIdentity = false
-        var hasTaggedEditions = false
+        // Category/adult resolution and shard assignment run once, in parallel. Grouping is then
+        // sharded by key hash: every variant of a work shares its key, so each shard sees
+        // complete grouping information and the shards merge back in deterministic order.
+        let resolved = await resolveItems(
+            lists, keys: keys, context: context, kind: categoryKind,
+            categoryID: { $0.categoryID }, isAdult: { $0.isAdult }, tags: { $0.tags }, tmdbID: { $0.tmdbID }
+        )
+        guard !Task.isCancelled else { return MediaGroups() }
 
-        for (catalogIndex, list) in lists.enumerated() {
-            var cats = [String?](repeating: nil, count: list.count)
-            var adult = [Bool](repeating: false, count: list.count)
-            let resolver = context.resolver(catalog: catalogIndex, kind: categoryKind)
-            let listKeys = keys[catalogIndex]
-            for (itemIndex, item) in list.enumerated() {
-                let category = item.categoryID.flatMap { resolver[$0] }
-                let isAdult = item.isAdult || category?.isAdult == true
-                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
-                if !hasTaggedEditions, !item.tags.isEmpty { hasTaggedEditions = true }
-                adult[itemIndex] = isAdult
-                cats[itemIndex] = category?.visibleID
-                if !hasTMDBIdentity, let tmdbID = item.tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
-                let key = listKeys[itemIndex]
-                let ref = Ref(catalog: Int32(catalogIndex), item: Int32(itemIndex))
-                guard let year = item.year else {
-                    pendingNoYear.append((key, ref))
-                    continue
-                }
-                let dated = NameIdentity(key: key, year: year)
-                if let group = datedGroups[dated] {
-                    mediaGroups[group].refs.append(ref)
-                } else {
-                    let group = mediaGroups.count
-                    mediaGroups.append(MediaGroup(name: dated, refs: [ref]))
-                    datedGroups[dated] = group
-                    yearsByKey[key] = yearsByKey[key] == nil ? group : -1
+        let shards: [MediaShard] = await withTaskGroup(of: MediaShard.self) { group in
+            for shard in 0..<resolved.shardCount {
+                group.addTask {
+                    var datedGroups: [NameIdentity: Int] = [:]
+                    /// Normalized title → its only dated group, or -1 when several years exist.
+                    var yearsByKey: [String: Int] = [:]
+                    var undatedGroups: [String: Int] = [:]
+                    var mediaGroups: [MediaGroup] = []
+                    var pendingNoYear: [(key: String, ref: Ref)] = []
+                    for (catalogIndex, list) in lists.enumerated() {
+                        for (itemIndex, item) in list.enumerated() {
+                            guard resolved.visible[catalogIndex][itemIndex],
+                                  Int(resolved.shards[catalogIndex][itemIndex]) == shard else { continue }
+                            let key = keys[catalogIndex][itemIndex]
+                            let ref = Ref(catalog: Int32(catalogIndex), item: Int32(itemIndex))
+                            guard let year = item.year else {
+                                pendingNoYear.append((key, ref))
+                                continue
+                            }
+                            let dated = NameIdentity(key: key, year: year)
+                            if let group = datedGroups[dated] {
+                                mediaGroups[group].refs.append(ref)
+                            } else {
+                                let group = mediaGroups.count
+                                mediaGroups.append(MediaGroup(name: dated, refs: [ref]))
+                                datedGroups[dated] = group
+                                yearsByKey[key] = yearsByKey[key] == nil ? group : -1
+                            }
+                        }
+                    }
+                    // A variant without a year joins the only dated group with the same key;
+                    // otherwise an undated group.
+                    for (key, ref) in pendingNoYear {
+                        if let group = yearsByKey[key], group >= 0 {
+                            mediaGroups[group].refs.append(ref)
+                        } else if let group = undatedGroups[key] {
+                            mediaGroups[group].refs.append(ref)
+                        } else {
+                            let group = mediaGroups.count
+                            mediaGroups.append(MediaGroup(name: NameIdentity(key: key, year: nil), refs: [ref]))
+                            undatedGroups[key] = group
+                        }
+                    }
+                    return MediaShard(shard: shard, groups: mediaGroups)
                 }
             }
-            resolvedCategories.append(cats)
-            adultFlags.append(adult)
+            var parts: [MediaShard] = []
+            for await part in group { parts.append(part) }
+            return parts.sorted { $0.shard < $1.shard }
         }
-        // A variant without a year joins the only dated group with the same key; otherwise an undated group.
-        for (key, ref) in pendingNoYear {
-            if let group = yearsByKey[key], group >= 0 {
-                mediaGroups[group].refs.append(ref)
-            } else if let group = undatedGroups[key] {
-                mediaGroups[group].refs.append(ref)
-            } else {
-                let group = mediaGroups.count
-                mediaGroups.append(MediaGroup(name: NameIdentity(key: key, year: nil), refs: [ref]))
-                undatedGroups[key] = group
+        guard !Task.isCancelled else { return MediaGroups() }
+
+        // Restore the sequential order — dated groups by first encounter, then undated ones —
+        // so editorial aliases and identity reconciliation see the same input as before.
+        var dated: [MediaGroup] = []
+        var undated: [MediaGroup] = []
+        for part in shards {
+            for group in part.groups {
+                if group.name.year != nil { dated.append(group) } else { undated.append(group) }
             }
+        }
+        func birthOrder(_ lhs: MediaGroup, _ rhs: MediaGroup) -> Bool {
+            let a = lhs.refs.first ?? Ref(catalog: Int32.max, item: Int32.max)
+            let b = rhs.refs.first ?? Ref(catalog: Int32.max, item: Int32.max)
+            return a.catalog != b.catalog ? a.catalog < b.catalog : a.item < b.item
+        }
+        dated.sort(by: birthOrder)
+        undated.sort(by: birthOrder)
+        var mediaGroups: [MediaGroup] = []
+        mediaGroups.reserveCapacity(dated.count + undated.count)
+        mediaGroups.append(contentsOf: dated)
+        mediaGroups.append(contentsOf: undated)
+
+        var datedGroups: [NameIdentity: Int] = Dictionary(minimumCapacity: mediaGroups.count)
+        for (index, group) in mediaGroups.enumerated() where group.name.year != nil {
+            datedGroups[group.name] = index
         }
 
         // Build titles in parallel chunks (variant sorting + metadata merge).
-        guard !Task.isCancelled else { return MediaGroups() }
         let namedGroups = mergeEditorialAliases(mediaGroups, datedGroups: datedGroups, kind: kind, lists: lists)
-        let frozenGroups = hasTMDBIdentity ? reconcileMediaIdentities(namedGroups, lists: lists) : namedGroups
+        let frozenGroups = resolved.hasTMDBIdentity ? await reconcileMediaIdentities(namedGroups, lists: lists) : namedGroups
         let groupCount = frozenGroups.count
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunk = max(2_048, groupCount / (workers * 2))
-        let frozenCategories = resolvedCategories, frozenAdult = adultFlags
+        let frozenCategories = resolved.categories, frozenAdult = resolved.adult
         let chunks: [BuiltChunk] = await withTaskGroup(of: BuiltChunk.self) { group in
             var start = 0
             while start < groupCount {
@@ -374,18 +553,30 @@ public enum CatalogBuilder {
         async let categories = order.map { title(at: $0).categoryIDs }
         async let titleIndex: [TitleID: Int] = {
             var index: [TitleID: Int] = Dictionary(minimumCapacity: groupCount)
+            // Canonical ids first: an alias or translated name must never overwrite another
+            // group's real title mapping.
+            for (position, group) in order.enumerated() {
+                index[title(at: group).id] = position
+            }
             for (position, group) in order.enumerated() {
                 let media = frozenGroups[group]
-                let id = title(at: group).id
-                index[id] = position
-                if !media.ambiguousName, !media.aliases.isEmpty { index[media.name.id(kind: kind)] = position }
-                for alias in media.aliases { index[alias.id(kind: kind)] = position }
-                if let tmdbID = media.tmdbID { index[TitleID(kind: kind, tmdbID: tmdbID)] = position }
+                if !media.ambiguousName, !media.aliases.isEmpty {
+                    let nameID = media.name.id(kind: kind)
+                    if index[nameID] == nil { index[nameID] = position }
+                }
+                for alias in media.aliases where index[alias.id(kind: kind)] == nil {
+                    index[alias.id(kind: kind)] = position
+                }
+                if let tmdbID = media.tmdbID {
+                    let id = TitleID(kind: kind, tmdbID: tmdbID)
+                    if index[id] == nil { index[id] = position }
+                }
             }
             return index
         }()
         async let contentIndex: [ContentID: Int] = {
-            var index: [ContentID: Int] = Dictionary(minimumCapacity: total)
+            // One entry per variant: the grouped refs are exactly the visible items.
+            var index: [ContentID: Int] = Dictionary(minimumCapacity: frozenGroups.reduce(0) { $0 + $1.refs.count })
             for (position, group) in order.enumerated() {
                 for variant in title(at: group).variants { index[variant.id] = position }
             }
@@ -393,7 +584,7 @@ public enum CatalogBuilder {
         }()
         return await MediaGroups(
             titles: titles, titleIndex: titleIndex, contentIndex: contentIndex,
-            categoryIDs: categories, hasTaggedEditions: hasTaggedEditions
+            categoryIDs: categories, hasTaggedEditions: resolved.hasTaggedEditions
         )
     }
 
@@ -440,7 +631,50 @@ public enum CatalogBuilder {
 
     /// Trusted provider IDs link translations, and keep homonyms separate even in the same year.
     /// A provider without an ID joins by name only when that bucket points to one identity.
-    static func reconcileMediaIdentities<V: GroupableMedia>(_ groups: [MediaGroup], lists: [[V]]) -> [MediaGroup] {
+    /// Large inputs reconcile in contiguous chunks (same per-chunk logic) merged in order, which
+    /// preserves the exact sequential output: refs and aliases keep first-appearance order.
+    static func reconcileMediaIdentities<V: GroupableMedia>(_ groups: [MediaGroup], lists: [[V]]) async -> [MediaGroup] {
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        guard groups.count >= 8_192, workers > 1 else {
+            return reconcileMediaIdentitiesChunk(groups, lists: lists)
+        }
+        let chunk = (groups.count + workers - 1) / workers
+        let parts: [[MediaGroup]] = await withTaskGroup(of: (Int, [MediaGroup]).self) { group in
+            for lower in stride(from: 0, to: groups.count, by: chunk) {
+                let upper = min(lower + chunk, groups.count)
+                group.addTask {
+                    (lower, reconcileMediaIdentitiesChunk(Array(groups[lower..<upper]), lists: lists))
+                }
+            }
+            var collected: [(Int, [MediaGroup])] = []
+            for await part in group { collected.append(part) }
+            return collected.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+        // Ordered merge applying the same identity rules across chunk boundaries.
+        var result: [MediaGroup] = []
+        result.reserveCapacity(groups.count)
+        var byTMDBID: [Int: Int] = [:]
+        for part in parts {
+            for group in part {
+                guard let tmdbID = group.tmdbID, tmdbID > 0 else {
+                    result.append(group)
+                    continue
+                }
+                if let index = byTMDBID[tmdbID] {
+                    result[index].refs.append(contentsOf: group.refs)
+                    if !group.ambiguousName { result[index].aliases.append(group.name) }
+                    result[index].aliases.append(contentsOf: group.aliases)
+                } else {
+                    byTMDBID[tmdbID] = result.count
+                    result.append(group)
+                }
+            }
+        }
+        return result
+    }
+
+    /// The reconciliation pass itself, run sequentially or once per chunk.
+    private static func reconcileMediaIdentitiesChunk<V: GroupableMedia>(_ groups: [MediaGroup], lists: [[V]]) -> [MediaGroup] {
         var result: [MediaGroup] = []
         result.reserveCapacity(groups.count)
         var byTMDBID: [Int: Int] = [:]
@@ -683,97 +917,116 @@ public enum CatalogBuilder {
         var categoryIDs: [Set<String>] = []
     }
 
-    static func groupChannels(lists: [[Channel]], keys: [[String]], context: Context) -> ChannelGroups {
+    static func groupChannels(lists: [[Channel]], keys: [[String]], context: Context) async -> ChannelGroups {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return ChannelGroups() }
-        var groupIndex: [String: Int] = Dictionary(minimumCapacity: total)
-        var groupKeys: [String] = []
-        var members: [[Channel]] = []
-        var categoryIDs: [Set<String>] = []
-        var adultFlags: [Bool] = []
 
-        for (catalogIndex, list) in lists.enumerated() {
-            let resolver = context.resolver(catalog: catalogIndex, kind: .live)
-            for (itemIndex, channel) in list.enumerated() {
-                let category = channel.categoryID.flatMap { resolver[$0] }
-                let isAdult = channel.isAdult || category?.isAdult == true
-                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
-                let key = keys[catalogIndex][itemIndex]
-                let group: Int
-                if let existing = groupIndex[key] {
-                    group = existing
-                } else {
-                    group = groupKeys.count
-                    groupIndex[key] = group
-                    groupKeys.append(key)
-                    members.append([])
-                    categoryIDs.append([])
-                    adultFlags.append(false)
+        // Same sharded grouping as media: every channel sharing a key lands in one shard, each
+        // shard builds finished groups, and the merged list is sorted once. The sort key
+        // (number, id) is total, so the result matches the sequential pass exactly.
+        let resolved = await resolveItems(
+            lists, keys: keys, context: context, kind: .live,
+            categoryID: { $0.categoryID }, isAdult: { $0.isAdult }, tags: { $0.tags }, tmdbID: { _ in nil }
+        )
+        guard !Task.isCancelled else { return ChannelGroups() }
+
+        let parts: [[ChannelGroup]] = await withTaskGroup(of: (Int, [ChannelGroup]).self) { group in
+            for shard in 0..<resolved.shardCount {
+                group.addTask {
+                    var groupIndex: [String: Int] = [:]
+                    var groupKeys: [String] = []
+                    var members: [[Channel]] = []
+                    var categoryIDs: [Set<String>] = []
+                    var adultFlags: [Bool] = []
+                    for (catalogIndex, list) in lists.enumerated() {
+                        for (itemIndex, channel) in list.enumerated() {
+                            guard resolved.visible[catalogIndex][itemIndex],
+                                  Int(resolved.shards[catalogIndex][itemIndex]) == shard else { continue }
+                            let key = keys[catalogIndex][itemIndex]
+                            let group: Int
+                            if let existing = groupIndex[key] {
+                                group = existing
+                            } else {
+                                group = groupKeys.count
+                                groupIndex[key] = group
+                                groupKeys.append(key)
+                                members.append([])
+                                categoryIDs.append([])
+                                adultFlags.append(false)
+                            }
+                            members[group].append(channel)
+                            if let visible = resolved.categories[catalogIndex][itemIndex] { categoryIDs[group].insert(visible) }
+                            if resolved.adult[catalogIndex][itemIndex] { adultFlags[group] = true }
+                        }
+                    }
+
+                    var groups: [ChannelGroup] = []
+                    groups.reserveCapacity(groupKeys.count)
+                    for group in groupKeys.indices {
+                        var variants = members[group]
+                        if variants.count > 1 {
+                            variants.sort { lhs, rhs in
+                                let pl = context.priority[lhs.sourceID] ?? .max, pr = context.priority[rhs.sourceID] ?? .max
+                                if pl != pr { return pl < pr }
+                                if lhs.quality != rhs.quality { return lhs.quality > rhs.quality }
+                                let ll = lhs.rawName.utf8.count, lr = rhs.rawName.utf8.count
+                                if ll != lr { return ll < lr }
+                                return lhs.id < rhs.id
+                            }
+                        }
+                        var name = variants[0].name
+                        if variants.count > 1 {
+                            var best = TextFolding.naturalnessScore(name)
+                            for variant in variants.dropFirst() where variant.name != name {
+                                let score = TextFolding.naturalnessScore(variant.name)
+                                if score > best { best = score; name = variant.name }
+                            }
+                        }
+                        let number = variants.lazy.compactMap(\.number).min()
+                        var channelGroup = ChannelGroup(
+                            id: groupKeys[group],
+                            name: name,
+                            number: number,
+                            epgID: variants.lazy.compactMap { $0.epgID?.isEmpty == false ? $0.epgID : nil }.first,
+                            variants: variants,
+                            categoryIDs: categoryIDs[group],
+                            isAdult: adultFlags[group]
+                        )
+                        channelGroup.$logoURL = variants.lazy.compactMap(\.$logoURL).first
+                        groups.append(channelGroup)
+                    }
+                    return (shard, groups)
                 }
-                members[group].append(channel)
-                if let visible = category?.visibleID { categoryIDs[group].insert(visible) }
-                if isAdult { adultFlags[group] = true }
             }
+            var collected: [(Int, [ChannelGroup])] = []
+            for await part in group { collected.append(part) }
+            return collected.sorted { $0.0 < $1.0 }.map(\.1)
         }
+        guard !Task.isCancelled else { return ChannelGroups() }
 
         var groups: [ChannelGroup] = []
-        groups.reserveCapacity(groupKeys.count)
-        var numbers: [Int?] = []
-        numbers.reserveCapacity(groupKeys.count)
-        for group in groupKeys.indices {
-            var variants = members[group]
-            if variants.count > 1 {
-                variants.sort { lhs, rhs in
-                    let pl = context.priority[lhs.sourceID] ?? .max, pr = context.priority[rhs.sourceID] ?? .max
-                    if pl != pr { return pl < pr }
-                    if lhs.quality != rhs.quality { return lhs.quality > rhs.quality }
-                    let ll = lhs.rawName.utf8.count, lr = rhs.rawName.utf8.count
-                    if ll != lr { return ll < lr }
-                    return lhs.id < rhs.id
-                }
-            }
-            var name = variants[0].name
-            if variants.count > 1 {
-                var best = TextFolding.naturalnessScore(name)
-                for variant in variants.dropFirst() where variant.name != name {
-                    let score = TextFolding.naturalnessScore(variant.name)
-                    if score > best { best = score; name = variant.name }
-                }
-            }
-            let number = variants.lazy.compactMap(\.number).min()
-            numbers.append(number)
-            var channelGroup = ChannelGroup(
-                id: groupKeys[group],
-                name: name,
-                number: number,
-                epgID: variants.lazy.compactMap { $0.epgID?.isEmpty == false ? $0.epgID : nil }.first,
-                variants: variants,
-                categoryIDs: categoryIDs[group],
-                isAdult: adultFlags[group]
-            )
-            channelGroup.$logoURL = variants.lazy.compactMap(\.$logoURL).first
-            groups.append(channelGroup)
-        }
+        groups.reserveCapacity(parts.reduce(0) { $0 + $1.count })
+        for part in parts { groups.append(contentsOf: part) }
 
         // Sort: number asc (nil last), then name key.
         var order = Array(groups.indices)
         order.sort { lhs, rhs in
-            let a = numbers[lhs], b = numbers[rhs]
+            let a = groups[lhs].number, b = groups[rhs].number
             if a != b {
                 guard let a else { return false }
                 guard let b else { return true }
                 return a < b
             }
-            return groupKeys[lhs] < groupKeys[rhs]
+            return groups[lhs].id < groups[rhs].id
         }
         var output = ChannelGroups()
         output.groups = order.map { groups[$0] }
-        output.categoryIDs = order.map { categoryIDs[$0] }
+        output.categoryIDs = order.map { groups[$0].categoryIDs }
         output.groupIndex = Dictionary(minimumCapacity: order.count)
-        output.contentIndex = Dictionary(minimumCapacity: total)
+        output.contentIndex = Dictionary(minimumCapacity: groups.reduce(0) { $0 + $1.variants.count })
         for (position, group) in order.enumerated() {
-            output.groupIndex[groupKeys[group]] = position
-            for channel in members[group] { output.contentIndex[channel.id] = position }
+            output.groupIndex[groups[group].id] = position
+            for channel in groups[group].variants { output.contentIndex[channel.id] = position }
         }
         return output
     }

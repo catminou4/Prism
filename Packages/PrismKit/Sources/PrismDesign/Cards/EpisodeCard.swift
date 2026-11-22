@@ -6,7 +6,7 @@ import SwiftUI
 public struct EpisodeCard<MenuContent: View>: View {
     private let stillURL: URL?
     private let seed: String
-    private let eyebrow: String
+    private let eyebrowCaps: String
     private let title: String
     private let synopsis: String?
     private let duration: String?
@@ -14,7 +14,8 @@ public struct EpisodeCard<MenuContent: View>: View {
     private let isWatched: Bool
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -28,11 +29,11 @@ public struct EpisodeCard<MenuContent: View>: View {
         isWatched: Bool = false,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
         self.stillURL = stillURL
         self.seed = seed ?? "\(eyebrow) \(title)"
-        self.eyebrow = eyebrow
+        eyebrowCaps = eyebrow.uppercased()
         self.title = title
         self.synopsis = synopsis
         self.duration = duration
@@ -40,7 +41,12 @@ public struct EpisodeCard<MenuContent: View>: View {
         self.isWatched = isWatched
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        var parts = [eyebrow, title]
+        if let duration { parts.append(duration) }
+        if isWatched { parts.append("Vu") } else if let progress { parts.append("\(Int((progress * 100).rounded())) % regardé") }
+        if let synopsis { parts.append(synopsis) }
+        accessibilityText = Text(parts.joined(separator: ", "))
     }
 
     private var resolvedWidth: CGFloat { width ?? shelfWidth ?? PrismMetrics.episodeCardWidth }
@@ -85,7 +91,7 @@ public struct EpisodeCard<MenuContent: View>: View {
 
     private func textBlock(isHovered: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(eyebrow.uppercased())
+            Text(eyebrowCaps)
                 .font(PrismFont.episodeEyebrow)
                 .foregroundStyle(.white.opacity(0.78))
                 .lineLimit(1)
@@ -126,14 +132,6 @@ public struct EpisodeCard<MenuContent: View>: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 9)
-    }
-
-    private var accessibilityText: Text {
-        var parts = [eyebrow, title]
-        if let duration { parts.append(duration) }
-        if isWatched { parts.append("Vu") } else if let progress { parts.append("\(Int((progress * 100).rounded())) % regardé") }
-        if let synopsis { parts.append(synopsis) }
-        return Text(parts.joined(separator: ", "))
     }
 }
 
