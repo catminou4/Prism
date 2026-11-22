@@ -86,6 +86,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         didReportTerminalEvent = false
         lastState = nil
         lastTimeMs = -1
+        lastTimeChange = .distantPast
         lastVideoSize = .zero
         nextTimeUpdate = nil
         nextMetadataPoll = nil
@@ -95,6 +96,8 @@ final class VLCEngine: NSObject, PlaybackEngine {
         seekableRangeCache = nil
         codecSnapshot = nil
         codecProbeCount = 0
+        bufferingCheck?.cancel()
+        bufferingCheck = nil
         isStopped = false
 
         let media = VLCMedia(url: url)
@@ -507,6 +510,9 @@ final class VLCEngine: NSObject, PlaybackEngine {
         let seconds = TimeInterval(ms) / 1000
         if publishesTime {
             nextTimeUpdate = now.advanced(by: .milliseconds(250))
+            // libvlc exposes no buffered-ahead position (VLCKit 3.6 offers only
+            // time/position/seekable + VLCMedia.Stats counters): `buffered` stays
+            // equal to `current`, the scrubber's buffered bar is cosmetic for VLC.
             eventHandler?(.time(current: seconds, buffered: seconds))
         }
 
@@ -561,14 +567,37 @@ final class VLCEngine: NSObject, PlaybackEngine {
         eventHandler?(.tracksChanged)
     }
 
+    /// Decode/display counters: they keep advancing on streams whose libvlc clock
+    /// is frozen (live formats without usable timestamps), which is exactly the
+    /// stall false positive the buffering check must not report.
+    private func playbackActivity() -> Int {
+        guard let stats = player.media?.statistics else { return 0 }
+        if player.numberOfVideoTracks > 0 {
+            return Int(stats.displayedPictures) + Int(stats.decodedVideo)
+        }
+        return Int(stats.decodedAudio) + Int(stats.playedAudioBuffers)
+    }
+
     private func scheduleBufferingCheck() {
-        bufferingCheck?.cancel()
+        // Coalesced: an armed check evaluates the latest state when it fires, so
+        // repeated `.buffering` events must not keep pushing it back (libvlc can
+        // emit them continuously — a cancel-and-restart would starve the check).
+        guard bufferingCheck == nil else { return }
         bufferingCheck = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1))
-            guard let self, !Task.isCancelled, !self.isStopped else { return }
-            if Date().timeIntervalSince(self.lastTimeChange) >= 1, self.wantsPlay {
-                self.report(.buffering)
-            }
+            guard let self, !Task.isCancelled else { return }
+            self.bufferingCheck = nil
+            guard !self.isStopped,
+                Date().timeIntervalSince(self.lastTimeChange) >= 1, self.wantsPlay
+            else { return }
+            // A frozen playhead is not proof of a stall: confirm nothing is being
+            // decoded or displayed before declaring buffering, and recover a
+            // previously reported `.buffering` when frames keep flowing (the
+            // `ms != lastTimeMs` recovery in handleTimeChange never fires then).
+            let before = self.playbackActivity()
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled, !self.isStopped else { return }
+            self.report(self.playbackActivity() == before ? .buffering : .playing)
         }
     }
 

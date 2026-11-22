@@ -176,6 +176,9 @@ struct PlayerStreamInfoCard: View {
 
 /// "Épisode suivant" card with a countdown ring (VOD, last 30 s). Use it in the `upNext` slot.
 public struct PlayerUpNextCard<Artwork: View>: View {
+    /// Matches the `remaining <= 30` window in `PlayerView`'s up-next host.
+    private static var liveWindow: TimeInterval { 30 }
+
     let title: String
     let subtitle: String?
     let remaining: TimeInterval
@@ -183,6 +186,8 @@ public struct PlayerUpNextCard<Artwork: View>: View {
     let onPlay: () -> Void
     let onDismiss: (() -> Void)?
     let artwork: Artwork
+    @Environment(\.playerUpNextRemaining) private var liveRemaining: TimeInterval?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// - Parameters:
     ///   - remaining: seconds left in the current item (`controller.remainingTime`).
@@ -201,7 +206,12 @@ public struct PlayerUpNextCard<Artwork: View>: View {
     }
 
     private var progress: Double {
-        guard countdown > 0 else { return 1 }
+        guard countdown > 0 else {
+            // `0, 0` is the "live" sentinel (what the app shell passes): the player
+            // host injects the real remaining time so the ring counts down.
+            guard remaining <= 0, let live = liveRemaining else { return 1 }
+            return min(1, max(0, 1 - live / Self.liveWindow))
+        }
         return min(1, max(0, 1 - remaining / countdown))
     }
 
@@ -237,6 +247,7 @@ public struct PlayerUpNextCard<Artwork: View>: View {
                 }
                 .frame(width: 36, height: 36)
                 .contentShape(Circle())
+                .animation(reduceMotion ? nil : .linear(duration: 0.25), value: progress)
             }
             .buttonStyle(.plain)
             .help("Lire maintenant")

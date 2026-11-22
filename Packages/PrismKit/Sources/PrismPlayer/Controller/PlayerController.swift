@@ -221,7 +221,7 @@ public final class PlayerController {
 
     /// Channel zapping / next episode: keeps the last frame until the new stream renders.
     public func replace(with newItem: PlaybackItem, programme: LiveProgramme? = nil) {
-        reportProgress(force: true)
+        reportProgress()
         item = newItem
         liveProgramme = programme
         duration = nil
@@ -240,7 +240,7 @@ public final class PlayerController {
 
     /// Stops playback and releases the engines (window closed).
     public func stop() {
-        reportProgress(force: true)
+        reportProgress()
         saveVolume()
         cancelTasks()
         playRequested = false
@@ -546,7 +546,7 @@ public final class PlayerController {
         guard phase != .ended else { return }  // duplicate .ended must not re-fire onEnded
         if let duration { currentTime = duration }
         playRequested = false
-        reportProgress(force: true)
+        reportProgress()
         setPhase(.ended)
         showControls()
         onEnded?()
@@ -693,7 +693,7 @@ public final class PlayerController {
         stopStallWatch()
         engine?.pause()
         if phase == .playing || phase == .buffering || phase == .loading { setPhase(.paused) }
-        reportProgress(force: true)
+        reportProgress()
     }
 
     public func togglePlayPause() {
@@ -715,7 +715,7 @@ public final class PlayerController {
         guard canSeek, let engine else { return false }
         currentTime = target
         if phase == .ended { setPhase(.paused) }
-        reportProgress(force: true)
+        reportProgress()
         seekTask?.cancel()
         seekTask = Task { [weak self] in
             guard !Task.isCancelled else { return }
@@ -961,7 +961,9 @@ public final class PlayerController {
         }
     }
 
-    private func reportProgress(force: Bool) {
+    /// Immediate progress report for pause/seek/stop/end/replace — bypasses the
+    /// 20 s `ProgressThrottle` and re-arms it so the next periodic tick waits a full interval.
+    private func reportProgress() {
         guard !item.isLive, let duration, duration > 0, attemptReady || currentTime > 0 else { return }
         progressThrottle.recordForced(at: uptime())
         onProgress?(currentTime, duration)

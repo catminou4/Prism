@@ -56,8 +56,11 @@ public final class AppModel {
     public private(set) var recommendations = Recommendations.empty
     public private(set) var homeAudioLanguages = HomeAudioLanguage.defaults
     public private(set) var sportsSettingsRevision = 0
-    /// In-flight imports/refreshes, by source.
-    public private(set) var imports: [SourceID: ImportProgress] = [:]
+    /// In-flight imports/refreshes, by source: one observable cell per source.
+    /// The dictionary only changes when a cell is created (kept for the session),
+    /// so "is importing" readers are not invalidated by the ~8/s progress ticks —
+    /// only views reading `importProgress(for:)` subscribe to a source's stream.
+    private var importStates: [SourceID: SourceImportState] = [:]
     /// Last refresh error per source (French, user-facing).
     public private(set) var errors: [SourceID: String] = [:]
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
@@ -165,11 +168,23 @@ public final class AppModel {
 
     // MARK: Lookups
 
+    /// Sources currently importing, with their latest progress — same shape as the
+    /// former `imports` dictionary, kept for tests/tools. Views should prefer
+    /// `isImporting(_:)` / `importProgress(for:)`: reading this computed property
+    /// subscribes to every source's progress stream.
+    public var imports: [SourceID: ImportProgress] {
+        importStates.compactMapValues(\.progress)
+    }
+
     public func source(_ id: SourceID) -> Source? { sources.first { $0.id == id } }
     public func password(for id: SourceID) -> String? { credentials.password(for: id) }
     public func account(for id: SourceID) -> XtreamAccount? { accounts[id] }
-    public func isImporting(_ id: SourceID) -> Bool { imports[id] != nil }
-    public var isImportingAnything: Bool { !imports.isEmpty }
+    public func isImporting(_ id: SourceID) -> Bool { importStates[id]?.isActive == true }
+    /// Throttled progress of one source's import (the detail page's `ProgressView`).
+    /// Subscribes only to that source's cell: other sources' ticks don't re-evaluate
+    /// the reader. `nil` once the import ends (`progress` is cleared with `isActive`).
+    public func importProgress(for id: SourceID) -> ImportProgress? { importStates[id]?.progress }
+    public var isImportingAnything: Bool { importStates.values.contains { $0.isActive } }
     public var hasCompletedOnboarding: Bool { UserDefaults.standard.bool(forKey: Keys.onboardingDone) }
 
     /// Provider categories come from the full source, including categories filtered from the library.
@@ -298,14 +313,18 @@ public final class AppModel {
             phase = .onboarding
             return
         }
-        let cached = await catalogRepository.cachedCatalogs(for: sources)
-        for catalog in cached {
+        // Le guide et le catalogue mis en cache sont indépendants : leurs lectures
+        // disque (actors séparés) se chevauchent, puis le guide rejoint l'attente
+        // de `rebuildCatalog` au lieu de la suivre.
+        async let cached = catalogRepository.cachedCatalogs(for: sources)
+        async let cachedGuide = epgRepository.cachedGuide(for: sources)
+        for catalog in await cached {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
         }
         await rebuildCatalog()
         phase = .ready
-        guide = await epgRepository.cachedGuide(for: sources)
+        guide = await cachedGuide
 
         let now = Date.now
         for source in sources where source.isEnabled {
@@ -341,7 +360,7 @@ public final class AppModel {
         let stream = AsyncThrowingStream<ImportProgress, any Error>(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task { @MainActor in
                 do {
-                    guard self.imports[source.id] == nil else { throw SourceImportBusy() }
+                    guard !self.isImporting(source.id) else { throw SourceImportBusy() }
                     try Task.checkCancellation()
                     if let password {
                         try self.credentials.setPassword(password, for: source.id)
@@ -351,7 +370,7 @@ public final class AppModel {
                     try await self.performImport(source.id) { continuation.yield($0) }
                     continuation.finish()
                 } catch {
-                    if isNew, self.sourceCatalogs[source.id] == nil, self.imports[source.id] == nil,
+                    if isNew, self.sourceCatalogs[source.id] == nil, !self.isImporting(source.id),
                        self.source(source.id) != nil {
                         self.remove(source.id)
                     } else if !isNew, !(error is CancellationError), !(error is SourceImportBusy) {
@@ -370,15 +389,15 @@ public final class AppModel {
         importSource(DemoContent.makeSource(), password: nil)
     }
 
-    /// Refreshes one source in the background (progress visible through `imports`).
+    /// Refreshes one source in the background (progress visible through `importProgress(for:)`).
     public func refresh(_ id: SourceID) async {
-        guard imports[id] == nil else { return }
+        guard !isImporting(id) else { return }
         do {
             try await performImport(id) { _ in }
         } catch is CancellationError {
         } catch is SourceImportBusy {
             // Another import grabbed the slot first: silent no-op, like the
-            // early `imports[id]` guard above.
+            // early `isImporting` guard above.
         } catch {
             errors[id] = UserFacingError.message(for: error)
         }
@@ -395,7 +414,7 @@ public final class AppModel {
     /// Updates a source's settings. Connection changes trigger a refresh.
     @discardableResult
     public func update(_ source: Source, password: String? = nil) -> Bool {
-        guard imports[source.id] == nil else { return false }
+        guard !isImporting(source.id) else { return false }
         if let password {
             do {
                 try credentials.setPassword(password, for: source.id)
@@ -439,7 +458,7 @@ public final class AppModel {
     }
 
     public func remove(_ id: SourceID) {
-        guard imports[id] == nil else { return }
+        guard !isImporting(id) else { return }
         pendingSources.remove(id)
         sources.removeAll { $0.id == id }
         if hiddenCategoriesBySource.removeValue(forKey: id.rawValue) != nil { persistHiddenCategories() }
@@ -448,11 +467,14 @@ public final class AppModel {
         sourceCatalogs[id] = nil
         accounts[id] = nil
         errors[id] = nil
-        imports[id] = nil
+        importStates[id] = nil
         if sources.isEmpty, phase == .ready { restartOnboarding() }
         Task {
-            await catalogRepository.forget(id)
-            await epgRepository.forget(id)
+            // Purges disque sur deux actors distincts : elles se chevauchent.
+            async let catalogForgotten = catalogRepository.forget(id)
+            async let guideForgotten = epgRepository.forget(id)
+            await catalogForgotten
+            await guideForgotten
             guide = await epgRepository.currentGuide(for: sources)
             await rebuild()
         }
@@ -462,8 +484,9 @@ public final class AppModel {
         sources.move(fromOffsets: offsets, toOffset: destination)
         persistSources()
         Task {
-            guide = await epgRepository.currentGuide(for: sources)
+            async let updatedGuide = epgRepository.currentGuide(for: sources)
             await rebuild()
+            guide = await updatedGuide
         }
     }
 
@@ -556,25 +579,38 @@ public final class AppModel {
         // parallèle, que ce soit via `refreshAll`, le bootstrap ou l'onboarding.
         try await withImportSlot {
             // Une source supprimée ou déjà importée pendant l'attente du slot
-            // ne doit pas repartir : `imports[id]` n'est posé qu'une fois le slot acquis.
-            guard imports[id] == nil else { throw SourceImportBusy() }
+            // ne doit pas repartir : `isActive` n'est posé qu'une fois le slot acquis.
+            guard !isImporting(id) else { throw SourceImportBusy() }
             try await performImportHeld(id, report: report)
         }
+    }
+
+    /// The observable cell tracking `id`'s import, created on first use and kept
+    /// afterwards so progress observers stay attached to the same instance.
+    private func importState(for id: SourceID) -> SourceImportState {
+        if let state = importStates[id] { return state }
+        let state = SourceImportState()
+        importStates[id] = state
+        return state
     }
 
     private func performImportHeld(_ id: SourceID, report: (ImportProgress) -> Void) async throws {
         try Task.checkCancellation()
         guard let source = source(id) else { return }
         errors[id] = nil
-        imports[id] = ImportProgress(stage: .connecting, fraction: 0)
-        defer { imports[id] = nil }
+        let state = importState(for: id)
+        state.isActive = true
+        state.progress = ImportProgress(stage: .connecting, fraction: 0)
+        defer {
+            state.isActive = false
+            state.progress = nil
+        }
 
         var finished: ImportProgress?
-        // `imports` est une seule propriété observée : chaque écriture réévalue
-        // toutes ses lectrices (badges latéraux, barre de progression). Les
-        // événements arrivent toutes les ~512 Ko ; on n'écrit qu'au changement
-        // de pourcent ou au plus ~8×/s. Le flux `report` (fiche d'import)
-        // continue de recevoir chaque étape.
+        // `state.progress` n'est lu que par la fiche de la source : chaque écriture
+        // ne réévalue plus les badges latéraux ni les autres fiches. On n'écrit
+        // qu'au changement de pourcent ou au plus ~8×/s. Le flux `report` (fiche
+        // d'import) continue de recevoir chaque étape.
         var lastProgressWrite = Date.distantPast
         var lastProgressPercent = -1
         for try await progress in catalogRepository.refresh(source) {
@@ -587,7 +623,7 @@ public final class AppModel {
                 let percent = Int((playlistProgress.fraction * 100).rounded())
                 let now = Date.now
                 if percent != lastProgressPercent || now.timeIntervalSince(lastProgressWrite) >= 0.12 {
-                    imports[id] = playlistProgress
+                    state.progress = playlistProgress
                     lastProgressPercent = percent
                     lastProgressWrite = now
                 }
@@ -609,11 +645,11 @@ public final class AppModel {
 
         var counts = finished.counts
         let guideStart = ImportProgress(stage: .guide(0), counts: counts, fraction: 0.92)
-        imports[id] = guideStart
+        state.progress = guideStart
         report(guideStart)
         counts.programs = await refreshGuide(for: id)
         let guideDone = ImportProgress(stage: .guide(counts.programs), counts: counts, fraction: 0.98)
-        imports[id] = guideDone
+        state.progress = guideDone
         report(guideDone)
         // L'index de recherche et l'index de curation continuent de se construire
         // en arrière-plan : la fiche peut afficher « Tout est prêt » sans attendre
@@ -778,6 +814,20 @@ public final class AppModel {
             if generation == rebuildGeneration { return }
         }
     }
+}
+
+/// Live import state of one source, held by `AppModel.importStates`.
+///
+/// Splitting progress out of a shared dictionary is what narrows observation:
+/// `isActive` flips only when an import starts or ends, while `progress` ticks
+/// (~8/s) invalidate just the views that read it — the source's own detail page.
+@MainActor
+@Observable
+final class SourceImportState {
+    /// `true` between import start and the deferred cleanup (the `.finished` report included).
+    var isActive = false
+    /// Latest throttled progress while active; cleared together with `isActive`.
+    var progress: ImportProgress?
 }
 
 private struct SourceImportBusy: LocalizedError {

@@ -573,6 +573,9 @@ private struct PlayerUpNextHost<Content: View>: View {
         ZStack {
             if isVisible {
                 content
+                    // Lets the card count its ring down from the real remaining time
+                    // even when the caller hardcoded `remaining: 0`.
+                    .environment(\.playerUpNextRemaining, controller.remainingTime)
                     .transition(reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity))
             }
         }

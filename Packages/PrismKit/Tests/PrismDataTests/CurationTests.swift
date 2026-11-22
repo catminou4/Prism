@@ -126,6 +126,44 @@ struct CurationTests {
         #expect(mixedIndex.ranking(.movie).count == 1, "strict eligibility unchanged when artwork exists")
     }
 
+    @Test func artworklessFallbackIsPerKind() async throws {
+        // The degraded pass runs independently per kind: artwork-less series relax while
+        // movies — which have eligible artwork titles — stay strict.
+        let source: SourceID = "src-a"
+        let movies = [
+            Fixture.movie(source, "art", "Avec Art", year: 2020, poster: "a.jpg", rating: 8),
+            Fixture.movie(source, "no", "Sans Art", year: 2020, rating: 8),
+        ]
+        let series = (0..<4).map { offset in
+            Fixture.series(source, "s\(offset)", "Serie Sans Art \(offset)", year: 2019 + offset, rating: 7 + Double(offset) / 10)
+        }
+        let catalog = await Fixture.build(
+            [Fixture.source(source)],
+            [SourceCatalog(sourceID: source, movies: movies, series: series)]
+        )
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        #expect(index.ranking(.movie).count == 1, "movies keep strict artwork eligibility")
+        #expect(index.ranking(.series).count == 4, "artwork-less series relax independently")
+    }
+
+    @Test func artworklessFallbackKeepsNonArtworkGatesStrict() async throws {
+        // Relaxing artwork must not weaken the other gates: adult, metadata-less and
+        // episode-like titles stay out even when every movie lacks artwork.
+        let source: SourceID = "src-a"
+        let movies = [
+            Fixture.movie(source, "ok1", "Film Honnête Un", year: 2020, rating: 7),
+            Fixture.movie(source, "ok2", "Film Honnête Deux", year: 2021, rating: 7.5),
+            Fixture.movie(source, "adult", "Club Interdit", year: 2020, rating: 9, adult: true),
+            Fixture.movie(source, "meta", "Sans Date Ni Note"),
+            Fixture.movie(source, "clip", "Super Film - Official Trailer", year: 2022, rating: 9),
+        ]
+        let catalog = await Fixture.build([Fixture.source(source)], [SourceCatalog(sourceID: source, movies: movies)])
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        #expect(index.ranking(.movie).count == 2, "only the two clean titles survive the relaxed pass")
+    }
+
     @Test func codecAndQualityTagsDoNotCountAsLanguages() async throws {
         // Codec/container/release tags must not inflate the edition count used for reach scores.
         let source: SourceID = "src-a"

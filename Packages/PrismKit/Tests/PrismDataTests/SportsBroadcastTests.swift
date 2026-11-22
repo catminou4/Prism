@@ -71,7 +71,7 @@ struct SportsBroadcastTests {
             ("Le journal de 20 heures", "Information"), ("Météo", nil), ("FOOTBALL : OM - OL", nil),
             ("Football américain NFL", nil), ("Résumé", "Basket-ball"), ("Ｆｏｏｔｂａｌｌ", nil), ("Fútbol", "Soccer"),
         ]
-        var memo: [String: BroadcastSport?] = [:]
+        var memo: [SportsScheduleMatcher.ClassifyKey: BroadcastSport?] = [:]
         for (title, category) in titles + titles {
             let item = program("x", title, category: category)
             #expect(SportsScheduleMatcher.classify(item, memo: &memo) == SportsScheduleMatcher.classify(item), "\(title)")

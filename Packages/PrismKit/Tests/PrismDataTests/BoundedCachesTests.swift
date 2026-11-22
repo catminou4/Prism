@@ -28,6 +28,24 @@ struct BoundedCachesTests {
         #expect(cache.count == 3)
     }
 
+    @Test func boundedCacheReinsertRefreshesRecencyWithoutEviction() {
+        var cache = BoundedCache<String, Int>(limit: 3)
+        cache.insert(1, for: "a")
+        cache.insert(2, for: "b")
+        cache.insert(3, for: "c")
+        // Reinserting an existing key must behave like a read: the value is replaced,
+        // the key becomes most-recently-used, and nothing is evicted or duplicated.
+        cache.insert(30, for: "a")
+        #expect(cache.count == 3)
+        #expect(cache.value(for: "a") == 30)
+        cache.insert(4, for: "d")
+        #expect(cache.value(for: "b") == nil, "\"b\" is now the least recently used entry")
+        #expect(cache.value(for: "a") == 30)
+        #expect(cache.value(for: "c") == 3)
+        #expect(cache.value(for: "d") == 4)
+        #expect(cache.count == 3)
+    }
+
     @Test func epgFetchedAtReadsTheArchiveHeaderOnly() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
@@ -86,6 +104,63 @@ struct BoundedCachesTests {
         #expect(store.watchlist.count == LibraryStore.maxWatchlist)
         #expect(store.favoriteChannels.count == LibraryStore.maxFavoriteChannels)
         #expect(store.watched.count == LibraryStore.maxWatched)
+    }
+
+    @MainActor
+    @Test func loadedLibraryCollectionsKeepDeterministicSubsets() throws {
+        // `apply(_:)` caps every collection: arrays keep their file-order prefix,
+        // watched keeps the entries with the freshest progress then smallest ids.
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        var file = LibraryFile(
+            watchlist: [], favoriteChannels: [], progress: [], watched: [], history: [],
+            preferredVariants: [], preferredChannelVariants: [], lastChannelGroupID: nil, dismissed: []
+        )
+        file.watchlist = (0..<(LibraryStore.maxWatchlist + 7)).map { TitleID(rawValue: "movie:w\($0)") }
+        file.dismissed = (0..<(LibraryStore.maxDismissed + 3)).map { TitleID(rawValue: "movie:d\($0)") }
+        file.favoriteChannels = (0..<(LibraryStore.maxFavoriteChannels + 4)).map { "ch\($0)" }
+        file.history = (0..<(LibraryStore.maxHistory + 6)).map {
+            HistoryEntry(target: .title(TitleID(rawValue: "movie:h\($0)")), lastContentID: ContentID(source: F.a, kind: .movie, nativeID: "h\($0)"), watchedAt: F.reference)
+        }
+        file.preferredVariants = (0..<(LibraryStore.maxPreferredEntries + 2)).map {
+            .init(key: "k\($0)", contentID: ContentID(source: F.a, kind: .movie, nativeID: "p\($0)"))
+        }
+        file.preferredChannelVariants = (0..<(LibraryStore.maxPreferredEntries + 2)).map {
+            .init(key: "g\($0)", contentID: ContentID(source: F.a, kind: .live, nativeID: "q\($0)"))
+        }
+
+        // Watched pruning is progress-aware: the five lexicographically largest ids would be
+        // dropped by a plain rawValue cut, but fresh progress must keep them.
+        let allWatched = (0..<(LibraryStore.maxWatched + 10)).map { ContentID(source: F.a, kind: .movie, nativeID: "w\($0)") }
+        let progressed = Set(allWatched.sorted { $0.rawValue > $1.rawValue }.prefix(5))
+        let recent = Date(timeIntervalSince1970: 1_800_000_000)
+        for id in progressed {
+            file.progress.append(PlaybackProgress(contentID: id, position: 1, duration: 2, updatedAt: recent))
+        }
+        file.watched = allWatched
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(file).write(to: directories.libraryFile)
+
+        let store = LibraryStore(directories: directories)
+        #expect(store.watchlist == Array(file.watchlist.prefix(LibraryStore.maxWatchlist)))
+        #expect(store.dismissed == Array(file.dismissed.prefix(LibraryStore.maxDismissed)))
+        #expect(store.favoriteChannels == Array(file.favoriteChannels.prefix(LibraryStore.maxFavoriteChannels)))
+        #expect(store.history.map(\.id) == file.history.prefix(LibraryStore.maxHistory).map(\.id))
+        #expect(store.preferredVariants.count == LibraryStore.maxPreferredEntries)
+        #expect(store.preferredVariants[TitleID(rawValue: "k0")] != nil)
+        #expect(store.preferredVariants[TitleID(rawValue: "k\(LibraryStore.maxPreferredEntries + 1)")] == nil)
+        #expect(store.preferredChannelVariants["g0"] != nil)
+        #expect(store.preferredChannelVariants["g\(LibraryStore.maxPreferredEntries + 1)"] == nil)
+
+        let rest = allWatched.filter { !progressed.contains($0) }.sorted { $0.rawValue < $1.rawValue }
+        let expectedWatched = progressed.union(rest.prefix(LibraryStore.maxWatched - progressed.count))
+        #expect(store.watched == expectedWatched)
+        #expect(store.watched.count == LibraryStore.maxWatched)
+        for id in progressed {
+            #expect(store.watched.contains(id), "fresh progress must survive the cap")
+        }
     }
 
     @Test func concurrentSeriesCastLookupsShareOneRequest() async throws {
@@ -148,6 +223,48 @@ struct BoundedCachesTests {
         #expect(StubURLProtocol.requestCount(host: host) == 2)
         #expect(guide.programCount == 2, "one programme per feed, merged")
         #expect(Set(guide.allPrograms.map(\.channelID)) == ["ch.a", "ch.b"])
+    }
+
+    /// Feeds download concurrently but merge in URL order: on a same-start conflict the
+    /// earlier feed must win, whichever response arrived first.
+    @Test(arguments: [
+        (["a", "b"], "A", "A-Nom"),
+        (["b", "a"], "B", "B-Nom"),
+    ])
+    func epgMergeKeepsEarlierFeedOnSameStartConflict(feedOrder: [String], expectedTitle: String, expectedChannelName: String) async throws {
+        let host = StubURLProtocol.uniqueHost("epg-order-\(feedOrder.joined())")
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        // Identical start/stop in both feeds so the conflict is exact.
+        let start = formatter.string(from: Date.now.addingTimeInterval(-1_800))
+        let stop = formatter.string(from: Date.now.addingTimeInterval(1_800))
+        @Sendable func body(_ tag: String) -> String {
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <tv>
+              <channel id="ch.a"><display-name>\(tag)-Nom</display-name></channel>
+              <programme start="\(start)" stop="\(stop)" channel="ch.a"><title>\(tag)</title></programme>
+            </tv>
+            """
+        }
+        StubURLProtocol.register(host: host) { request in
+            .text(request.url?.lastPathComponent == "a.xml" ? body("A") : body("B"))
+        }
+        defer { StubURLProtocol.unregister(host: host) }
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let repository = EPGRepository(directories: directories, credentials: InMemoryCredentialStore(), session: StubURLProtocol.session())
+        let source = Source(id: "epg-order-src", name: "Nova", kind: .m3uURL, serverURL: URL(string: "https://\(host)/list.m3u"))
+        let feeds = try feedOrder.map { try #require(URL(string: "https://\(host)/\($0).xml")) }
+        let guide = try await repository.refresh(source, playlistEPGURLs: feeds)
+
+        let interval = DateInterval(start: .distantPast, end: .distantFuture)
+        let programs = guide.programs(forEPGID: "ch.a", in: interval)
+        #expect(programs.count == 1, "same-start duplicates collapse to the earlier feed's programme")
+        #expect(programs.first?.title == expectedTitle)
+        #expect(guide.xmltvChannel(forEPGID: "ch.a")?.displayNames.first == expectedChannelName)
     }
 
     // MARK: - XMLTV fixtures (dates inside the refresh window)

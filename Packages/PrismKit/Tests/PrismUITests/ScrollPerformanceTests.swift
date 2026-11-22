@@ -29,7 +29,12 @@ struct ScrollPerformanceTests {
                     TitleShelf(title: "Sélection \(index)", items: Array(titles[(index * 18)..<(index * 18 + 18)]))
                 }
             }
-        }.frame(width: size.width, height: size.height)
+        }
+        // `clip.scroll(to:)` is an AppKit-level scroll: SwiftUI's onScrollPhaseChange never
+        // fires, so emulate the scrolling state the real app enters via BrowseScreen —
+        // cards then take their lean path (no hover lift/shadow modifiers) for the whole run.
+        .environment(\.prismIsScrollingContent, true)
+        .frame(width: size.width, height: size.height)
             .environment(\.prismShelfViewportWidth, size.width)
             .environment(model).environment(navigation))
         host.frame = frame
@@ -84,6 +89,7 @@ struct ScrollPerformanceTests {
             rootView: ScrollView {
                 TitleGrid(items: titles, availableWidth: size.width)
             }
+            .environment(\.prismIsScrollingContent, true)
             .frame(width: size.width, height: size.height)
             .environment(model)
             .environment(navigation)

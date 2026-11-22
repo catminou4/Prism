@@ -260,7 +260,9 @@ private struct TitleDetailContent: View {
             quality: movieDetail?.tech?.quality.badge ?? edition?.variant.quality.badge, playLabel: label,
             progress: resuming ? progress?.fraction : nil,
             canPlay: title.kind == .series ? episode != nil : activeEdition != nil,
-            isInWatchlist: app.library.isInWatchlist(title.id),
+            // Hidden pages skip library reads (see `heroEpisode`): the watchlist scan is
+            // O(#watchlist) and would subscribe this subtree to unrelated watchlist edits.
+            isInWatchlist: isPageActive && app.library.isInWatchlist(title.id),
             edition: edition, editionCount: editions.count,
             play: { choosePlayback(episode: episode) },
             toggleWatchlist: { app.library.toggleWatchlist(title.id) },

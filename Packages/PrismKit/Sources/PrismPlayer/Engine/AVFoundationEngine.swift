@@ -87,11 +87,26 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
 
         var options: [String: Any] = [:]
         var extraHeaders = headers
-        if let uaKey = headers.keys.first(where: { $0.caseInsensitiveCompare("User-Agent") == .orderedSame }),
-            let userAgent = headers[uaKey], !userAgent.isEmpty
-        {
+        // UA → dedicated public key, applied to every request the asset makes.
+        let agentKeys = headers.keys.filter {
+            $0.caseInsensitiveCompare("User-Agent") == .orderedSame
+        }
+        if let userAgent = agentKeys.lazy.compactMap({ headers[$0] }).first(where: { !$0.isEmpty }) {
             options[AVURLAssetHTTPUserAgentKey] = userAgent
-            extraHeaders.removeValue(forKey: uaKey)
+        }
+        for key in agentKeys { extraHeaders.removeValue(forKey: key) }
+        // Cookies → public cookies key, documented to reach every HLS request
+        // (variant playlists, segments, keys) even on other hosts — the
+        // undocumented header-fields key below is not guaranteed to.
+        let cookiePairs = extraHeaders.filter {
+            $0.key.caseInsensitiveCompare("Cookie") == .orderedSame
+        }
+        if !cookiePairs.isEmpty {
+            let cookies = cookiePairs.flatMap { Self.httpCookies(from: $0.value, url: url) }
+            if !cookies.isEmpty {
+                options[AVURLAssetHTTPCookiesKey] = cookies
+                for (key, _) in cookiePairs { extraHeaders.removeValue(forKey: key) }
+            }
         }
         if !extraHeaders.isEmpty {
             options["AVURLAssetHTTPHeaderFieldsKey"] = extraHeaders
@@ -558,6 +573,28 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     }
 
     // MARK: - Helpers
+
+    /// Parses a `Cookie` header (`a=1; b=2`) into host cookies for the asset URL.
+    static func httpCookies(from header: String, url: URL) -> [HTTPCookie] {
+        guard let host = url.host()?.lowercased(), !host.isEmpty else { return [] }
+        var cookies: [HTTPCookie] = []
+        for pair in header.split(separator: ";") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let name = parts[0].trimmingCharacters(in: .whitespaces)
+            var value = parts[1].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            guard !name.isEmpty,
+                let cookie = HTTPCookie(properties: [
+                    .name: name, .value: value, .domain: host, .path: "/",
+                ])
+            else { continue }
+            cookies.append(cookie)
+        }
+        return cookies
+    }
 
     static func message(for error: (any Error)?) -> String {
         guard let error = error as NSError? else { return "Ce flux ne peut pas être lu." }

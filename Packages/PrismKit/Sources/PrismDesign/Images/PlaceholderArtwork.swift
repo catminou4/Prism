@@ -41,18 +41,15 @@ public struct PlaceholderArtwork: View {
 
     /// Contacts-style neutral portrait placeholder.
     private var monogramBody: some View {
-        LinearGradient(
-            colors: [Color(.sRGB, red: 0.64, green: 0.66, blue: 0.70), Color(.sRGB, red: 0.45, green: 0.47, blue: 0.51)],
-            startPoint: .top, endPoint: .bottom
-        )
-        .overlay { label }
-        .accessibilityHidden(true)
+        LinearGradient(colors: Self.monogramColors, startPoint: .top, endPoint: .bottom)
+            .overlay { label }
+            .accessibilityHidden(true)
     }
 
     private var artworkBody: some View {
         ZStack {
-            LinearGradient(colors: [palette.top, palette.bottom], startPoint: palette.start, endPoint: palette.end)
-            RadialGradient(colors: [.white.opacity(0.10), .clear], center: palette.glowCenter, startRadius: 0, endRadius: 225)
+            LinearGradient(colors: palette.gradient, startPoint: palette.start, endPoint: palette.end)
+            RadialGradient(colors: Self.glowColors, center: palette.glowCenter, startRadius: 0, endRadius: 225)
             label
         }
         .accessibilityHidden(true)
@@ -93,9 +90,19 @@ public struct PlaceholderArtwork: View {
         }
     }
 
+    /// Fixed gradient stops shared by every placeholder — hoisted so `body` passes don't
+    /// re-allocate the same arrays per evaluation.
+    private static let monogramColors: [Color] = [
+        Color(.sRGB, red: 0.64, green: 0.66, blue: 0.70),
+        Color(.sRGB, red: 0.45, green: 0.47, blue: 0.51),
+    ]
+    private static let glowColors: [Color] = [.white.opacity(0.10), .clear]
+
     struct Palette {
         let top: Color
         let bottom: Color
+        /// `[top, bottom]` pre-bundled: stored once per seed instead of allocated per `body`.
+        let gradient: [Color]
         let start: UnitPoint
         let end: UnitPoint
         let glowCenter: UnitPoint
@@ -111,8 +118,11 @@ public struct PlaceholderArtwork: View {
                 return
             }
             var rng = StableHash.Generator(seed: seed)
-            top = Color(white: 0.12 + rng.unit() * 0.19)
-            bottom = Color(white: 0.045 + rng.unit() * 0.045)
+            let top = Color(white: 0.12 + rng.unit() * 0.19)
+            let bottom = Color(white: 0.045 + rng.unit() * 0.045)
+            self.top = top
+            self.bottom = bottom
+            gradient = [top, bottom]
             let angle = rng.unit() * .pi * 0.5 - .pi * 0.25 // −45°…45° around vertical
             start = UnitPoint(x: 0.5 - sin(angle) * 0.5, y: 0)
             end = UnitPoint(x: 0.5 + sin(angle) * 0.5, y: 1)

@@ -27,22 +27,26 @@ public enum ProviderSynopsis {
         return english ?? unknown
     }
 
+    /// Cheap guards run unmemoized (trim + whitespace scan ≈ the cost of a memo lookup on a
+    /// long plot); only the regex + language-recognition branch below is expensive enough to
+    /// memoize, keyed on the trimmed text so whitespace variants share an entry.
     public static func cleaned(_ value: String?) -> String? {
         guard let value else { return nil }
-        if let hit = cache.value(for: value) { return hit }
-        let result = cleanedUncached(value)
-        cache.store(result, for: value)
-        return result
-    }
-
-    private static func cleanedUncached(_ value: String) -> String? {
         guard let first = value.unicodeScalars.first, let last = value.unicodeScalars.last else { return nil }
         let whitespace = CharacterSet.whitespacesAndNewlines
         let text = whitespace.contains(first) || whitespace.contains(last)
             ? value.trimmingCharacters(in: whitespace) : value
         guard !text.isEmpty else { return nil }
         guard needsNormalization(text) else { return text }
+        if let hit = cache.value(for: text) { return hit }
+        let result = cleanedNormalized(text)
+        cache.store(result, for: text)
+        return result
+    }
 
+    /// `cleaned` tail for texts that `needsNormalization` flagged: paragraph splitting,
+    /// per-paragraph language/script recognition and majority-language retention.
+    private static func cleanedNormalized(_ text: String) -> String? {
         let paragraphs = fragments(in: text)
         guard paragraphs.count > 1, paragraphs.count <= 12 else { return joined(paragraphs) }
 
@@ -133,19 +137,50 @@ public enum ProviderSynopsis {
 }
 
 /// Thread-safe bounded memo for `ProviderSynopsis.cleaned` — plots are long, so the cap is
-/// smaller than the title cache's. `nil` results are cached too (`.some(nil)`).
+/// smaller than the title cache's. `nil` results are cached too (`.some(nil)`). Self-disables
+/// on low-reuse streams (a catalog build sees mostly unique plots).
 private final class CleanedCache: Sendable {
-    private let storage = Mutex<[String: String?]>([:])
+    private struct State {
+        var map: [String: String?] = [:]
+        var hits = 0
+        var misses = 0
+    }
+    private let state = Mutex(State())
+    /// Lock-free gate so disabled lookups cost one atomic load instead of a contended mutex.
+    private let enabled = Atomic<Bool>(true)
     private let limit = 10_000
+    private let sampleWindow = 4_096
+    private let minHitRate = 0.10
 
     func value(for key: String) -> String?? {
-        storage.withLock { $0[key] }
+        guard enabled.load(ordering: .relaxed) else { return nil }
+        return state.withLock { state in
+            if let hit = state.map[key] {
+                state.hits += 1
+                return .some(hit)
+            }
+            state.misses += 1
+            sample(&state)
+            return nil
+        }
     }
 
     func store(_ value: String?, for key: String) {
-        storage.withLock { map in
-            if map.count >= limit { map.removeAll(keepingCapacity: true) }
-            map[key] = .some(value)
+        guard enabled.load(ordering: .relaxed) else { return }
+        state.withLock { state in
+            guard enabled.load(ordering: .relaxed) else { return }
+            if state.map.count >= limit { state.map.removeAll(keepingCapacity: true) }
+            state.map[key] = .some(value)
         }
+    }
+
+    private func sample(_ state: inout State) {
+        guard state.hits + state.misses >= sampleWindow else { return }
+        if Double(state.hits) / Double(state.hits + state.misses) < minHitRate {
+            enabled.store(false, ordering: .relaxed)
+            state.map.removeAll(keepingCapacity: false)
+        }
+        state.hits = 0
+        state.misses = 0
     }
 }

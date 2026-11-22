@@ -30,7 +30,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     private let card: (Item) -> Card
 
     @State private var leadingItem: Item.ID?
-    @State private var isVisible = false
+    @State private var warmBox = WarmBox()
     @State private var viewport = ShelfViewport()
     @State private var scrollAvailability = ScrollAvailability()
     @State private var measuredWidth: CGFloat = 0
@@ -78,7 +78,6 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     public var body: some View {
-        let warm = warmRequest
         VStack(alignment: .leading, spacing: PrismMetrics.shelfHeaderSpacing) {
             if let title {
                 ShelfHeader(title, subtitle: subtitle, action: onHeaderTap)
@@ -88,16 +87,17 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
             }
             row
         }
+        // Threshold crossings must not write @State: each write re-evaluates the whole
+        // shelf (header + row) in the middle of a page scroll. The box debounces the
+        // warm off the view tree instead.
         .onScrollVisibilityChange(threshold: 0.15) { visible in
-            if posterArtwork != nil { isVisible = visible }
+            warmBox.setVisible(visible, warmRequest)
         }
-        .task(id: warm, priority: .utility) {
-            guard let warm else { return }
-            // Avoid queuing artwork for shelves passed during a quick scroll.
-            try? await Task.sleep(for: .milliseconds(150))
-            guard !Task.isCancelled else { return }
-            ImagePipeline.shared.warm(warm.urls, pixelSize: warm.pixelSize)
+        // Row scrolling/resizing changes the warm target without a visibility event.
+        .onChange(of: warmRequest) { _, request in
+            warmBox.refresh(request)
         }
+        .onDisappear { warmBox.cancel() }
     }
 
     private struct WarmRequest: Equatable {
@@ -106,7 +106,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     private var warmRequest: WarmRequest? {
-        guard let posterArtwork, isVisible, !items.isEmpty else { return nil }
+        guard let posterArtwork, !items.isEmpty else { return nil }
         let width = itemWidth
         let available = (layoutWidth ?? measuredWidth) - margin * 2
         guard available > 0, width > 0 else { return nil }
@@ -117,6 +117,49 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         guard !urls.isEmpty else { return nil }
         let size = CGSize(width: width, height: (width / PrismMetrics.posterAspectRatio).rounded())
         return WarmRequest(urls: urls, pixelSize: RemoteImage.pixelSize(forPointSize: size, scale: displayScale))
+    }
+
+    /// Debounced artwork warm-up for the posters just past the visible columns. Kept in a
+    /// class (like `ShelfViewport`) so scroll callbacks mutate it without invalidating the
+    /// shelf — class storage is invisible to SwiftUI observation.
+    private final class WarmBox {
+        private(set) var isVisible = false
+        private var task: Task<Void, Never>?
+
+        /// Visibility threshold crossed: remember it, then arm or cancel the pending warm.
+        func setVisible(_ visible: Bool, _ request: WarmRequest?) {
+            isVisible = visible
+            schedule(visible ? request : nil)
+        }
+
+        /// The warm target changed (row scrolled, width changed, items swapped).
+        func refresh(_ request: WarmRequest?) {
+            schedule(isVisible ? request : nil)
+        }
+
+        /// The shelf left the view tree: drop any pending warm (mirrors the old `.task`
+        /// cancellation on disappear). `isVisible` is kept — a still-visible shelf that
+        /// comes back re-arms through `refresh`/`setVisible`.
+        func cancel() {
+            task?.cancel()
+            task = nil
+        }
+
+        /// (Re)arms a ~150 ms debounce so a shelf passed mid-scroll never queues artwork;
+        /// the latest call wins and `nil` cancels outright.
+        private func schedule(_ request: WarmRequest?) {
+            task?.cancel()
+            task = nil
+            guard let request else { return }
+            let urls = request.urls
+            let pixelSize = request.pixelSize
+            task = Task.detached(priority: .utility) {
+                // Avoid queuing artwork for shelves passed during a quick scroll.
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                ImagePipeline.shared.warm(urls, pixelSize: pixelSize)
+            }
+        }
     }
 
     private var row: some View {

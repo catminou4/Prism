@@ -41,7 +41,10 @@ struct SourceDetailView: View {
                             if let account = app.account(for: sourceID), let date = account.expiresAt {
                                 LabeledContent("Expiration de l’abonnement") { Text(date, format: .dateTime.day().month(.wide).year()) }
                             }
-                            if let progress = app.imports[sourceID] {
+                            // `importProgress(for:)` ne souscrit qu'à la cellule de
+                            // cette source : les ticks des autres imports ne
+                            // réévaluent pas cette fiche.
+                            if let progress = app.importProgress(for: sourceID) {
                                 ProgressView(value: progress.fraction)
                                     .accessibilityLabel("Actualisation de la source")
                             }

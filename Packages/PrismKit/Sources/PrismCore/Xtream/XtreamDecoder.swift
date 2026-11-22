@@ -261,6 +261,7 @@ public enum XtreamDecoder {
 
         var bySeason: [Int: [Episode]] = [:]
         var seenIDs = Set<String>()
+        let seriesKey = TitleNormalizer.key(series.title)
         for item in raw {
             guard let ep = JSONObject(item.value), let id = ep.string("id", "stream_id"), seenIDs.insert(id).inserted else { continue }
             let epInfo = ep.object("info") ?? JSONObject.empty
@@ -274,7 +275,7 @@ public enum XtreamDecoder {
                 nativeID: id,
                 season: season,
                 number: number,
-                title: episodeTitle(ep.string("title") ?? epInfo.string("name", "title"), number: number, seriesTitle: series.title),
+                title: episodeTitle(ep.string("title") ?? epInfo.string("name", "title"), number: number, seriesKey: seriesKey),
                 plot: epInfo.string("plot", "overview", "description"),
                 durationSeconds: duration.flatMap { $0 > 0 ? $0 : nil },
                 stillURL: epInfo.url("movie_image", "cover_big", "still_path", "cover"),
@@ -399,14 +400,19 @@ public enum XtreamDecoder {
 
     /// Episode title without the redundant "Show - S01E02 -" prefix; "Épisode N" when empty.
     static func episodeTitle(_ raw: String?, number: Int, seriesTitle: String) -> String {
+        episodeTitle(raw, number: number, seriesKey: TitleNormalizer.key(seriesTitle))
+    }
+
+    /// `seriesKey` = `TitleNormalizer.key(seriesTitle)`, hoisted out of per-episode loops.
+    static func episodeTitle(_ raw: String?, number: Int, seriesKey: String) -> String {
         guard let raw, !raw.isEmpty else { return "Épisode \(number)" }
         let n = TitleNormalizer.normalize(raw)
         if n.season != nil || n.episode != nil {
-            if let title = n.episodeTitle, !title.isEmpty, TitleNormalizer.key(title) != TitleNormalizer.key(seriesTitle) { return title }
-            if n.key != TitleNormalizer.key(seriesTitle), !n.title.isEmpty, n.episodeTitle != nil { return n.title }
+            if let title = n.episodeTitle, !title.isEmpty, TitleNormalizer.key(title) != seriesKey { return title }
+            if n.key != seriesKey, !n.title.isEmpty, n.episodeTitle != nil { return n.title }
             return "Épisode \(number)"
         }
-        if n.key == TitleNormalizer.key(seriesTitle) { return "Épisode \(number)" }
+        if n.key == seriesKey { return "Épisode \(number)" }
         return raw
     }
 

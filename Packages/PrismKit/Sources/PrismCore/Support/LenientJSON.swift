@@ -40,7 +40,8 @@ enum LenientValue {
             let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
             if let i = Int(trimmed) { return i }
-            if let d = Double(trimmed.replacingOccurrences(of: ",", with: ".")), d.isFinite, abs(d) < 9e15 { return Int(d) }
+            let normalized = trimmed.contains(",") ? trimmed.replacingOccurrences(of: ",", with: ".") : trimmed
+            if let d = Double(normalized), d.isFinite, abs(d) < 9e15 { return Int(d) }
             return nil
         default:
             return nil
@@ -54,7 +55,8 @@ enum LenientValue {
             let d = n.doubleValue
             return d.isFinite ? d : nil
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+            var trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.contains(",") { trimmed = trimmed.replacingOccurrences(of: ",", with: ".") }
             guard !trimmed.isEmpty, let d = Double(trimmed), d.isFinite else { return nil }
             return d
         default:
@@ -228,10 +230,12 @@ enum LenientValue {
         let remainder = cleaned.count % 4
         if remainder > 0 { cleaned += String(repeating: "=", count: 4 - remainder) }
         if let data = Data(base64Encoded: cleaned), let text = String(data: data, encoding: .utf8),
-           !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }),
-           proseScore(text) >= 0.85, proseScore(text) >= proseScore(raw) {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+           !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }) {
+            let score = proseScore(text)
+            if score >= 0.85, score >= proseScore(raw) {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
         }
         return raw
     }

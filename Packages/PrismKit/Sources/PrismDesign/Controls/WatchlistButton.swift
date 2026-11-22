@@ -5,6 +5,7 @@ public struct WatchlistButton: View {
     private let isAdded: Bool
     private let size: CGFloat
     private let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(isAdded: Bool, size: CGFloat = PrismMetrics.circleButtonSize, action: @escaping () -> Void) {
         self.isAdded = isAdded
@@ -21,7 +22,7 @@ public struct WatchlistButton: View {
                 .contentShape(.circle)
         }
         .buttonStyle(GlassCircleStyle(style: .dark))
-        .animation(PrismMotion.standard, value: isAdded)
+        .animation(PrismMotion.respecting(reduceMotion, PrismMotion.standard), value: isAdded)
         .accessibilityLabel(isAdded ? "Retirer de Ma liste" : "Ajouter à Ma liste")
         .accessibilityAddTraits(isAdded ? .isSelected : [])
     }

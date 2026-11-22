@@ -38,6 +38,41 @@ struct SupportTests {
         #expect(words == ["dune"])
     }
 
+    @Test func emojiAndSymbolsSplitWordsLikePunctuation() {
+        // Emoji are symbols (So), not word characters: they must split words exactly like
+        // punctuation does, or "Dune🏆Partie" would index as one glued word.
+        let single = TextFolding.words(ofFolded: TextFolding.fold("Dune 🏆 Partie"))
+        #expect(single.map { String(decoding: $0, as: UTF8.self) } == ["dune", "partie"])
+        // ZWJ sequences stay separators too.
+        let family = TextFolding.words(ofFolded: TextFolding.fold("Film 👨‍👩‍👧 2020"))
+        #expect(family.map { String(decoding: $0, as: UTF8.self) } == ["film", "2020"])
+        // Same through the buffer API used by the index builder.
+        var words: [String] = []
+        var buffer: [UInt8] = []
+        TextFolding.forEachWord(in: "A🏆B", buffer: &buffer) { word in
+            words.append(String(decoding: word, as: UTF8.self))
+        }
+        #expect(words == ["a", "b"])
+    }
+
+    @Test func nonLatinLettersStayWordCharacters() {
+        // Arabic letters are Lo like Cyrillic or Latin: they must remain word characters,
+        // both in `words` and in the streaming `forEachWord` path.
+        let arabic = TextFolding.words(ofFolded: TextFolding.fold("مسلسل رمضان"))
+        #expect(arabic.map { String(decoding: $0, as: UTF8.self) } == ["مسلسل", "رمضان"])
+        var words: [String] = []
+        var buffer: [UInt8] = []
+        TextFolding.forEachWord(in: "الجزيرةsport", buffer: &buffer) { word in
+            words.append(String(decoding: word, as: UTF8.self))
+        }
+        #expect(words == ["الجزيرةsport"])
+        // Thai and Hebrew letters likewise (Lo / Lo).
+        let thai = TextFolding.words(ofFolded: TextFolding.fold("ละครไทย"))
+        #expect(thai.count == 1)
+        let hebrew = TextFolding.words(ofFolded: TextFolding.fold("ערוץ 12"))
+        #expect(hebrew.map { String(decoding: $0, as: UTF8.self) } == ["ערוץ", "12"])
+    }
+
     @Test func naturalness() {
         #expect(TextFolding.naturalnessScore("Amélie") > TextFolding.naturalnessScore("AMELIE"))
         #expect(TextFolding.naturalnessScore("Amélie") > TextFolding.naturalnessScore("Amelie"))

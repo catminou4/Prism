@@ -26,7 +26,8 @@ enum LivePlayback {
         return PlaybackItem(
             id: variant.id.rawValue, url: variant.streamURL, fallbackURLs: fallback,
             title: group.name, subtitle: program?.title, artworkURL: group.logoURL,
-            isLive: true, httpHeaders: variant.httpHeaders
+            isLive: true, httpHeaders: variant.httpHeaders,
+            supportsTimeshift: variant.catchup != nil
         )
     }
 

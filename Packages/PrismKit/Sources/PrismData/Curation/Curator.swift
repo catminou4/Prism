@@ -171,6 +171,10 @@ struct FeedBuilder {
     /// other input is fixed for the builder's lifetime, so repeated shelf/"voir tout" lookups
     /// extend a scan instead of re-filtering the whole ranking.
     private var candidateScans: [CandidateKey: CandidateScan] = [:]
+    /// Per-kind scan context, built once per feed: the ranking positions that can still produce
+    /// candidates (language and dismissal filters are fixed for the builder's lifetime) and the
+    /// daily rotation noise of every title. Facet scans neither re-filter nor re-hash elements.
+    private var kindContexts: [MediaKind: KindContext] = [:]
 
     init(
         catalog: Catalog, index: CurationIndex, recommendations: Recommendations, languages: Set<HomeAudioLanguage>,
@@ -438,7 +442,7 @@ struct FeedBuilder {
     }
 
     /// One (kind set, facet) scan: per-kind filtered candidates kept in ranking order plus how
-    /// far each kind's ranking has been consumed. `seed` is the resolved `.because` anchor.
+    /// far each kind's eligible pool has been consumed. `seed` is the resolved `.because` anchor.
     private struct CandidateScan {
         struct KindScan {
             var kind: MediaKind
@@ -455,6 +459,15 @@ struct FeedBuilder {
         }
     }
 
+    /// What every facet scan of one kind shares: `pool` holds the ranking's catalogue indices in
+    /// ranking order after the builder-constant language/dismissal filters; `jitters` the daily
+    /// rotation noise of each catalogue index, filled on the first jitter-using facet scan
+    /// (only pool positions are filled, empty until then).
+    private struct KindContext {
+        var pool: [Int32]
+        var jitters: [Float] = []
+    }
+
     /// Ranked catalogue positions matching a query, before presentation.
     /// Scans are memoized per (kind set, facet) and extended lazily to the depth each limit
     /// needs; results are identical to rescanning because nothing but `limit` varies between
@@ -464,7 +477,6 @@ struct FeedBuilder {
         var scan = candidateScans[key] ?? CandidateScan(kinds: query.kind.map { [$0] } ?? [.movie, .series])
         let poolLimit = limit * 4 + 40
         let followsGeneral = query.facet.followsGeneralScore
-        let checksLanguage = index.hasLanguageEvidence
 
         // The "because" seed resolves once per scan; an unresolvable seed yields no candidates.
         if case .because = query.facet, !scan.seedChecked {
@@ -481,31 +493,46 @@ struct FeedBuilder {
         let seed = scan.seed
 
         // Extend each kind's filtered scan to the depth this request needs (or to exhaustion
-        // for facets that do not follow the general ranking).
+        // for facets that do not follow the general ranking). The pool already applied the
+        // language/dismissal filters, so every visited element only needs its facet score.
         for kindIndex in scan.kinds.indices {
             let target = followsGeneral ? poolLimit : Int.max
             guard !scan.kinds[kindIndex].exhausted,
                   scan.kinds[kindIndex].candidates.count < target else { continue }
             let kind = scan.kinds[kindIndex].kind
+            var context = kindContext(for: kind)
+            if query.facet.usesJitter, context.jitters.isEmpty {
+                context.jitters = jitterTable(kind: kind, pool: context.pool, signalCount: index.signals(kind).count)
+                kindContexts[kind] = context
+            }
+            let pool = context.pool
+            let jitters = context.jitters
             let signals = index.signals(kind)
-            let titles = kind == .series ? catalog.series : catalog.movies
-            let ranking = index.ranking(kind)
-            while scan.kinds[kindIndex].rankPosition < ranking.count,
+            while scan.kinds[kindIndex].rankPosition < pool.count,
                   scan.kinds[kindIndex].candidates.count < target {
-                let titleIndex = ranking[scan.kinds[kindIndex].rankPosition]
+                let titleIndex = pool[scan.kinds[kindIndex].rankPosition]
                 scan.kinds[kindIndex].rankPosition += 1
-                let signal = signals[Int(titleIndex)]
-                guard !checksLanguage || signal.matches(audio: audioMask),
-                      let facetScore = score(signal, kind: kind, index: titleIndex, for: query.facet, seed: seed),
-                      profile.dismissed.isEmpty || !profile.dismissed.contains(titles[Int(titleIndex)].id) else { continue }
+                guard let facetScore = score(
+                    signals[Int(titleIndex)], kind: kind, index: titleIndex,
+                    jitter: jitters.isEmpty ? 0 : jitters[Int(titleIndex)], for: query.facet, seed: seed
+                ) else { continue }
                 scan.kinds[kindIndex].candidates.append(Candidate(score: facetScore, kind: kind, index: titleIndex))
             }
-            scan.kinds[kindIndex].exhausted = scan.kinds[kindIndex].rankPosition >= ranking.count
+            scan.kinds[kindIndex].exhausted = scan.kinds[kindIndex].rankPosition >= pool.count
         }
         candidateScans[key] = scan
 
+        // Candidates kept per kind once merged: prefix-bounded for general-ranking facets,
+        // exhaustive otherwise.
+        var merged = 0
+        for kindScan in scan.kinds {
+            merged += followsGeneral ? min(kindScan.candidates.count, poolLimit) : kindScan.candidates.count
+        }
+        if merged > limit {
+            return Self.topCandidates(scan.kinds, followsGeneral: followsGeneral, poolLimit: poolLimit, limit: limit)
+        }
         var scored: [Candidate] = []
-        scored.reserveCapacity(scan.kinds.reduce(0) { $0 + min($1.candidates.count, followsGeneral ? poolLimit : $1.candidates.count) })
+        scored.reserveCapacity(merged)
         for kindScan in scan.kinds {
             if followsGeneral {
                 // Rankings are sorted by the general score: once enough candidates are seen for
@@ -515,24 +542,92 @@ struct FeedBuilder {
                 scored.append(contentsOf: kindScan.candidates)
             }
         }
-        if scored.count > limit {
-            scored = CatalogBuilder.topIndices(
-                scored.enumerated().lazy.map { (score: Double($0.element.score), index: Int32($0.offset)) }, count: limit
-            ).map { scored[Int($0)] }
-        } else {
-            scored.sort { $0.score != $1.score ? $0.score > $1.score : ($0.kind.rawValue, $0.index) < ($1.kind.rawValue, $1.index) }
-        }
+        scored.sort { $0.score != $1.score ? $0.score > $1.score : ($0.kind.rawValue, $0.index) < ($1.kind.rawValue, $1.index) }
         return scored
     }
 
-    /// Facet-specific score, or `nil` when the title does not belong to the facet.
+    /// Ranking context of one kind, built on first use and shared by every facet scan.
+    private mutating func kindContext(for kind: MediaKind) -> KindContext {
+        if let context = kindContexts[kind] { return context }
+        let ranking = index.ranking(kind)
+        let signals = index.signals(kind)
+        // Dismissed titles as catalogue indices: `TitleID` lookups happen once per kind instead
+        // of a string hash per scanned element per facet.
+        var dismissed: Set<Int32>?
+        if !profile.dismissed.isEmpty {
+            let lookup = kind == .series ? catalog.indexes.seriesByTitleID : catalog.indexes.movieByTitleID
+            var set = Set<Int32>()
+            set.reserveCapacity(profile.dismissed.count)
+            for id in profile.dismissed {
+                if let position = lookup[id] { set.insert(Int32(position)) }
+            }
+            dismissed = set
+        }
+        let checksLanguage = index.hasLanguageEvidence
+        let hasDismissed = dismissed?.isEmpty == false
+        let pool: [Int32]
+        if !checksLanguage && !hasDismissed {
+            pool = ranking
+        } else {
+            pool = ranking.filter { titleIndex in
+                (!checksLanguage || signals[Int(titleIndex)].matches(audio: audioMask))
+                    && !(dismissed?.contains(titleIndex) ?? false)
+            }
+        }
+        let context = KindContext(pool: pool)
+        kindContexts[kind] = context
+        return context
+    }
+
+    /// Daily rotation noise of every pool position, computed once per kind on the first
+    /// jitter-using facet scan instead of once per element per facet.
+    private func jitterTable(kind: MediaKind, pool: [Int32], signalCount: Int) -> [Float] {
+        var jitters = [Float](repeating: 0, count: signalCount)
+        for titleIndex in pool {
+            jitters[Int(titleIndex)] = noise(kind: kind, index: titleIndex) * 0.035
+        }
+        return jitters
+    }
+
+    /// Top `limit` candidates across the per-kind pools, best first. Equivalent to running
+    /// `CatalogBuilder.topIndices` over the concatenated pools — candidates are visited in scan
+    /// order and equal scores keep that order — without materializing the merge.
+    private static func topCandidates(
+        _ kinds: [CandidateScan.KindScan], followsGeneral: Bool, poolLimit: Int, limit: Int
+    ) -> [Candidate] {
+        guard limit > 0 else { return [] }
+        var top: [Candidate] = []
+        top.reserveCapacity(limit + 1)
+        for kindScan in kinds {
+            let pool: ArraySlice<Candidate>
+            if followsGeneral {
+                pool = kindScan.candidates.prefix(poolLimit)
+            } else {
+                pool = kindScan.candidates[...]
+            }
+            for candidate in pool {
+                if top.count == limit, candidate.score <= top[top.count - 1].score { continue }
+                var low = 0, high = top.count
+                while low < high {
+                    let mid = (low + high) / 2
+                    if top[mid].score >= candidate.score { low = mid + 1 } else { high = mid }
+                }
+                top.insert(candidate, at: low)
+                if top.count > limit { top.removeLast() }
+            }
+        }
+        return top
+    }
+
+    /// Facet-specific score, or `nil` when the title does not belong to the facet. `jitter` is the
+    /// title's daily rotation noise, precomputed once per kind in `kindContext`.
     private func score(
-        _ signal: TitleSignals, kind: MediaKind, index titleIndex: Int32, for facet: CurationQuery.Facet,
+        _ signal: TitleSignals, kind: MediaKind, index titleIndex: Int32, jitter: Float,
+        for facet: CurationQuery.Facet,
         seed: (id: TitleID, kind: MediaKind, signals: TitleSignals)?
     ) -> Float? {
         let isGeneral = signal.flags.isDisjoint(with: [.kids, .regional])
         let year = Int(signal.year)
-        let jitter = noise(kind: kind, index: titleIndex) * 0.035
         switch facet {
         case .top:
             // A chart is about reach first: international distribution, then quality and freshness.
@@ -831,6 +926,16 @@ extension CurationQuery.Facet {
         case .top, .newReleases, .platform, .french, .discover, .franchise, .uhd, .asian: true
         case .genre: false
         case .forYou, .because, .acclaimed, .classics, .hiddenGems, .popular, .topRated, .decade: false
+        }
+    }
+
+    /// Facets whose score adds the daily rotation noise (`jitter` in `FeedBuilder.score`);
+    /// the jitter table is only built when one of them scans.
+    var usesJitter: Bool {
+        switch self {
+        case .top, .because: false
+        case .newReleases, .forYou, .genre, .platform, .acclaimed, .classics, .french, .hiddenGems,
+             .popular, .topRated, .decade, .franchise, .uhd, .asian, .discover: true
         }
     }
 }

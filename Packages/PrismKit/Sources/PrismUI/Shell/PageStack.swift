@@ -14,12 +14,14 @@ struct PageStack<Root: View>: View {
     @ViewBuilder var root: Root
 
     /// Pushed pages kept alive under the top one (plus the root). Deeper routes stay
-    /// in `NavigationModel.stacks` — only their view state (scroll position) is lost
+    /// in `NavigationModel` — only their view state (scroll position) is lost
     /// when navigating back past this depth.
     private static var maxMountedPages: Int { 7 }
 
     var body: some View {
-        let path = navigation.stacks[section] ?? []
+        // `pages(in:)` ne souscrit qu'à la cellule de cette section : une
+        // navigation dans une autre section ne réévalue pas cette pile.
+        let path = navigation.pages(in: section)
         // Only the top `maxMountedPages` entries stay mounted; the suffix keeps the
         // most recent pages, which are the likeliest back-navigation targets.
         let mountedCount = min(path.count, Self.maxMountedPages)

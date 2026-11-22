@@ -35,6 +35,10 @@ public enum TitleRefinement {
 
     // MARK: Fast path
 
+    /// Shortest marketing prefix in UTF-8 bytes: titles shorter than it can't match, so the
+    /// seven anchored range searches below are skipped for nearly every catalog title.
+    private static let shortestMarketingPrefix = marketingPrefixes.map(\.utf8.count).min() ?? .max
+
     private static func needsWork(_ title: String) -> Bool {
         let bytes = title.utf8
         guard let last = bytes.last else { return false }
@@ -52,7 +56,8 @@ public enum TitleRefinement {
             default: upperRun = 0
             }
         }
-        if let first = bytes.first, first == UInt8(ascii: "U") || first == UInt8(ascii: "A") || first == UInt8(ascii: "M"),
+        if title.utf8.count >= shortestMarketingPrefix,
+           let first = bytes.first, first == UInt8(ascii: "U") || first == UInt8(ascii: "A") || first == UInt8(ascii: "M"),
            marketingPrefixes.contains(where: { title.range(of: $0, options: [.caseInsensitive, .anchored, .diacriticInsensitive]) != nil }) {
             return true
         }

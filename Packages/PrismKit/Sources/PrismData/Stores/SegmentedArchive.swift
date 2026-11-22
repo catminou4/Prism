@@ -116,21 +116,35 @@ enum SegmentedArchive {
         }
     }
 
-    /// Encodes `items` in chunks of `chunkSize`, concurrently, preserving order.
+    /// Encodes `items` in chunks of `chunkSize`, at most six chunks in flight (each holds a full
+    /// JSON document plus its compressed form, so an unbounded group multiplied peak memory by
+    /// the chunk count), preserving archive order.
     static func encodeChunks<T: Encodable & Sendable>(_ items: [T], tag: UInt8, chunkSize: Int) async throws -> [Segment] {
+        let batchSize = 6
+        // The batch span multiplies chunkSize by batchSize: keep it far from Int.max.
+        precondition(chunkSize > 0 && chunkSize <= Int.max / batchSize)
         guard !items.isEmpty else { return [] }
-        return try await withThrowingTaskGroup(of: (Int, Segment).self) { group in
-            for (index, lower) in stride(from: 0, to: items.count, by: chunkSize).enumerated() {
-                let upper = min(lower + chunkSize, items.count)
-                group.addTask {
-                    try Task.checkCancellation()
-                    return (index, try encodeSegment(Chunk(items: items[lower..<upper]), tag: tag))
+        var segments: [Segment] = []
+        var lower = 0
+        while lower < items.count {
+            try Task.checkCancellation()
+            let upper = min(lower + chunkSize * batchSize, items.count)
+            let batch = try await withThrowingTaskGroup(of: (Int, Segment).self) { group in
+                for start in stride(from: lower, to: upper, by: chunkSize) {
+                    let end = min(start + chunkSize, items.count)
+                    group.addTask {
+                        try Task.checkCancellation()
+                        return (start, try encodeSegment(Chunk(items: items[start..<end]), tag: tag))
+                    }
                 }
+                var parts: [(Int, Segment)] = []
+                for try await part in group { parts.append(part) }
+                return parts.sorted { $0.0 < $1.0 }.map(\.1)
             }
-            var parts: [(Int, Segment)] = []
-            for try await part in group { parts.append(part) }
-            return parts.sorted { $0.0 < $1.0 }.map(\.1)
+            segments.append(contentsOf: batch)
+            lower = upper
         }
+        return segments
     }
 
     // MARK: Integers

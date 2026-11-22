@@ -62,14 +62,24 @@ nonisolated final class ImageDiskCache: Sendable {
     func data(for url: URL) -> Data? {
         let key = Self.key(for: url)
         let file = fileURL(forKey: key)
-        // Artwork files are small: a plain read beats mapping them.
-        guard let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
+        guard let data = Self.read(file), !data.isEmpty else { return nil }
         // LRU touch, once per launch: the date only has to order files across sessions.
         let isNew = usage.withLock { state in Self.noteTouched(&state, key) }
         if isNew {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
         }
         return data
+    }
+
+    /// `.mappedIfSafe` keeps the bytes in the shared page cache instead of a fresh malloc'd
+    /// copy per read — the same artwork is decoded at several sizes per launch, and a hero
+    /// backdrop can be several MB. The `Data` bridges the mapping zero-copy (verified);
+    /// filesystems that refuse mapping fall back to a plain read.
+    private static func read(_ file: URL) -> Data? {
+        if let mapped = try? NSData(contentsOf: file, options: [.mappedIfSafe]) {
+            return mapped as Data
+        }
+        return try? Data(contentsOf: file)
     }
 
     func store(_ data: Data, for url: URL) {

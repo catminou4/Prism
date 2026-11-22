@@ -12,6 +12,7 @@ public struct SourceCard: View {
     private let width: CGFloat
     private let action: (() -> Void)?
     private let accessibilityText: Text
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(name: String, detail: String? = nil, tint: PrismTint, isSelected: Bool = false, logoURL: URL? = nil, width: CGFloat = 292, action: (() -> Void)? = nil) {
         self.name = name
@@ -55,7 +56,7 @@ public struct SourceCard: View {
                 RoundedRectangle(cornerRadius: PrismMetrics.sourceCardRadius, style: .continuous)
                     .strokeBorder(Color.accentColor, lineWidth: isSelected ? 2 : 0)
             }
-            .animation(PrismMotion.standard, value: isSelected)
+            .animation(PrismMotion.respecting(reduceMotion, PrismMotion.standard), value: isSelected)
         }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }

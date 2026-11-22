@@ -97,7 +97,9 @@ public actor ImagePipeline {
         configuration.waitsForConnectivity = false
         configuration.httpAdditionalHeaders = ["Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8"]
         if warming { configuration.networkServiceType = .background }
-        return URLSession(configuration: configuration)
+        // `download` drives its tasks manually: the async `URLSession` APIs bypass session
+        // delegates entirely, so the 2xx/MIME/size checks and the byte cap live in the delegate.
+        return URLSession(configuration: configuration, delegate: downloadDelegate, delegateQueue: nil)
     }
 
     // MARK: Public API
@@ -188,10 +190,18 @@ public actor ImagePipeline {
         let candidates = inFlight.compactMap { $0.key.url == url && $0.key.blur == 0 ? $0.value : nil }
         for entry in candidates {
             if let image = await entry.task.value {
+                // A finished decode already stored its own sample (see `makeTask`); reuse it
+                // instead of drawing the 12 px average a second time. The fallback covers a
+                // decode that returned an image without memoizing (cancelled mid-store).
+                if let rgba = averageColors[url] { return rgba }
                 return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
             }
         }
+        // A same-URL decode may have memoized while the in-flight ones were awaited.
+        if let cached = averageColors[url] { return cached }
         guard let image = await image(for: url, maxPixelSize: 64) else { return nil }
+        // Same reuse: the 64 px decode memoizes too unless it was a memory-cache hit.
+        if let rgba = averageColors[url] { return rgba }
         return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
     }
 
@@ -340,6 +350,9 @@ public actor ImagePipeline {
     /// disk beyond this. Overshooting by a few KiB between checks is harmless.
     private static let maxImageBytes = 48 << 20
 
+    /// Attached to both sessions in `makeSession`; `download` relies on its callbacks.
+    private static let downloadDelegate = ImageDownloadDelegate(limit: maxImageBytes)
+
     /// Disk hit, else network. Bytes are validated (status, MIME, size cap) and — when no
     /// fallback exists — stored even if undecodable, which prevents a refetch loop for dead
     /// artwork URLs. `isDecodable` gates the return value so `encodedData` falls through to
@@ -355,36 +368,29 @@ public actor ImagePipeline {
         return await download(fallback, disk: disk, session: session, storeUndecodable: true)
     }
 
-    /// Streams the body with `URLSession.AsyncBytes` instead of buffering the whole response:
-    /// memory stays flat whatever the payload size, and reading stops as soon as the cap is hit.
+    /// Downloads through a manually driven `URLSessionDataTask`: `ImageDownloadDelegate`
+    /// rejects bad statuses, non-image MIME types and oversized `Content-Length` before the
+    /// body starts, then accumulates chunks with memcpy and cancels the moment the running
+    /// total passes the cap. This replaces `URLSession.AsyncBytes`, whose per-byte iteration
+    /// cost tens of ns per byte (~0.3–0.8 s of CPU for a 10 MB backdrop).
     @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession, storeUndecodable: Bool) async -> Data? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        do {
-            let (stream, response) = try await session.bytes(from: url)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-            if let mime = response.mimeType?.lowercased(), mime.hasPrefix("text/") || mime.contains("json") || mime.contains("html") {
-                return nil
+        let task = session.dataTask(with: url)
+        let data = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                downloadDelegate.begin(task, continuation)
+                task.resume()
             }
-            // Headers arrive before the body: refuse oversized payloads without consuming them.
-            if response.expectedContentLength > Int64(maxImageBytes) { return nil }
-            var bytes: [UInt8] = []
-            let expected = response.expectedContentLength
-            bytes.reserveCapacity(expected > 0 ? min(Int(expected), maxImageBytes) : 0)
-            for try await byte in stream {
-                bytes.append(byte)
-                if bytes.count & 0x3FFF == 0, Task.isCancelled || bytes.count > maxImageBytes { return nil }
-            }
-            guard bytes.count <= maxImageBytes, !bytes.isEmpty else { return nil }
-            let data = Data(bytes)
-            guard ImageDecoder.isDecodable(data) else {
-                if storeUndecodable { disk.store(data, for: url) }
-                return nil
-            }
-            disk.store(data, for: url)
-            return data
-        } catch {
+        } onCancel: {
+            task.cancel()
+        }
+        guard let data, !data.isEmpty, data.count <= maxImageBytes else { return nil }
+        guard ImageDecoder.isDecodable(data) else {
+            if storeUndecodable { disk.store(data, for: url) }
             return nil
         }
+        disk.store(data, for: url)
+        return data
     }
 
     private func enqueueWarm(_ urls: [URL], target: CGSize, fitting: Fitting) {
@@ -441,6 +447,74 @@ public actor ImagePipeline {
             entry.task.cancel()
             inFlight[key] = nil
         }
+    }
+}
+
+/// Drives the data tasks `ImagePipeline.download` creates manually. The async `URLSession`
+/// APIs (`data(from:)`, `bytes(from:)`, completion-handler tasks) bypass session delegates on
+/// macOS 26 — verified empirically — so header checks and the byte cap can only live here.
+///
+/// Callbacks arrive on each session's serial delegate queue; `pending` is locked because the
+/// foreground and prefetch sessions have separate queues. Every resumed task produces exactly
+/// one `didCompleteWithError`, which is the single point where the continuation resumes.
+private final class ImageDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private struct Pending {
+        var data = Data()
+        /// `Content-Length` hint used to pre-size the accumulation (0 = unknown).
+        var hint = 0
+        var continuation: CheckedContinuation<Data?, Never>?
+    }
+
+    private let pending = Mutex<[ObjectIdentifier: Pending]>([:])
+    private let limit: Int
+
+    init(limit: Int) { self.limit = limit }
+
+    /// Registers the continuation before `task.resume()`; safe even if the caller is already
+    /// cancelled — a task cancelled before resume still reports `didCompleteWithError`.
+    func begin(_ task: URLSessionDataTask, _ continuation: CheckedContinuation<Data?, Never>) {
+        pending.withLock { $0[ObjectIdentifier(task)] = Pending(continuation: continuation) }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            completionHandler(.cancel)
+            return
+        }
+        if let mime = response.mimeType?.lowercased(), mime.hasPrefix("text/") || mime.contains("json") || mime.contains("html") {
+            completionHandler(.cancel)
+            return
+        }
+        // Headers arrive before the body: refuse oversized payloads without consuming them.
+        let expected = response.expectedContentLength
+        if expected > Int64(limit) {
+            completionHandler(.cancel)
+            return
+        }
+        if expected > 0 {
+            pending.withLock { $0[ObjectIdentifier(dataTask)]?.hint = Int(min(expected, Int64(limit))) }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let over = pending.withLock { state -> Bool in
+            guard var entry = state[ObjectIdentifier(dataTask)] else { return true }
+            if entry.data.isEmpty, entry.hint > 0 { entry.data.reserveCapacity(entry.hint) }
+            entry.data.append(data)
+            state[ObjectIdentifier(dataTask)] = entry
+            return entry.data.count > limit
+        }
+        if over { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        let entry = pending.withLock { $0.removeValue(forKey: ObjectIdentifier(task)) }
+        // Any error — network failure, our own oversize/status/MIME cancel, caller cancel —
+        // yields nil; only a clean finish returns the accumulated bytes.
+        entry?.continuation?.resume(returning: error == nil ? entry?.data : nil)
     }
 }
 

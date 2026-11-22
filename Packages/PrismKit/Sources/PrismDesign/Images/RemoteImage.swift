@@ -95,13 +95,20 @@ public struct RemoteImage: View {
             nil
         }
 
-        let artwork = Color.clear
-            .overlay(alignment: alignment) {
-                if url == nil {
-                    if showsPlaceholder {
-                        PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
-                    }
-                } else {
+        // No artwork to load: the placeholder (or clear space) needs no task, measurement
+        // or overlay wrapper — return it directly to keep the view tree shallow.
+        if url == nil {
+            if showsPlaceholder {
+                PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
+                    .frame(width: size?.width, height: size?.height)
+                    .clipped()
+            } else {
+                Color.clear
+                    .frame(width: size?.width, height: size?.height)
+            }
+        } else {
+            let artwork = Color.clear
+                .overlay(alignment: alignment) {
                     ZStack(alignment: alignment) {
                         if showsPlaceholder, image == nil {
                             PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
@@ -117,11 +124,9 @@ public struct RemoteImage: View {
                         }
                     }
                 }
-            }
-            .frame(width: size?.width, height: size?.height)
-            .clipped()
+                .frame(width: size?.width, height: size?.height)
+                .clipped()
 
-        if url != nil {
             artwork
                 .modifier(MeasureIfNeeded(enabled: size == nil && blurRadius <= 0, size: $measuredSize))
                 .task(id: key) {
@@ -130,8 +135,6 @@ public struct RemoteImage: View {
                 // Lazy stacks can keep a card's state after scrolling past it. The cost-bounded
                 // cache controls how long offscreen decoded artwork stays resident.
                 .onDisappear { loaded = nil }
-        } else {
-            artwork
         }
     }
 

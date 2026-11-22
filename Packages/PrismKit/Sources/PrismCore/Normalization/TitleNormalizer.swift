@@ -1,5 +1,4 @@
 import Foundation
-import Synchronization
 
 /// Result of cleaning a raw IPTV name ("FR: TF1 HD", "4K | Avatar (2009) [MULTI] HDR"…).
 public struct NormalizedName: Sendable, Hashable {
@@ -36,16 +35,9 @@ public struct NormalizedName: Sendable, Hashable {
 
 /// Fast, allocation-light cleaner for IPTV titles. Pure functions, safe to call from any thread.
 public enum TitleNormalizer {
-    /// Bounded memoization: `normalize` is pure and runs once per catalog item (100k+) with heavy
-    /// duplication across variants and sources. `Mutex` keeps `@concurrent` callers safe.
-    private static let cache = NormalizeCache()
-
     public static func normalize(_ raw: String) -> NormalizedName {
-        if let hit = cache.value(for: raw) { return hit }
         var work = NameWork(raw)
-        let result = work.normalize()
-        cache.store(result, for: raw)
-        return result
+        return work.normalize()
     }
 
     /// Grouping key: lowercase, diacritics folded (é → e, œ → oe, ß → ss), apostrophes removed,
@@ -114,26 +106,6 @@ struct PackedKey: Hashable, Sendable {
     }
 
     static func == (lhs: PackedKey, rhs: PackedKey) -> Bool { lhs.a == rhs.a && lhs.b == rhs.b && lhs.count == rhs.count }
-}
-
-/// Thread-safe bounded memo for `TitleNormalizer.normalize` (same pattern as `ResolutionMemo` in PrismData).
-private final class NormalizeCache: Sendable {
-    private struct State {
-        var map: [String: NormalizedName] = [:]
-    }
-    private let state = Mutex(State())
-    private let limit = 100_000
-
-    func value(for key: String) -> NormalizedName? {
-        state.withLock { $0.map[key] }
-    }
-
-    func store(_ value: NormalizedName, for key: String) {
-        state.withLock { state in
-            if state.map.count >= limit { state.map.removeAll(keepingCapacity: true) }
-            state.map[key] = value
-        }
-    }
 }
 
 struct NameTableEntry: Sendable {
@@ -1108,6 +1080,10 @@ enum NameFolding {
     }
 
     static func key(_ text: String) -> String {
+        fold(text)
+    }
+
+    private static func fold(_ text: String) -> String {
         var b = KeyBuilder(out: [])
         b.out.reserveCapacity(text.utf8.count + 4)
         for c in text.unicodeScalars {
@@ -1198,6 +1174,10 @@ enum NameFolding {
 
     /// Scans an already folded key word by word (no substring allocations).
     static func isAdult(key: String, strict: Bool) -> Bool {
+        scan(key: key, strict: strict)
+    }
+
+    private static func scan(key: String, strict: Bool) -> Bool {
         var word = PackedKey()
         var overflow = false
         var previous = PackedKey()

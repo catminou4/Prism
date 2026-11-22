@@ -47,7 +47,7 @@ extension EPGGuide {
         var result: [SportsBroadcast] = []
         var programsByID: [String: [(EPGProgram, BroadcastSport)]] = [:]
         // Guides repeat the same shows across days and channels: classify each distinct text once.
-        var classified: [String: BroadcastSport?] = [:]
+        var classified: [SportsScheduleMatcher.ClassifyKey: BroadcastSport?] = [:]
         for channel in channels {
             guard !Task.isCancelled else { return [] }
             guard !channel.variants.isEmpty, let id = resolveEPGID(for: channel) else { continue }
@@ -106,14 +106,28 @@ public enum SportsScheduleMatcher {
         return result
     }
 
+    /// Memo key on the programme's raw inputs: equal inputs always classify identically, so the
+    /// lookup never concatenates the texts — the joined string is only built on a miss, for the
+    /// byte-level `mayMentionSport` prefilter.
+    struct ClassifyKey: Hashable {
+        var title: String
+        var subtitle: String?
+        var categoryLabels: [String]?
+        var category: String?
+    }
+
     /// `classify` with a memo keyed by the programme's raw texts, after a byte-level check that
     /// rules out most programmes without normalizing their text.
-    static func classify(_ program: EPGProgram, memo: inout [String: BroadcastSport?]) -> BroadcastSport? {
+    static func classify(_ program: EPGProgram, memo: inout [ClassifyKey: BroadcastSport?]) -> BroadcastSport? {
+        let key = ClassifyKey(
+            title: program.title, subtitle: program.subtitle,
+            categoryLabels: program.categoryLabels, category: program.category
+        )
+        if let known = memo[key] { return known }
         let categories = program.categoryLabels?.joined(separator: " ") ?? program.category ?? ""
         let raw = program.title + "\u{1F}" + (program.subtitle ?? "") + "\u{1F}" + categories
-        if let known = memo[raw] { return known }
         let sport = mayMentionSport(raw) ? classify(program) : nil
-        memo[raw] = sport
+        memo[key] = sport
         return sport
     }
 
