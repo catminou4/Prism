@@ -96,7 +96,8 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         }
         // Hug the cards' height (a horizontal scroll view is vertically greedy otherwise).
         .fixedSize(horizontal: false, vertical: true)
-        .scrollIndicators(.hidden)
+        // `.hidden` still shows legacy scrollers when macOS is set to always show them (mouse attached).
+        .scrollIndicators(.never)
         .contentMargins(.horizontal, margin, for: .scrollContent)
         .defaultScrollAnchor(.leading, for: .initialOffset)
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))

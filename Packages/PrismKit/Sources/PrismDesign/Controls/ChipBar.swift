@@ -44,7 +44,7 @@ public struct ChipBar: View {
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .scrollIndicators(.hidden)
+        .scrollIndicators(.never)
         .scrollClipDisabled()
         .contentMargins(.horizontal, horizontalMargin, for: .scrollContent)
         .accessibilityElement(children: .contain)

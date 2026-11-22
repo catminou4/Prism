@@ -135,7 +135,7 @@ public struct LiveScreen: View {
             .padding(.vertical, 6)
         }
         .fixedSize(horizontal: false, vertical: true)
-        .scrollIndicators(.hidden)
+        .scrollIndicators(.never)
         .contentMargins(.horizontal, PrismMetrics.contentMargin, for: .scrollContent)
         .accessibilityLabel("Catégories de chaînes")
     }
