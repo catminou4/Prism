@@ -115,21 +115,25 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .overlay(alignment: .leading) { chevron(.leading) }
         .overlay(alignment: .trailing) { chevron(.trailing) }
         .onHover { inside in withAnimation(PrismMotion.quickFade) { hovering = inside } }
+        .accessibilityScrollAction { edge in
+            if edge == .leading && scrollAvailability.backward { page(.leading) }
+            if edge == .trailing && scrollAvailability.forward { page(.trailing) }
+        }
     }
 
     @ViewBuilder private func chevron(_ edge: HorizontalEdge) -> some View {
         let canScroll = edge == .leading ? scrollAvailability.backward : scrollAvailability.forward
-        GlassCircleButton(
-            systemName: edge == .leading ? "chevron.left" : "chevron.right",
-            size: PrismMetrics.shelfChevronSize,
-            accessibilityLabel: edge == .leading ? "Précédent" : "Suivant"
-        ) {
-            page(edge)
+        if isHovered && canScroll {
+            GlassCircleButton(
+                systemName: edge == .leading ? "chevron.left" : "chevron.right",
+                size: PrismMetrics.shelfChevronSize,
+                accessibilityLabel: edge == .leading ? "Précédent" : "Suivant"
+            ) {
+                page(edge)
+            }
+            .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
+            .transition(.opacity)
         }
-        .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
-        .opacity(isHovered && canScroll ? 1 : 0)
-        .allowsHitTesting(isHovered && canScroll)
-        .accessibilityHidden(!canScroll)
     }
 
     private func page(_ edge: HorizontalEdge) {

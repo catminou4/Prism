@@ -523,4 +523,22 @@ final class MockFactory {
         #expect(factory.last?.isStopped == true)
         defaults.removePersistentDomain(forName: suiteName)
     }
+
+    @Test func mouseMovementRestoresHiddenControlsDuringPlayback() {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        factory.last?.start()
+        controller.pointerExited()
+        #expect(!controller.controlsVisible)
+
+        controller.pointerMoved()
+        #expect(controller.controlsVisible)
+        controller.setPanelOpen(true)
+        controller.pointerExited()
+        #expect(controller.controlsVisible)
+
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
 }

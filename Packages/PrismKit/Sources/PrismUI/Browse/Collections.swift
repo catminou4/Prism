@@ -24,15 +24,23 @@ struct TitleGrid: View {
 
 struct CollectionView: View {
     @Environment(AppModel.self) private var app
-    @State private var curated: CuratedItems?
+    @Environment(\.isPageActive) private var isActive
+    @State private var resolved: ResolvedItems?
     let collection: CollectionRoute
 
-    private struct CuratedItems {
-        let request: CurationRequest
+    private enum Request: Equatable {
+        case catalog(Int)
+        case recent(catalog: Int, curation: Int)
+        case curated(CurationRequest)
+    }
+
+    private struct ResolvedItems {
+        let request: Request
         let titles: [MediaTitle]
     }
 
     var body: some View {
+        let request = isActive ? loadRequest : nil
         GeometryReader { geometry in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 26) {
@@ -47,12 +55,14 @@ struct CollectionView: View {
                             }
                             .padding(.horizontal, PrismMetrics.contentMargin)
                         }
-                    } else if case .curated = collection, curated == nil {
-                        ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
-                    } else if items.isEmpty {
-                        emptyMessage
+                    } else if let titles = items {
+                        if titles.isEmpty {
+                            emptyMessage
+                        } else {
+                            TitleGrid(items: titles, availableWidth: geometry.size.width)
+                        }
                     } else {
-                        TitleGrid(items: items, availableWidth: geometry.size.width)
+                        ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                 }
                 .padding(.vertical, 24)
@@ -60,17 +70,30 @@ struct CollectionView: View {
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
         }
-        .task(id: curatedRequest) {
-            guard case .curated(let query) = collection, let request = curatedRequest else { return }
-            let titles = await app.collection(query)
+        .task(id: request) {
+            guard let request, resolved?.request != request else { return }
+            let titles: [MediaTitle]
+            if case .curated(let query) = collection {
+                titles = await app.collection(query)
+            } else {
+                titles = await Self.collect(collection, in: app.catalog, index: app.curationIndex)
+            }
             guard !Task.isCancelled else { return }
-            curated = CuratedItems(request: request, titles: titles)
+            resolved = ResolvedItems(request: request, titles: titles)
         }
     }
 
-    private var curatedRequest: CurationRequest? {
-        guard case .curated(let query) = collection else { return nil }
-        return app.curationRequest(for: query.kind == .movie ? .movies : query.kind == .series ? .series : .home)
+    private var loadRequest: Request? {
+        switch collection {
+        case .category, .topRated, .related:
+            .catalog(app.catalogRevision)
+        case .recentlyAdded:
+            .recent(catalog: app.catalogRevision, curation: app.curationRevision)
+        case .curated(let query):
+            .curated(app.curationRequest(for: query.kind == .movie ? .movies : query.kind == .series ? .series : .home))
+        case .all, .watchlist, .continueWatching:
+            nil
+        }
     }
 
     private var title: String {
@@ -86,25 +109,28 @@ struct CollectionView: View {
         }
     }
 
-    private var items: [MediaTitle] {
+    private var items: [MediaTitle]? {
+        switch collection {
+        case .all(let kind): kind == .movie ? app.catalog.movies : app.catalog.series
+        case .watchlist: app.library.watchlist.compactMap(app.catalog.title)
+        case .continueWatching: []
+        case .category, .recentlyAdded, .topRated, .related, .curated: resolved?.titles
+        }
+    }
+
+    @concurrent private static func collect(_ collection: CollectionRoute, in catalog: Catalog, index: CurationIndex) async -> [MediaTitle] {
         switch collection {
         case .category(let id):
-            app.catalog.categoryGroup(id).map(app.catalog.titles(in:)) ?? []
-        case .all(let kind):
-            kind == .movie ? app.catalog.movies : app.catalog.series
+            catalog.categoryGroup(id).map(catalog.titles(in:)) ?? []
         case .recentlyAdded(let kind):
             // Newest first, without clips, cams and listings in scripts the user cannot read.
-            (kind == .movie ? app.catalog.movies : app.catalog.series).prefix(3_000)
-                .filter { app.signals(for: $0)?.isEligible ?? true }
-        case .curated:
-            curated?.titles ?? []
+            (kind == .movie ? catalog.movies : catalog.series).prefix(3_000)
+                .filter { index.signals(for: $0, in: catalog)?.isEligible ?? true }
         case .topRated(let kind):
-            app.catalog.topRated(kind, limit: 200)
-        case .watchlist:
-            app.library.watchlist.compactMap(app.catalog.title)
+            catalog.topRated(kind, limit: 200)
         case .related(let id):
-            app.catalog.title(id).map { app.catalog.related(to: $0, limit: 80) } ?? []
-        case .continueWatching: []
+            catalog.title(id).map { catalog.related(to: $0, limit: 80) } ?? []
+        case .all, .watchlist, .continueWatching, .curated: []
         }
     }
 

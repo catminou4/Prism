@@ -68,6 +68,9 @@ struct SearchScreen: View {
             }
             .padding(.vertical, 24)
         }
+        .task(id: isActive ? app.catalogRevision : nil, priority: .utility) {
+            if isActive { app.prepareSearchIndex() }
+        }
         .task(id: request) {
             guard request.active, !request.term.isEmpty, let index = app.searchIndex else { return }
             try? await Task.sleep(for: .milliseconds(150))

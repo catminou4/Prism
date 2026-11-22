@@ -123,7 +123,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
             switch phase {
             case .active:
                 if !isPointerInside { isPointerInside = true }
-                controller.noteUserActivity()
+                controller.pointerMoved()
             case .ended:
                 if isPointerInside { isPointerInside = false }
                 controller.pointerExited()
@@ -188,6 +188,18 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
     }
 
     private var controlsLayer: some View {
+        ZStack {
+            if controller.controlsVisible {
+                transportControls
+                    .transition(.opacity)
+            }
+        }
+        .allowsHitTesting(controller.controlsVisible)
+        .accessibilityHidden(!controller.controlsVisible)
+        .animation(fade, value: controller.controlsVisible)
+    }
+
+    private var transportControls: some View {
         let showsTransport = !controller.isLoading && failureMessage == nil
         return VStack(spacing: 0) {
             topBar
@@ -217,10 +229,6 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
-        .opacity(controller.controlsVisible ? 1 : 0)
-        .allowsHitTesting(controller.controlsVisible)
-        .accessibilityHidden(!controller.controlsVisible)
-        .animation(fade, value: controller.controlsVisible)
     }
 
     // MARK: Top

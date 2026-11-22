@@ -44,7 +44,7 @@ enum SegmentedArchive {
             let tag = table[index * 5]
             let length = Int(readUInt32(table, at: index * 5 + 1))
             guard offset + length <= data.endIndex else { return nil }
-            segments.append(Segment(tag: tag, payload: data.subdata(in: offset ..< offset + length)))
+            segments.append(Segment(tag: tag, payload: data[offset ..< offset + length]))
             offset += length
         }
         return segments
@@ -53,13 +53,26 @@ enum SegmentedArchive {
     // MARK: Segments
 
     static func encodeSegment<T: Encodable>(_ value: T, tag: UInt8) throws -> Segment {
-        let json = try JSONEncoder().encode(value)
-        return Segment(tag: tag, payload: try (json as NSData).compressed(using: .lzfse) as Data)
+        try autoreleasepool {
+            let json = try JSONEncoder().encode(value)
+            return Segment(tag: tag, payload: try (json as NSData).compressed(using: .lzfse) as Data)
+        }
     }
 
     static func decodeSegment<T: Decodable>(_ type: T.Type, from segment: Segment) -> T? {
-        guard let json = try? (segment.payload as NSData).decompressed(using: .lzfse) as Data else { return nil }
-        return try? JSONDecoder().decode(T.self, from: json)
+        autoreleasepool {
+            guard let json = try? (segment.payload as NSData).decompressed(using: .lzfse) as Data else { return nil }
+            return try? JSONDecoder().decode(T.self, from: json)
+        }
+    }
+
+    private struct Chunk<Item: Encodable>: Encodable {
+        let items: ArraySlice<Item>
+
+        func encode(to encoder: any Encoder) throws {
+            var values = encoder.unkeyedContainer()
+            try values.encode(contentsOf: items)
+        }
     }
 
     /// Encodes `items` in chunks of `chunkSize`, concurrently, preserving order.
@@ -68,7 +81,10 @@ enum SegmentedArchive {
         return try await withThrowingTaskGroup(of: (Int, Segment).self) { group in
             for (index, lower) in stride(from: 0, to: items.count, by: chunkSize).enumerated() {
                 let upper = min(lower + chunkSize, items.count)
-                group.addTask { (index, try encodeSegment(Array(items[lower..<upper]), tag: tag)) }
+                group.addTask {
+                    try Task.checkCancellation()
+                    return (index, try encodeSegment(Chunk(items: items[lower..<upper]), tag: tag))
+                }
             }
             var parts: [(Int, Segment)] = []
             for try await part in group { parts.append(part) }

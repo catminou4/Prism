@@ -27,7 +27,6 @@ nonisolated final class ImageDiskCache: Sendable {
             .appending(path: "Prism/Images", directoryHint: .isDirectory)
         self.directory = base
         self.capacity = capacity
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     }
 
     private static let hexDigits = Array("0123456789abcdef".utf8)

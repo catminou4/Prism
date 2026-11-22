@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 import SwiftUI
 
-/// Shared image loader: request de-duplication, memory cache (≈ 256 MB, byte cost), disk cache
+/// Shared image loader: request de-duplication, memory cache (≈ 160 MiB, byte cost), disk cache
 /// (1 GB, survives relaunch), ImageIO downsampling off the main thread.
 ///
 /// ```swift
@@ -66,10 +66,11 @@ public actor ImagePipeline {
 
     private let memory: MemoryCache
     private let disk: ImageDiskCache
-    private let session: URLSession
+    private let decoder = ImageDecodeQueue()
+    private lazy var session = Self.makeSession(warming: false)
     /// Background warm-ups use their own small connection pool so they never queue ahead of
     /// artwork that is on screen.
-    private let prefetchSession: URLSession
+    private lazy var prefetchSession = Self.makeSession(warming: true)
     private var inFlight: [Key: InFlight<CGImage?>] = [:]
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
@@ -81,22 +82,22 @@ public actor ImagePipeline {
     private var warmRunning = 0
     private static let warmConcurrency = 3
 
-    public init(memoryCapacity: Int = 256 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
+    public init(memoryCapacity: Int = 160 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
         memory = MemoryCache(costLimit: memoryCapacity)
         disk = ImageDiskCache(directory: diskDirectory, capacity: diskCapacity)
+    }
+
+    private nonisolated static func makeSession(warming: Bool) -> URLSession {
         let configuration = URLSessionConfiguration.default
-        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.httpMaximumConnectionsPerHost = warming ? 2 : 6
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 60
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil // the disk cache below stores the encoded bytes
         configuration.waitsForConnectivity = false
         configuration.httpAdditionalHeaders = ["Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8"]
-        session = URLSession(configuration: configuration)
-        let background = configuration.copy() as? URLSessionConfiguration ?? configuration
-        background.httpMaximumConnectionsPerHost = 2
-        background.networkServiceType = .background
-        prefetchSession = URLSession(configuration: background)
+        if warming { configuration.networkServiceType = .background }
+        return URLSession(configuration: configuration)
     }
 
     // MARK: Public API
@@ -113,7 +114,7 @@ public actor ImagePipeline {
         return await image(for: key)
     }
 
-    func image(for key: Key) async -> CGImage? {
+    func image(for key: Key, blurredFrom source: Key? = nil) async -> CGImage? {
         guard !Task.isCancelled else { return nil }
         if let hit = memory.image(for: key) { return hit }
 
@@ -121,7 +122,7 @@ public actor ImagePipeline {
         if let existing = inFlight[key] {
             entry = existing
         } else {
-            entry = InFlight(task: makeTask(for: key))
+            entry = InFlight(task: makeTask(for: key, blurredFrom: source))
             inFlight[key] = entry
         }
         entry.waiters += 1
@@ -230,21 +231,32 @@ public actor ImagePipeline {
         return Key(url: url, width: width, height: height, fitting: fitting, blur: blur)
     }
 
-    private func makeTask(for key: Key) -> Task<CGImage?, Never> {
+    private func makeTask(for key: Key, blurredFrom source: Key?) -> Task<CGImage?, Never> {
         let memory = memory
+        let decoder = decoder
         let blur = CGFloat(key.blur)
         let target = key.target
         return Task.detached(priority: .userInitiated) {
-            var image: CGImage?
-            if key.url.isFileURL {
-                image = await ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+            let image: CGImage?
+            if blur > 0, let source {
+                guard let sharp = await self.image(for: source) else { return nil }
+                image = await decoder.decode {
+                    return ImageDecoder.blurred(sharp, radius: blur * 0.25, target: target)
+                }
+            } else if key.url.isFileURL {
+                image = await decoder.decode {
+                    let thumbnail = ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+                    return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
+                }
             } else if let data = await self.sharedData(
                 for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             ) {
-                image = await ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
-            }
-            if let decoded = image, blur > 0 {
-                image = await ImageDecoder.blurred(decoded, radius: blur * 0.25)
+                image = await decoder.decode {
+                    let thumbnail = ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+                    return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
+                }
+            } else {
+                image = nil
             }
             if let image, !Task.isCancelled {
                 memory.insert(image, for: key)
@@ -397,6 +409,57 @@ public actor ImagePipeline {
             prefetches.values.forEach { $0.cancel() }
             prefetches.removeAll()
         }
+    }
+}
+
+/// Bound expensive ImageIO work even when multiple shelves become visible at once.
+/// Cancelled jobs leave the queue before they allocate decoded pixels.
+private actor ImageDecodeQueue {
+    private let limit = 6
+    private var running = 0
+    private var waiting: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+
+    func decode(_ work: @Sendable () -> CGImage?) async -> CGImage? {
+        guard !Task.isCancelled, await acquire() else { return nil }
+        defer { release() }
+        guard !Task.isCancelled else { return nil }
+        return await Self.perform(work)
+    }
+
+    private func acquire() async -> Bool {
+        if running < limit {
+            running += 1
+            return true
+        }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    waiting.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    private func cancel(_ id: UUID) {
+        guard let index = waiting.firstIndex(where: { $0.id == id }) else { return }
+        waiting.remove(at: index).continuation.resume(returning: false)
+    }
+
+    private func release() {
+        if waiting.isEmpty {
+            running -= 1
+        } else {
+            waiting.removeFirst().continuation.resume(returning: true)
+        }
+    }
+
+    @concurrent private nonisolated static func perform(_ work: @Sendable () -> CGImage?) async -> CGImage? {
+        autoreleasepool(invoking: work)
     }
 }
 

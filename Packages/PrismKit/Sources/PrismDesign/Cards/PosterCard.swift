@@ -50,7 +50,7 @@ public struct PosterCard<MenuContent: View>: View {
         CardContainer(accessibilityLabel: Text(label), action: action, menu: menu) { _ in
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkSurface(radius: PrismMetrics.posterRadius) {
-                    RemoteImage(url: imageURL, size: artworkSize, placeholderSeed: seed, placeholderTitle: title)
+                    RemoteImage(url: imageURL, size: artworkSize, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
                         .overlay(alignment: .topTrailing) {
                             if let badge {
                                 MediaBadge(badge, style: .filled)

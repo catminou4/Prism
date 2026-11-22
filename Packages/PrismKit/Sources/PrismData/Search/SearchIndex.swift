@@ -36,10 +36,9 @@ public final class SearchIndex: Sendable {
     let movies: [MediaTitle]
     let series: [MediaTitle]
 
-    /// Per entry: 0 channel, 1 movie, 2 series.
-    let entryKinds: [UInt8]
-    /// Per entry: index in the matching catalog array.
-    let entryRefs: [Int32]
+    /// Entries use the concatenated order of channels, movies, then series.
+    let movieStart: Int
+    let seriesStart: Int
     /// Per entry: tie-break score (quality, variants, recency, shortness), < 2^60.
     let baseScores: [UInt64]
     /// Normalized names ("word word word"), flattened; `nameOffsets.count == entryCount + 1`.
@@ -55,7 +54,7 @@ public final class SearchIndex: Sendable {
     let postings: [Int32]
     let postingOffsets: [Int32]
 
-    public var entryCount: Int { entryKinds.count }
+    public var entryCount: Int { baseScores.count }
     public var wordCount: Int { max(wordOffsets.count - 1, 0) }
 
     public static let empty = SearchIndex()
@@ -63,7 +62,7 @@ public final class SearchIndex: Sendable {
 
     private init() {
         channels = []; movies = []; series = []
-        entryKinds = []; entryRefs = []; baseScores = []
+        movieStart = 0; seriesStart = 0; baseScores = []
         nameBytes = []; nameOffsets = [0]
         entryWords = []; entryWordOffsets = [0]
         wordBytes = []; wordOffsets = [0]
@@ -72,15 +71,15 @@ public final class SearchIndex: Sendable {
 
     private init(
         channels: [ChannelGroup], movies: [MediaTitle], series: [MediaTitle],
-        entryKinds: [UInt8], entryRefs: [Int32], baseScores: [UInt64],
+        baseScores: [UInt64],
         nameBytes: [UInt8], nameOffsets: [Int32], entryWords: [Int32], entryWordOffsets: [Int32],
         wordBytes: [UInt8], wordOffsets: [Int32], postings: [Int32], postingOffsets: [Int32]
     ) {
         self.channels = channels
         self.movies = movies
         self.series = series
-        self.entryKinds = entryKinds
-        self.entryRefs = entryRefs
+        self.movieStart = channels.count
+        self.seriesStart = channels.count + movies.count
         self.baseScores = baseScores
         self.nameBytes = nameBytes
         self.nameOffsets = nameOffsets
@@ -111,8 +110,6 @@ public final class SearchIndex: Sendable {
         /// Local word ids of every entry, flattened.
         var entryWords: [Int32] = []
         var wordCounts: [Int32] = []
-        var kinds: [UInt8] = []
-        var refs: [Int32] = []
         var baseScores: [UInt64] = []
     }
 
@@ -135,10 +132,10 @@ public final class SearchIndex: Sendable {
                         if entry < channels.count {
                             let group = channels[entry]
                             let quality = group.variants.lazy.map(\.quality).max() ?? .unknown
-                            return (0, Int32(entry), Source(
+                            return Source(
                                 name: group.name, extraWord: nil,
                                 baseScore: baseScore(quality: quality, variants: group.variants.count, addedAt: nil, nameLength: group.name.utf8.count)
-                            ))
+                            )
                         }
                         let isMovie = entry < channels.count + movies.count
                         let index = isMovie ? entry - channels.count : entry - channels.count - movies.count
@@ -149,11 +146,11 @@ public final class SearchIndex: Sendable {
                         if title.variants.count > 1 {
                             for variant in title.variants where variant.title != name { alternateNames.insert(variant.title) }
                         }
-                        return (isMovie ? 1 : 2, Int32(index), Source(
+                        return Source(
                             name: name, extraWord: title.year.map(String.init),
                             baseScore: baseScore(quality: title.bestQuality, variants: title.variants.count, addedAt: title.addedAt, nameLength: name.utf8.count),
                             alternateNames: alternateNames
-                        ))
+                        )
                     }
                 }
                 start = upper
@@ -163,8 +160,6 @@ public final class SearchIndex: Sendable {
             return result.sorted { $0.start < $1.start }
         }
         guard !Task.isCancelled else { return .empty }
-        let kinds = chunks.flatMap(\.kinds)
-        let refs = chunks.flatMap(\.refs)
         let baseScores = chunks.flatMap(\.baseScores)
 
         // Names, global word ids (only chunk-unique words hit the shared dictionary).
@@ -261,7 +256,7 @@ public final class SearchIndex: Sendable {
 
         return SearchIndex(
             channels: channels, movies: movies, series: series,
-            entryKinds: kinds, entryRefs: refs, baseScores: baseScores,
+            baseScores: baseScores,
             nameBytes: nameBytes, nameOffsets: nameOffsets,
             entryWords: entryWords, entryWordOffsets: entryWordOffsets,
             wordBytes: wordBytes, wordOffsets: wordOffsets,
@@ -269,16 +264,16 @@ public final class SearchIndex: Sendable {
         )
     }
 
-    private static func processChunk(range: Range<Int>, describe: (Int) -> (UInt8, Int32, Source)) -> Chunk {
+    private static func processChunk(range: Range<Int>, describe: (Int) -> Source) -> Chunk {
         var chunk = Chunk(start: range.lowerBound)
-        chunk.kinds.reserveCapacity(range.count)
-        chunk.refs.reserveCapacity(range.count)
         chunk.baseScores.reserveCapacity(range.count)
         chunk.nameLengths.reserveCapacity(range.count)
         chunk.wordCounts.reserveCapacity(range.count)
         chunk.entryWords.reserveCapacity(range.count * 3)
         var localIDs: [String: Int32] = Dictionary(minimumCapacity: range.count)
         var entry: [Int32] = []
+        var wordBuffer: [UInt8] = []
+        wordBuffer.reserveCapacity(32)
         func localID(_ word: String) -> Int32 {
             if let id = localIDs[word] { return id }
             let id = Int32(chunk.localWords.count)
@@ -287,17 +282,13 @@ public final class SearchIndex: Sendable {
             return id
         }
         for index in range {
-            let (kind, ref, source) = describe(index)
-            chunk.kinds.append(kind)
-            chunk.refs.append(ref)
+            let source = describe(index)
             chunk.baseScores.append(source.baseScore)
-            let words = TextFolding.words(ofFolded: TextFolding.fold(source.name))
-            var length: Int32 = 0
+            let start = chunk.nameBytes.count
             entry.removeAll(keepingCapacity: true)
-            for (offset, word) in words.enumerated() {
-                if offset > 0 { chunk.nameBytes.append(0x20); length += 1 }
+            TextFolding.forEachWord(in: source.name, buffer: &wordBuffer) { word in
+                if chunk.nameBytes.count > start { chunk.nameBytes.append(0x20) }
                 chunk.nameBytes.append(contentsOf: word)
-                length += Int32(word.count)
                 let id = localID(String(decoding: word, as: UTF8.self))
                 if !entry.contains(id) { entry.append(id) }
             }
@@ -306,13 +297,13 @@ public final class SearchIndex: Sendable {
                 if !entry.contains(id) { entry.append(id) }
             }
             for alias in source.alternateNames.sorted() {
-                for word in TextFolding.words(ofFolded: TextFolding.fold(alias)) {
+                TextFolding.forEachWord(in: alias, buffer: &wordBuffer) { word in
                     let id = localID(String(decoding: word, as: UTF8.self))
                     if !entry.contains(id) { entry.append(id) }
                 }
             }
             chunk.entryWords.append(contentsOf: entry)
-            chunk.nameLengths.append(length)
+            chunk.nameLengths.append(Int32(chunk.nameBytes.count - start))
             chunk.wordCounts.append(Int32(entry.count))
         }
         return chunk
@@ -344,9 +335,9 @@ public final class SearchIndex: Sendable {
             if !found { substringSearch(raw, tokens: tokens, top: &top) }
         }
 
-        let channelHits = top[0].items.map { channels[Int(entryRefs[Int($0.entry)])] }
-        let movieHits = top[1].items.map { movies[Int(entryRefs[Int($0.entry)])] }
-        let seriesHits = top[2].items.map { series[Int(entryRefs[Int($0.entry)])] }
+        let channelHits = top[0].items.map { channels[Int($0.entry)] }
+        let movieHits = top[1].items.map { movies[Int($0.entry) - movieStart] }
+        let seriesHits = top[2].items.map { series[Int($0.entry) - seriesStart] }
 
         var best: (score: UInt64, entry: Int32)?
         for kind in 0..<3 {
@@ -356,18 +347,23 @@ public final class SearchIndex: Sendable {
         }
         var topHit: SearchHit?
         if let best {
-            let ref = Int(entryRefs[Int(best.entry)])
-            switch entryKinds[Int(best.entry)] {
-            case 0: topHit = .channel(channels[ref])
-            case 1: topHit = .title(movies[ref])
-            default: topHit = .title(series[ref])
+            let entry = Int(best.entry)
+            switch kind(of: entry) {
+            case 0: topHit = .channel(channels[entry])
+            case 1: topHit = .title(movies[entry - movieStart])
+            default: topHit = .title(series[entry - seriesStart])
             }
         }
         return SearchResults(topHit: topHit, channels: channelHits, movies: movieHits, series: seriesHits)
     }
 
+    @inline(__always)
+    private func kind(of entry: Int) -> Int {
+        if entry < movieStart { return 0 }
+        return entry < seriesStart ? 1 : 2
+    }
+
     private struct Raw {
-        let kinds: UnsafeBufferPointer<UInt8>
         let baseScores: UnsafeBufferPointer<UInt64>
         let nameBytes: UnsafeBufferPointer<UInt8>
         let nameOffsets: UnsafeBufferPointer<Int32>
@@ -378,11 +374,10 @@ public final class SearchIndex: Sendable {
         let postings: UnsafeBufferPointer<Int32>
         let postingOffsets: UnsafeBufferPointer<Int32>
         var wordCount: Int { wordOffsets.count - 1 }
-        var entryCount: Int { kinds.count }
+        var entryCount: Int { baseScores.count }
     }
 
     private func withRaw(_ body: (Raw) -> Void) {
-        entryKinds.withUnsafeBufferPointer { kinds in
         baseScores.withUnsafeBufferPointer { baseScores in
         nameBytes.withUnsafeBufferPointer { nameBytes in
         nameOffsets.withUnsafeBufferPointer { nameOffsets in
@@ -393,11 +388,11 @@ public final class SearchIndex: Sendable {
         postings.withUnsafeBufferPointer { postings in
         postingOffsets.withUnsafeBufferPointer { postingOffsets in
             body(Raw(
-                kinds: kinds, baseScores: baseScores, nameBytes: nameBytes, nameOffsets: nameOffsets,
+                baseScores: baseScores, nameBytes: nameBytes, nameOffsets: nameOffsets,
                 entryWords: entryWords, entryWordOffsets: entryWordOffsets, wordBytes: wordBytes,
                 wordOffsets: wordOffsets, postings: postings, postingOffsets: postingOffsets
             ))
-        }}}}}}}}}}
+        }}}}}}}}}
     }
 
     /// Returns `false` when no entry prefix-matches every token.
@@ -451,7 +446,7 @@ public final class SearchIndex: Sendable {
                         tier = n1 - n0 == q.count ? 3 : 2
                     }
                     let score = tier << 60 | raw.baseScores[entry]
-                    top[Int(raw.kinds[entry])].offer(score: score, entry: Int32(entry))
+                    top[kind(of: entry)].offer(score: score, entry: Int32(entry))
                 }
             }
         }
@@ -503,7 +498,7 @@ public final class SearchIndex: Sendable {
                     if !hit { matchesAll = false; break }
                 }
                 guard matchesAll else { continue }
-                top[Int(raw.kinds[entry])].offer(score: raw.baseScores[entry], entry: Int32(entry))
+                top[kind(of: entry)].offer(score: raw.baseScores[entry], entry: Int32(entry))
             }
         }
     }

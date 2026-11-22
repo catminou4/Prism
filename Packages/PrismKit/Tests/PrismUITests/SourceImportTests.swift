@@ -35,6 +35,18 @@ struct SourceImportTests {
         #expect(model.catalog.movies.first?.variants.count == 2)
         #expect(model.searchIndex?.search("premier contact").movies.count == 1)
         #expect(model.imports.isEmpty)
+
+        let reopened = AppModel(directories: directories, credentials: credentials, library: .inMemory())
+        await reopened.bootstrap()
+        #expect(reopened.catalog.movies.count == 1)
+        #expect(reopened.searchIndex == nil)
+
+        reopened.prepareSearchIndex()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while reopened.searchIndex == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(reopened.searchIndex?.search("premier contact").movies.count == 1)
     }
 
     @Test func failedNewSourceDoesNotStayInTheLibrary() async {

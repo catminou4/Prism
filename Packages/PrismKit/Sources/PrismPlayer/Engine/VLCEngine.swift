@@ -40,6 +40,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var lastTimeMs: Int32 = -1
     private var lastTimeChange = Date.distantPast
     private var lastVideoSize: CGSize = .zero
+    private var nextMetadataPoll: ContinuousClock.Instant?
     private var bufferingCheck: Task<Void, Never>?
     private var trackSignature = ""
     private var volumeValue: Float = 1
@@ -72,6 +73,8 @@ final class VLCEngine: NSObject, PlaybackEngine {
         didReportTerminalEvent = false
         lastState = nil
         lastTimeMs = -1
+        lastVideoSize = .zero
+        nextMetadataPoll = nil
         trackSignature = ""
         isStopped = false
 
@@ -411,17 +414,23 @@ final class VLCEngine: NSObject, PlaybackEngine {
         let seconds = TimeInterval(ms) / 1000
         eventHandler?(.time(current: seconds, buffered: seconds))
 
-        let size = player.videoSize
-        if size.width > 0, size.height > 0, size != lastVideoSize {
-            lastVideoSize = size
-            eventHandler?(.videoSize(size))
-            applyGeometry()
+        let now = ContinuousClock.now
+        if nextMetadataPoll.map({ now >= $0 }) ?? true {
+            // Track changes also arrive via the state delegate. Poll as a fallback
+            // for adaptive streams and for resolution changes without a state event.
+            nextMetadataPoll = now.advanced(by: .seconds(1))
+            let size = player.videoSize
+            if size.width > 0, size.height > 0, size != lastVideoSize {
+                lastVideoSize = size
+                eventHandler?(.videoSize(size))
+                applyGeometry()
+            }
+            refreshTracksIfNeeded()
         }
         if !didReportFirstFrame, player.hasVideoOut || (seconds > 0.5 && player.numberOfVideoTracks == 0) {
             didReportFirstFrame = true
             eventHandler?(.firstFrame)
         }
-        refreshTracksIfNeeded()
     }
 
     private func markReady() {

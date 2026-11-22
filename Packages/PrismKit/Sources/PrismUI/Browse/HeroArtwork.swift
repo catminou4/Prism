@@ -2,15 +2,8 @@ import Foundation
 import Observation
 import PrismCore
 import PrismData
-import PrismDesign
 
-/// Artwork and synopsis of the hero pages, resolved once per title and kept for the session.
-///
-/// IPTV listings rarely carry a backdrop or a plot for films: they come from TMDB and from the
-/// provider's detail call. Resolving them when a page appears (one request after the other) left
-/// each page on its poster fallback for a second or more, every time the carousel came back to it.
-/// The store resolves every page of a hero as soon as it is shown, both sources in parallel, and
-/// downloads the chosen backdrops ahead of time.
+/// Hero artwork and synopsis from the provider and TMDB, shared by the visible page and its preload.
 @MainActor
 @Observable
 final class HeroArtworkStore {
@@ -23,38 +16,43 @@ final class HeroArtworkStore {
     }
 
     private(set) var entries: [TitleID: Entry] = [:]
-    @ObservationIgnored private var running: [TitleID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var running: [Request: Resolution] = [:]
+
+    private struct Request: Hashable, Sendable {
+        let id: TitleID
+        let usesMetadata: Bool
+    }
+
+    private struct Resolution {
+        let task: Task<Void, Never>
+        var waiters: Set<UUID> = []
+    }
 
     func entry(for id: TitleID) -> Entry? { entries[id] }
 
-    /// Resolves `titles` (in order, a few at a time) and warms their hero artwork for `pixelSize`.
-    func warm(_ titles: [MediaTitle], app: AppModel, pixelSize: CGSize) async {
-        await withTaskGroup(of: Void.self) { group in
-            var pending = titles.makeIterator()
-            func next() -> Bool {
-                guard let title = pending.next() else { return false }
-                group.addTask { await self.resolve(title, app: app, pixelSize: pixelSize) }
-                return true
-            }
-            for _ in 0..<3 where next() {}
-            for await _ in group {
-                if Task.isCancelled { group.cancelAll(); return }
-                _ = next()
-            }
+    /// Stops speculatively resolving a title if the last interested view goes away.
+    func resolve(_ title: MediaTitle, app: AppModel) async {
+        let request = Request(id: title.id, usesMetadata: app.isMetadataEnabled)
+        guard !Task.isCancelled, entries[request.id]?.usedMetadata != request.usesMetadata else { return }
+        if running[request] == nil {
+            running[request] = Resolution(task: Task { await self.load(title, app: app, usesMetadata: request.usesMetadata) })
         }
+        guard let task = running[request]?.task else { return }
+        let waiter = UUID()
+        running[request]?.waiters.insert(waiter)
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            Task { @MainActor in self.release(request, waiter: waiter, cancelled: true) }
+        }
+        release(request, waiter: waiter, cancelled: Task.isCancelled)
     }
 
-    /// Resolves one title (joins a resolution already running).
-    func resolve(_ title: MediaTitle, app: AppModel, pixelSize: CGSize) async {
-        if let entry = entries[title.id], entry.usedMetadata == app.isMetadataEnabled { return }
-        if let task = running[title.id] {
-            await task.value
-            return
-        }
-        let task = Task { await self.load(title, app: app, pixelSize: pixelSize) }
-        running[title.id] = task
-        await task.value
-        running[title.id] = nil
+    private func release(_ request: Request, waiter: UUID, cancelled: Bool) {
+        guard running[request]?.waiters.remove(waiter) != nil,
+              let resolution = running[request], resolution.waiters.isEmpty else { return }
+        running[request] = nil
+        if cancelled { resolution.task.cancel() }
     }
 
     func backdropURLs(for title: MediaTitle) -> [URL] {
@@ -71,11 +69,12 @@ final class HeroArtworkStore {
 
     static func leadVariants(_ title: MediaTitle) -> ArraySlice<MediaVariant> { title.variants.prefix(12) }
 
-    private func load(_ title: MediaTitle, app: AppModel, pixelSize: CGSize) async {
+    private func load(_ title: MediaTitle, app: AppModel, usesMetadata: Bool) async {
+        guard !Task.isCancelled else { return }
         let lead = Self.leadVariants(title)
         let candidates = [title.plot] + lead.map { $0.movie?.plot ?? $0.series?.plot }
         let initial = await Self.preferredSynopsis(candidates)
-        let usesMetadata = app.isMetadataEnabled
+        guard !Task.isCancelled else { return }
         var entry = Entry(metadata: entries[title.id]?.metadata, providerDetail: entries[title.id]?.providerDetail,
                           synopsis: initial, usedMetadata: usesMetadata)
 
@@ -96,14 +95,8 @@ final class HeroArtworkStore {
         if let enriched = await Self.preferredSynopsis([resolvedMetadata?.overview] + candidates + [resolvedDetail?.plot]) {
             entry.synopsis = enriched
         }
+        guard !Task.isCancelled, usesMetadata == app.isMetadataEnabled else { return }
         entries[title.id] = entry
-
-        // The backdrop the page will show, on disk before the carousel gets there.
-        if let backdrop = backdropURLs(for: title).first {
-            ImagePipeline.shared.warm([backdrop], pixelSize: pixelSize, fitting: .landscapeFill)
-        } else if let poster = posterURLs(for: title).first {
-            ImagePipeline.shared.warm([poster], pixelSize: pixelSize, fitting: .portraitFit)
-        }
     }
 
     private static func providerDetail(_ request: (Movie, Source)?, repository: DetailRepository) async -> MovieDetail? {

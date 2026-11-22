@@ -539,6 +539,7 @@ public final class AppModel {
             upsert(updated)
         }
         await rebuildCatalog()
+        prepareSearchIndex()
 
         var counts = finished.counts
         let guideStart = ImportProgress(stage: .guide(0), counts: counts, fraction: 0.92)
@@ -599,10 +600,21 @@ public final class AppModel {
             self.curationRevision &+= 1
             if self.isMetadataEnabled { self.refreshTrending() }
         }
-        searchTask = Task { [weak self] in
-            let index = await SearchIndex.build(from: built, recommendations: recommendations)
-            guard !Task.isCancelled else { return }
-            self?.searchIndex = index
+        searchTask?.cancel()
+        searchTask = nil
+    }
+
+    /// Warm the index when Search opens or when a caller explicitly awaits a searchable catalogue.
+    func prepareSearchIndex() {
+        guard searchIndex == nil, searchTask == nil else { return }
+        let catalog = self.catalog
+        let recommendations = self.recommendations
+        let revision = catalogRevision
+        searchTask = Task(priority: .utility) { [weak self] in
+            let index = await SearchIndex.build(from: catalog, recommendations: recommendations)
+            guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
+            self.searchIndex = index
+            self.searchTask = nil
         }
     }
 
@@ -610,7 +622,9 @@ public final class AppModel {
         while !Task.isCancelled {
             let generation = rebuildGeneration
             await catalogTask?.value
+            guard !Task.isCancelled, generation == rebuildGeneration else { continue }
             if includingSearch {
+                prepareSearchIndex()
                 await searchTask?.value
                 await curationTask?.value
             }

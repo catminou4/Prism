@@ -45,6 +45,25 @@ enum TextFolding {
         return result
     }
 
+    /// Visits normalized words using a caller-owned buffer. ASCII names are split and lowercased
+    /// together, without allocating a folded String or an array of words for each name.
+    static func forEachWord(in text: String, buffer: inout [UInt8], _ visit: ([UInt8]) -> Void) {
+        let bytes = text.utf8
+        let content = bytes.allSatisfy { $0 < 0x80 } ? bytes : fold(text).utf8
+        for byte in content {
+            if isWordByte(byte) {
+                buffer.append((0x41...0x5A).contains(byte) ? byte &+ 0x20 : byte)
+            } else if !buffer.isEmpty {
+                visit(buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+        if !buffer.isEmpty {
+            visit(buffer)
+            buffer.removeAll(keepingCapacity: true)
+        }
+    }
+
     @inline(__always)
     static func isWordByte(_ byte: UInt8) -> Bool {
         (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x7A) || (byte >= 0x41 && byte <= 0x5A) || byte >= 0x80

@@ -23,8 +23,12 @@ public enum ProviderSynopsis {
     }
 
     public static func cleaned(_ value: String?) -> String? {
-        guard let text = value?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
-        guard text.contains("  ") || text.rangeOfCharacter(from: .newlines) != nil || text.contains("\t") else { return text }
+        guard let value, let first = value.unicodeScalars.first, let last = value.unicodeScalars.last else { return nil }
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        let text = whitespace.contains(first) || whitespace.contains(last)
+            ? value.trimmingCharacters(in: whitespace) : value
+        guard !text.isEmpty else { return nil }
+        guard needsNormalization(text) else { return text }
 
         let paragraphs = fragments(in: text)
         guard paragraphs.count > 1, paragraphs.count <= 12 else { return joined(paragraphs) }
@@ -45,6 +49,22 @@ public enum ProviderSynopsis {
             return scripts[index] == script
         }
         return joined(retained.map { paragraphs[$0] })
+    }
+
+    private static func needsNormalization(_ text: String) -> Bool {
+        var previousWasSpace = false
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x20:
+                if previousWasSpace { return true }
+                previousWasSpace = true
+            case 0x09...0x0D, 0x85, 0x2028, 0x2029:
+                return true
+            default:
+                previousWasSpace = false
+            }
+        }
+        return false
     }
 
     private struct Fragment {

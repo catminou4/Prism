@@ -258,7 +258,7 @@ public struct LiveScreen: View {
             let cardWidth = max(1, PrismMetrics.columnWidth(available: available, minWidth: 184, spacing: spacing))
             let columnCount = max(1, Int((available + spacing) / (184 + spacing)))
             let columns = Array(repeating: GridItem(.fixed(cardWidth), spacing: spacing, alignment: .top), count: columnCount)
-            LiveClock(active: isPageActive) { now in
+            LiveClock(active: isPageActive && !model.guide.isEmpty) { now in
                 ScrollView {
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
                         ForEach(channels) { channel in
@@ -362,15 +362,17 @@ public struct LiveScreen: View {
 struct LiveClock<Content: View>: View {
     let active: Bool
     @ViewBuilder let content: (Date) -> Content
+    @Environment(\.appearsActive) private var appearsActive
     @State private var now = Date.now
 
     var body: some View {
+        let running = active && appearsActive
         content(now)
-            .task(id: active) {
-                guard active else { return }
+            .task(id: running) {
+                guard running else { return }
                 while !Task.isCancelled {
                     now = .now
-                    try? await Task.sleep(for: .seconds(30))
+                    try? await Task.sleep(for: .seconds(30), tolerance: .seconds(3))
                 }
             }
     }

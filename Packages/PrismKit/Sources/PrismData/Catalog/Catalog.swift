@@ -217,6 +217,13 @@ public struct Catalog: Sendable {
         guard !list.isEmpty else { return [] }
         let genres = Set(title.genres.map { TextFolding.fold($0) })
         let groupIDs = Set(title.categoryIDs.compactMap { indexes.categoryToGroup[$0] })
+        var genreMatches: [String: Bool] = [:]
+        func matchesGenre(_ genre: String) -> Bool {
+            if let known = genreMatches[genre] { return known }
+            let matches = genres.contains(TextFolding.fold(genre))
+            genreMatches[genre] = matches
+            return matches
+        }
 
         var candidateHits: [Int32: Int] = [:]
         let perGroupScanLimit = 2_000
@@ -229,7 +236,7 @@ public struct Catalog: Sendable {
         if candidateHits.count < limit, !genres.isEmpty {
             // Small or missing categories: widen with genre matches among recent titles.
             for (offset, other) in list.prefix(5_000).enumerated() where candidateHits[Int32(offset)] == nil {
-                if other.genres.contains(where: { genres.contains(TextFolding.fold($0)) }) {
+                if other.genres.contains(where: matchesGenre) {
                     candidateHits[Int32(offset)] = 0
                     if candidateHits.count >= limit * 4 { break }
                 }
@@ -243,7 +250,7 @@ public struct Catalog: Sendable {
             guard other.id != title.id, title.isAdult || !other.isAdult else { continue }
             var score = Double(sharedGroups) * 2
             if !genres.isEmpty {
-                let shared = other.genres.reduce(0) { $0 + (genres.contains(TextFolding.fold($1)) ? 1 : 0) }
+                let shared = other.genres.reduce(0) { $0 + (matchesGenre($1) ? 1 : 0) }
                 score += Double(shared) * 3
             }
             if other.$posterURL != nil { score += 1 }

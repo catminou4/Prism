@@ -20,6 +20,7 @@ public struct RemoteImage: View {
     private let showsPlaceholder: Bool
     private let progressive: Bool
     private let onLoadFailure: (() -> Void)?
+    private var blurSourceSize: CGSize?
 
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -62,8 +63,16 @@ public struct RemoteImage: View {
 
     private var loadKey: ImagePipeline.Key? {
         guard let url else { return nil }
-        let pixels = Self.pixelSize(forPointSize: size ?? measuredSize, scale: displayScale)
+        // Blurs have a fixed decode size, regardless of the slot they fill.
+        let points = blurRadius > 0 ? CGSize(width: 1, height: 1) : (size ?? measuredSize)
+        let pixels = Self.pixelSize(forPointSize: points, scale: displayScale)
         return ImagePipeline.key(url: url, pixelSize: pixels, fitting: fitting, blurRadius: blurRadius)
+    }
+
+    func blursArtwork(sized sourceSize: CGSize) -> Self {
+        var view = self
+        view.blurSourceSize = sourceSize
+        return view
     }
 
     /// The pixel size `RemoteImage` requests for a slot — use it with
@@ -86,7 +95,7 @@ public struct RemoteImage: View {
             nil
         }
 
-        Color.clear
+        let artwork = Color.clear
             .overlay(alignment: alignment) {
                 ZStack(alignment: alignment) {
                     if showsPlaceholder, image == nil {
@@ -105,10 +114,19 @@ public struct RemoteImage: View {
             }
             .frame(width: size?.width, height: size?.height)
             .clipped()
-            .modifier(MeasureIfNeeded(enabled: size == nil, size: $measuredSize))
-            .task(id: key) {
-                if let key { await load(key) }
-            }
+
+        if url != nil {
+            artwork
+                .modifier(MeasureIfNeeded(enabled: size == nil && blurRadius <= 0, size: $measuredSize))
+                .task(id: key) {
+                    if let key { await load(key) }
+                }
+                // Lazy stacks can keep a card's state after scrolling past it. The cost-bounded
+                // cache controls how long offscreen decoded artwork stays resident.
+                .onDisappear { loaded = nil }
+        } else {
+            artwork
+        }
     }
 
     private func load(_ key: ImagePipeline.Key) async {
@@ -138,7 +156,13 @@ public struct RemoteImage: View {
             }
             return
         }
-        finish(await ImagePipeline.shared.image(for: key), key: key)
+        let source = blurSourceSize.flatMap { size in
+            ImagePipeline.key(
+                url: key.url, pixelSize: Self.pixelSize(forPointSize: size, scale: displayScale),
+                fitting: key.fitting, blurRadius: 0
+            )
+        }
+        finish(await ImagePipeline.shared.image(for: key, blurredFrom: source), key: key)
     }
 
     private func finish(_ image: CGImage?, key: ImagePipeline.Key) {

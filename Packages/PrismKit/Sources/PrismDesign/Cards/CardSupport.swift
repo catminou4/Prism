@@ -35,16 +35,16 @@ struct ArtworkSurface<Content: View>: View {
                 shape.strokeBorder(PrismColors.artworkStroke, lineWidth: 1)
                     .allowsHitTesting(false)
             }
-            // The lift shadow is cast by a plain shape, not by the artwork's pixels, and is not
-            // drawn at all at rest: a hidden shadow on every card still cost an offscreen pass
-            // per card on every scrolled frame.
             .background {
-                shape.fill(.black)
-                    .shadow(color: PrismColors.hoverShadow, radius: 18, y: 10)
-                    .opacity(lifted && !reduceMotion ? 1 : 0)
-                    .animation(PrismMotion.hover, value: lifted)
-                    .allowsHitTesting(false)
+                // Only hovered artwork allocates a shadow layer.
+                if lifted && !reduceMotion {
+                    shape.fill(.black)
+                        .shadow(color: PrismColors.hoverShadow, radius: 18, y: 10)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
             }
+            .animation(PrismMotion.hover, value: lifted)
     }
 }
 
@@ -61,11 +61,13 @@ struct ExtendedArtwork: View {
     var darkening: Double = 0.28
 
     var body: some View {
+        let artworkSize = CGSize(width: size.width, height: artworkHeight)
         ZStack(alignment: .top) {
-            // Band background: blurred artwork (decoded tiny, blurred off-main, upscaled).
+            // The colour band uses the same decoded artwork as the sharp card.
             RemoteImage(url: url, size: size, placeholderSeed: seed, placeholderStyle: .none, blurRadius: 24)
+                .blursArtwork(sized: artworkSize)
                 .overlay(Color.black.opacity(darkening))
-            RemoteImage(url: url, size: CGSize(width: size.width, height: artworkHeight), placeholderSeed: seed, placeholderTitle: title)
+            RemoteImage(url: url, size: artworkSize, placeholderSeed: seed, placeholderTitle: title)
                 .mask {
                     LinearGradient(
                         stops: [.init(color: .black, location: 0), .init(color: .black, location: meltStart), .init(color: .clear, location: 1)],

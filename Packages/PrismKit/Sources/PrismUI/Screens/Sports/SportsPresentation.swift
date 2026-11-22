@@ -46,7 +46,7 @@ final class SportsPresentation {
             guard !Task.isCancelled else { return }
             liveStatus = snapshot.liveStatus
             hasLoaded = true
-            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            do { try await Task.sleep(for: .seconds(60), tolerance: .seconds(6)) } catch { return }
         }
     }
 
@@ -98,10 +98,11 @@ struct SportsUpdates: ViewModifier {
     @Environment(AppModel.self) private var app
     @Environment(SportsPresentation.self) private var presentation: SportsPresentation?
     @Environment(\.isPageActive) private var isActive
+    @Environment(\.appearsActive) private var appearsActive
 
     func body(content: Content) -> some View {
         let day = Calendar.current.startOfDay(for: presentation?.now ?? .now)
-        let key = isActive ? SportsScheduleKey(
+        let key = isActive && appearsActive ? SportsScheduleKey(
             day: day, guideRevision: app.guideRevision, catalogRevision: app.catalogRevision,
             settingsRevision: app.sportsSettingsRevision
         ) : nil

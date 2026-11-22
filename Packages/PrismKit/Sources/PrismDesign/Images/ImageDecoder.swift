@@ -1,15 +1,11 @@
+import Accelerate
 import CoreGraphics
-import CoreImage
 import Foundation
 import ImageIO
 import SwiftUI
 
-/// ImageIO decoding helpers. Every entry point is `@concurrent` so decoding never runs on
-/// the main actor nor serialises on the pipeline actor.
+/// Synchronous ImageIO work runs in the pipeline's bounded decode queue.
 nonisolated enum ImageDecoder {
-    /// Shared Core Image context (thread-safe).
-    static let ciContext = CIContext(options: [.cacheIntermediates: false])
-
     /// Returns `true` when `data` looks like an image ImageIO can decode.
     static func isDecodable(_ data: Data) -> Bool {
         guard data.count > 16,
@@ -20,9 +16,9 @@ nonisolated enum ImageDecoder {
     }
 
     /// Decodes and downsamples `data` so the result covers (`fill`) or fits in (`fit`) `target` pixels.
-    @concurrent static func decode(
+    static func decode(
         _ data: Data, target: CGSize, fitting: ImagePipeline.Fitting, fillsForBlur: Bool
-    ) async -> CGImage? {
+    ) -> CGImage? {
         guard !Task.isCancelled,
               let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
         else { return nil }
@@ -30,9 +26,9 @@ nonisolated enum ImageDecoder {
     }
 
     /// Reads straight from a local file.
-    @concurrent static func decode(
+    static func decode(
         fileURL: URL, target: CGSize, fitting: ImagePipeline.Fitting, fillsForBlur: Bool
-    ) async -> CGImage? {
+    ) -> CGImage? {
         guard !Task.isCancelled,
               let source = CGImageSourceCreateWithURL(fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
         else { return nil }
@@ -71,10 +67,37 @@ nonisolated enum ImageDecoder {
     }
 
     /// Gaussian-blurred copy (computed on a small version of the image; meant to be upscaled).
-    @concurrent static func blurred(_ image: CGImage, radius: CGFloat) async -> CGImage? {
-        let input = CIImage(cgImage: image)
-        let blurred = input.clampedToExtent().applyingGaussianBlur(sigma: Double(radius)).cropped(to: input.extent)
-        return ciContext.createCGImage(blurred, from: input.extent)
+    static func blurred(_ image: CGImage, radius: CGFloat, target: CGSize? = nil) -> CGImage? {
+        let width = CGFloat(image.width), height = CGFloat(image.height)
+        let scale = target.map { min(max($0.width / width, $0.height / height), 384 / max(width, height), 1) } ?? 1
+        let pixelWidth = max(1, Int((width * scale).rounded(.up)))
+        let pixelHeight = max(1, Int((height * scale).rounded(.up)))
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        func makeContext() -> CGContext? {
+            CGContext(
+                data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bytesPerRow: 0,
+                space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        }
+        guard let source = makeContext(), let destination = makeContext() else { return nil }
+        source.interpolationQuality = .medium
+        source.draw(image, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+
+        func buffer(_ context: CGContext) -> vImage_Buffer {
+            vImage_Buffer(data: context.data, height: vImagePixelCount(pixelHeight), width: vImagePixelCount(pixelWidth), rowBytes: context.bytesPerRow)
+        }
+        var input = buffer(source), output = buffer(destination)
+        // Three box passes approximate the Gaussian on the tiny thumbnail while keeping its pixels
+        // off the GPU. The first draw preserves alpha for artwork with transparent edges.
+        let boxWidth = UInt32((radius * 2).rounded()) | 1
+        let flags = vImage_Flags(kvImageEdgeExtend | kvImageDoNotTile)
+        for _ in 0..<3 {
+            guard vImageBoxConvolve_ARGB8888(&input, &output, nil, 0, 0, boxWidth, boxWidth, nil, flags) == kvImageNoError else {
+                return nil
+            }
+            swap(&input, &output)
+        }
+        return destination.makeImage()
     }
 
     /// Alpha-weighted average colour with a light vibrance boost (muddy averages look dull).

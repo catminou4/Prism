@@ -97,12 +97,16 @@ struct HeroHorizontalScrollReader: NSViewRepresentable {
 
             let insideHero = visibleRect.contains(convert(event.locationInWindow, from: nil))
             let phase = event.phase
+            let deltaX = event.scrollingDeltaX
+            let deltaY = event.scrollingDeltaY
             if phase.contains(.began) || phase.contains(.mayBegin) {
                 isTracking = insideHero
                 gesture = HeroScrollGesture()
             } else if phase.isEmpty {
                 // Horizontal wheels and some mice send deltas without gesture phases.
-                if event.timestamp - lastUnphasedEvent > 0.20 || !insideHero {
+                // A clear vertical turn returns scrolling to the surrounding page immediately.
+                let turnedVertical = gesture.consumesMomentum && abs(deltaY) > abs(deltaX) * 1.4
+                if event.timestamp - lastUnphasedEvent > 0.20 || !insideHero || turnedVertical {
                     isTracking = insideHero
                     gesture = HeroScrollGesture()
                 }
@@ -112,8 +116,8 @@ struct HeroHorizontalScrollReader: NSViewRepresentable {
 
             let pointsPerUnit: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 12
             let change = gesture.add(
-                horizontal: event.scrollingDeltaX * pointsPerUnit,
-                vertical: event.scrollingDeltaY * pointsPerUnit
+                horizontal: deltaX * pointsPerUnit,
+                vertical: deltaY * pointsPerUnit
             )
             if let offset = change.pageOffset { onPage?(offset) }
             return change.consumesEvent

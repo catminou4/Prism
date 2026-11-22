@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Full-width glass scrubber: elapsed · track (buffered + played + knob) · remaining / EN DIRECT.
-/// Reads the 4 Hz time updates itself so the rest of the overlay does not re-render.
+/// Reads time updates in isolation, only while the transport controls are mounted.
 struct PlayerScrubber: View {
     let controller: PlayerController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -127,7 +127,8 @@ struct PlayerScrubber: View {
             .contentShape(Rectangle())
             .onContinuousHover { phase in
                 switch phase {
-                case .active(let location): hoverFraction = min(1, max(0, location.x / width))
+                case .active(let location):
+                    if seekable { hoverFraction = min(1, max(0, location.x / width)) }
                 case .ended: hoverFraction = nil
                 }
             }
@@ -136,7 +137,7 @@ struct PlayerScrubber: View {
         .frame(height: 20)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Position de lecture")
-        .accessibilityValue(PlayerFormat.timecode(displayedTime, forceHours: forceHours))
+        .accessibilityValue(seekable ? PlayerFormat.timecode(displayedTime, forceHours: forceHours) : "")
         .accessibilityAdjustableAction { direction in
             switch direction {
             case .increment: controller.skip(by: 10)

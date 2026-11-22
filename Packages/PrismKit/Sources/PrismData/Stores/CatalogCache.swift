@@ -10,7 +10,8 @@ import PrismCore
 public actor CatalogCache {
     /// Bump when `SourceCatalog` (or any nested model) changes shape: older caches are ignored.
     public static let formatVersion: UInt32 = 1
-    static let chunkSize = 12_000
+    // Smaller chunks keep concurrently expanded JSON and encoder state below their previous peak.
+    static let chunkSize = 6_000
 
     enum Tag: UInt8 {
         case meta = 0, channels = 1, movies = 2, series = 3
@@ -78,7 +79,6 @@ public actor CatalogCache {
     }
 
     private enum Decoded: Sendable {
-        case meta(Meta)
         case channels([Channel])
         case movies([Movie])
         case series([Series])
@@ -87,16 +87,19 @@ public actor CatalogCache {
 
     @concurrent
     static func decode(_ data: Data, version: UInt32, expecting id: SourceID? = nil) async -> SourceCatalog? {
-        guard let segments = SegmentedArchive.unpack(data, version: version) else { return nil }
+        guard let segments = SegmentedArchive.unpack(data, version: version),
+              let first = segments.first, first.tag == Tag.meta.rawValue,
+              let meta = SegmentedArchive.decodeSegment(Meta.self, from: first),
+              id == nil || meta.sourceID == id else { return nil }
         let decoded: [(Int, Decoded)] = await withTaskGroup(of: (Int, Decoded).self) { group in
-            for (index, segment) in segments.enumerated() {
+            for (index, segment) in segments.dropFirst().enumerated() {
                 group.addTask {
+                    guard !Task.isCancelled else { return (index, .invalid) }
                     switch Tag(rawValue: segment.tag) {
-                    case .meta: (index, SegmentedArchive.decodeSegment(Meta.self, from: segment).map(Decoded.meta) ?? .invalid)
-                    case .channels: (index, SegmentedArchive.decodeSegment([Channel].self, from: segment).map(Decoded.channels) ?? .invalid)
-                    case .movies: (index, SegmentedArchive.decodeSegment([Movie].self, from: segment).map(Decoded.movies) ?? .invalid)
-                    case .series: (index, SegmentedArchive.decodeSegment([Series].self, from: segment).map(Decoded.series) ?? .invalid)
-                    case nil: (index, .invalid)
+                    case .channels: return (index, SegmentedArchive.decodeSegment([Channel].self, from: segment).map(Decoded.channels) ?? .invalid)
+                    case .movies: return (index, SegmentedArchive.decodeSegment([Movie].self, from: segment).map(Decoded.movies) ?? .invalid)
+                    case .series: return (index, SegmentedArchive.decodeSegment([Series].self, from: segment).map(Decoded.series) ?? .invalid)
+                    case .meta, nil: return (index, .invalid)
                     }
                 }
             }
@@ -104,21 +107,32 @@ public actor CatalogCache {
             for await result in group { results.append(result) }
             return results.sorted { $0.0 < $1.0 }
         }
-        var meta: Meta?
+        var counts = (channels: 0, movies: 0, series: 0)
+        for (_, part) in decoded {
+            switch part {
+            case .channels(let value): counts.channels += value.count
+            case .movies(let value): counts.movies += value.count
+            case .series(let value): counts.series += value.count
+            case .invalid: return nil
+            }
+        }
+        guard counts.channels == meta.channelCount, counts.movies == meta.movieCount,
+              counts.series == meta.seriesCount else { return nil }
+
         var channels: [Channel] = []
         var movies: [Movie] = []
         var series: [Series] = []
+        channels.reserveCapacity(counts.channels)
+        movies.reserveCapacity(counts.movies)
+        series.reserveCapacity(counts.series)
         for (_, part) in decoded {
             switch part {
-            case .meta(let value): meta = value
             case .channels(let value): channels += value
             case .movies(let value): movies += value
             case .series(let value): series += value
             case .invalid: return nil
             }
         }
-        guard let meta, id == nil || meta.sourceID == id,
-              meta.channelCount == channels.count, meta.movieCount == movies.count, meta.seriesCount == series.count else { return nil }
         var catalog = SourceCatalog(
             sourceID: meta.sourceID, categories: meta.categories, channels: channels, movies: movies, series: series,
             account: meta.account, fetchedAt: meta.fetchedAt

@@ -97,6 +97,8 @@ public enum CatalogBuilder {
         let options: CatalogBuildOptions
         /// Visible categories, by canonical ID.
         let categories: [String: PrismCore.Category]
+        /// The common one-category case shares Set storage across all titles in that category.
+        let singleCategorySets: [String: Set<String>]
         /// Per catalog and kind: raw category reference (canonical id or native id) → resolution.
         let resolvers: [[MediaKind: [String: ResolvedCategory]]]
 
@@ -138,6 +140,7 @@ public enum CatalogBuilder {
                 resolvers.append(resolver)
             }
             self.categories = categories
+            self.singleCategorySets = Dictionary(uniqueKeysWithValues: categories.keys.map { ($0, Set([$0])) })
             self.resolvers = resolvers
         }
 
@@ -324,6 +327,8 @@ public enum CatalogBuilder {
                     var built = BuiltChunk(lower: lower)
                     guard !Task.isCancelled else { return built }
                     built.titles.reserveCapacity(upper - lower)
+                    built.added.reserveCapacity(upper - lower)
+                    var cleanedGenreLists: [[String]: [String]] = [:]
                     for index in lower..<upper {
                         let offer = frozenGroups[index]
                         var refs = offer.refs
@@ -334,7 +339,8 @@ public enum CatalogBuilder {
                         }
                         let title = makeTitle(
                             id: offer.id(kind: kind), kind: kind, year: offer.name.year, refs: refs, lists: lists,
-                            categories: frozenCategories, adult: frozenAdult
+                            categories: frozenCategories, categorySets: context.singleCategorySets, adult: frozenAdult,
+                            cleanedGenreLists: &cleanedGenreLists
                         )
                         built.added.append(title.addedAt?.timeIntervalSinceReferenceDate ?? -.infinity)
                         built.titles.append(title)
@@ -361,14 +367,16 @@ public enum CatalogBuilder {
         }
         guard !Task.isCancelled else { return MediaGroups() }
 
-        let unorderedTitles = chunks.flatMap(\.titles)
-        async let titles = order.map { unorderedTitles[$0] }
-        async let categories = order.map { unorderedTitles[$0].categoryIDs }
+        @Sendable func title(at offset: Int) -> MediaTitle {
+            chunks[offset / chunk].titles[offset % chunk]
+        }
+        async let titles = order.map { title(at: $0) }
+        async let categories = order.map { title(at: $0).categoryIDs }
         async let titleIndex: [TitleID: Int] = {
             var index: [TitleID: Int] = Dictionary(minimumCapacity: groupCount)
             for (position, group) in order.enumerated() {
                 let media = frozenGroups[group]
-                let id = unorderedTitles[group].id
+                let id = title(at: group).id
                 index[id] = position
                 if !media.ambiguousName, !media.aliases.isEmpty { index[media.name.id(kind: kind)] = position }
                 for alias in media.aliases { index[alias.id(kind: kind)] = position }
@@ -379,7 +387,7 @@ public enum CatalogBuilder {
         async let contentIndex: [ContentID: Int] = {
             var index: [ContentID: Int] = Dictionary(minimumCapacity: total)
             for (position, group) in order.enumerated() {
-                for variant in unorderedTitles[group].variants { index[variant.id] = position }
+                for variant in title(at: group).variants { index[variant.id] = position }
             }
             return index
         }()
@@ -552,7 +560,8 @@ public enum CatalogBuilder {
 
     static func makeTitle<V: GroupableMedia>(
         id: TitleID, kind: MediaKind, year: Int?, refs: [Ref], lists: [[V]],
-        categories: [[String?]], adult: [[Bool]]
+        categories: [[String?]], categorySets: [String: Set<String>], adult: [[Bool]],
+        cleanedGenreLists: inout [[String]: [String]]
     ) -> MediaTitle {
         let first = lists[Int(refs[0].catalog)][Int(refs[0].item)]
         if refs.count == 1 {
@@ -562,8 +571,8 @@ public enum CatalogBuilder {
                 id: id,
                 kind: kind, title: first.title, year: year ?? first.year, variants: [first.mediaVariant],
                 plot: cleanPlot(first.plot),
-                genres: cleanGenres(first.genres), rating: rating, addedAt: first.addedAt,
-                categoryIDs: categories[Int(ref.catalog)][Int(ref.item)].map { [$0] } ?? [],
+                genres: cleanGenres(first.genres, cache: &cleanedGenreLists), rating: rating, addedAt: first.addedAt,
+                categoryIDs: categories[Int(ref.catalog)][Int(ref.item)].flatMap { categorySets[$0] } ?? [],
                 isAdult: adult[Int(ref.catalog)][Int(ref.item)]
             )
             // Artwork addresses are shared with the variant as text, never re-parsed.
@@ -604,14 +613,18 @@ public enum CatalogBuilder {
                 plot = candidate
                 plotLength = candidate.utf8.count
             }
-            for genre in item.genres {
-                let trimmed = trimmed(genre)
-                guard !trimmed.isEmpty else { continue }
-                if seenGenres.insert(TextFolding.fold(trimmed)).inserted { genres.append(trimmed) }
+            for genre in cleanGenres(item.genres, cache: &cleanedGenreLists) {
+                if seenGenres.insert(TextFolding.fold(genre)).inserted { genres.append(genre) }
             }
             if let value = item.rating, value.isFinite, value > 0 { rating = max(rating ?? 0, value) }
             if let date = item.addedAt { addedAt = max(addedAt ?? date, date) }
-            if let category = categories[Int(ref.catalog)][Int(ref.item)] { categoryIDs.insert(category) }
+            if let category = categories[Int(ref.catalog)][Int(ref.item)] {
+                if categoryIDs.isEmpty {
+                    categoryIDs = categorySets[category] ?? [category]
+                } else if !categoryIDs.contains(category) {
+                    categoryIDs.insert(category)
+                }
+            }
             if adult[Int(ref.catalog)][Int(ref.item)] { isAdult = true }
         }
 
@@ -638,12 +651,19 @@ public enum CatalogBuilder {
         ProviderSynopsis.cleaned(plot)
     }
 
-    static func cleanGenres(_ genres: [String]) -> [String] {
+    static func cleanGenres(_ genres: [String], cache: inout [[String]: [String]]) -> [String] {
+        guard !genres.isEmpty else { return [] }
+        if let cleaned = cache[genres] { return cleaned }
+        let cleaned = cleanGenres(genres)
+        if cache.count < 256 { cache[genres] = cleaned }
+        return cleaned
+    }
+
+    private static func cleanGenres(_ genres: [String]) -> [String] {
         if genres.count == 1, let only = genres.first {
             let value = trimmed(only)
             return value.isEmpty ? [] : [value]
         }
-        guard !genres.isEmpty else { return [] }
         var seen: Set<String> = []
         var result: [String] = []
         for genre in genres {

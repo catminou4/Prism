@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 import PrismCore
 import PrismData
@@ -6,8 +7,7 @@ import PrismDesign
 struct BrowseScreen: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
-    @Environment(\.isPageActive) private var isActive
-    @Environment(\.displayScale) private var displayScale
+    @State private var motion = BrowseScrollActivity()
     let kind: MediaKind?
 
     private var scope: CurationScope {
@@ -19,7 +19,6 @@ struct BrowseScreen: View {
     }
 
     var body: some View {
-        let request = isActive ? app.curationRequest(for: scope) : nil
         let feed = app.feed(for: scope)
         GeometryReader { geometry in
             let heroHeight = Self.heroHeight(for: geometry.size, home: kind == nil)
@@ -28,7 +27,7 @@ struct BrowseScreen: View {
                 LazyVStack(alignment: .leading, spacing: PrismMetrics.shelfSpacing) {
                     if !feed.highlights.isEmpty {
                         // The carousel owns its page index: advancing it must not re-evaluate every shelf.
-                        BrowseHero(highlights: feed.highlights, height: heroHeight, artworkSize: artworkSize)
+                        BrowseHero(highlights: feed.highlights, height: heroHeight, artworkSize: artworkSize, motion: motion)
                     } else {
                         HStack(alignment: .firstTextBaseline) {
                             BrowseHeading(title: kind?.sectionTitle ?? "Accueil")
@@ -37,7 +36,7 @@ struct BrowseScreen: View {
                         .padding(.top, 52)
                     }
 
-                    if kind == nil { libraryShelves }
+                    if kind == nil { HomeLibraryShelves() }
                     if app.catalog.isEmpty {
                         ContentUnavailableView("Catalogue vide", systemImage: "rectangle.stack",
                                                description: Text("Ajoutez ou actualisez une source pour retrouver vos programmes."))
@@ -53,46 +52,19 @@ struct BrowseScreen: View {
                 }
                 .padding(.bottom, 48)
             }
+            .onScrollPhaseChange { _, phase in
+                if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
+            }
             .scrollEdgeEffectStyle(.soft, for: .top)
             .ignoresSafeArea(.container, edges: feed.highlights.isEmpty ? [] : .top)
         }
-        .task(id: request) {
-            if let request { await app.refreshFeed(request) }
-        }
-        // Posters further along each row and further down the page are downloaded in the
-        // background, so scrolling reveals artwork instead of placeholders.
-        .task(id: isActive ? feed.shelves.flatMap { $0.items.prefix(Self.warmedPerShelf).map(\.id) } : []) {
-            guard isActive else { return }
-            let posters = feed.shelves.flatMap { $0.items.prefix(Self.warmedPerShelf).compactMap(\.posterURL) }
-            ImagePipeline.shared.warm(posters, pixelSize: RemoteImage.pixelSize(
-                forPointSize: CGSize(width: PrismMetrics.posterWidth, height: PrismMetrics.posterWidth / PrismMetrics.posterAspectRatio),
-                scale: displayScale
-            ))
-        }
+        .modifier(BrowseFeedRefresh(scope: scope))
     }
-
-    private static let warmedPerShelf = 14
 
     /// Apple TV keeps the hero cinematic: most of the window on wide screens, never a letterbox.
     static func heroHeight(for size: CGSize, home: Bool) -> CGFloat {
         let ratio: CGFloat = home ? 0.66 : 0.7
         return min(max(size.height * ratio, 420, size.width * 0.36), 760)
-    }
-
-    @ViewBuilder private var libraryShelves: some View {
-        let watching = app.library.continueWatching(in: app.catalog, limit: 14)
-        if !watching.isEmpty {
-            Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
-                navigation.push(.collection(.continueWatching))
-            }) { item in
-                ResumeCard(item: item)
-            }
-        }
-        SportsHomeShelf()
-        let watchlist = app.library.watchlist.prefix(24).compactMap { app.catalog.title($0) }
-        if !watchlist.isEmpty {
-            TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
-        }
     }
 
     @ViewBuilder private func curatedShelves(_ feed: CuratedFeed) -> some View {
@@ -114,22 +86,67 @@ struct BrowseScreen: View {
 
 }
 
+private struct BrowseFeedRefresh: ViewModifier {
+    @Environment(AppModel.self) private var app
+    @Environment(\.isPageActive) private var isActive
+    let scope: CurationScope
+
+    func body(content: Content) -> some View {
+        let request = isActive ? app.curationRequest(for: scope) : nil
+        content.task(id: request) {
+            if let request { await app.refreshFeed(request) }
+        }
+    }
+}
+
+private struct HomeLibraryShelves: View {
+    @Environment(AppModel.self) private var app
+    @Environment(NavigationModel.self) private var navigation
+
+    var body: some View {
+        let watching = app.library.continueWatching(in: app.catalog, limit: 14)
+        if !watching.isEmpty {
+            Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
+                navigation.push(.collection(.continueWatching))
+            }) { item in
+                ResumeCard(item: item)
+            }
+        }
+        SportsHomeShelf()
+        let watchlist = app.library.watchlist.prefix(24).compactMap(app.catalog.title)
+        if !watchlist.isEmpty {
+            TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
+        }
+    }
+}
+
+/// Only the carousel reads scroll phase, so starting a scroll leaves the shelves alone.
+@Observable private final class BrowseScrollActivity {
+    var isScrolling = false
+}
+
 /// Hero carousel of a browse page, with the next page's artwork decoded ahead of time.
 private struct BrowseHero: View {
     @Environment(AppModel.self) private var app
     @Environment(\.isPageActive) private var isActive
     @Environment(\.displayScale) private var scale
+    @Environment(\.appearsActive) private var appearsActive
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selected: Int? = 0
+    @State private var isVisible = true
     let highlights: [CuratedHighlight]
     let height: CGFloat
     let artworkSize: CGSize
+    let motion: BrowseScrollActivity
 
     var body: some View {
+        let canAnimate = isActive && isVisible && !motion.isScrolling
+        let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
-            items: highlights, interval: isActive ? PrismMotion.heroInterval + 2 : 0,
+            items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
             height: height, index: $selected, isInteractive: isActive
         ) { highlight in
-            HighlightPage(highlight: highlight, size: artworkSize)
+            HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
         }
         .overlay(alignment: .topTrailing) {
             HomeLanguageMenu()
@@ -137,40 +154,36 @@ private struct BrowseHero: View {
                 .padding(.top, 14)
                 .padding(.trailing, 18)
         }
-        // Every page is resolved and its backdrop downloaded as soon as the hero is on screen,
-        // starting with the page shown.
-        .task(id: WarmRequest(ids: highlights.map(\.title.id), enrichment: app.isMetadataEnabled, active: isActive)) {
-            guard isActive, !highlights.isEmpty else { return }
-            let start = min(selected ?? 0, highlights.count - 1)
-            let ordered = highlights[start...] + highlights[..<start]
-            await app.heroArtwork.warm(ordered.map(\.title), app: app, pixelSize: pixelSize)
-        }
-        // The next page is decoded too, so the cross-fade never starts on an empty frame.
-        .task(id: nextArtwork) {
-            guard let next = nextArtwork else { return }
-            _ = await ImagePipeline.shared.image(for: next.url, pixelSize: next.size, fitting: .landscapeFill)
+        .onScrollVisibilityChange(threshold: 0.15) { isVisible = $0 }
+        .task(id: preload, priority: .utility) {
+            guard let preload else { return }
+            // Give visible artwork first use of network and decode slots after a gesture.
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled else { return }
+            await app.heroArtwork.resolve(preload.title, app: app)
+            guard !Task.isCancelled, let url = app.heroArtwork.backdropURLs(for: preload.title).first else { return }
+            _ = await ImagePipeline.shared.image(for: url, pixelSize: preload.size, fitting: .landscapeFill)
         }
         .onChange(of: app.homeAudioLanguages) { _, _ in selected = 0 }
     }
 
     private var pixelSize: CGSize { RemoteImage.pixelSize(forPointSize: artworkSize, scale: scale) }
 
-    private struct WarmRequest: Equatable {
-        let ids: [TitleID]
-        let enrichment: Bool
-        let active: Bool
-    }
-
     private struct Preload: Equatable {
-        let url: URL
+        let title: MediaTitle
         let size: CGSize
+        let enrichment: Bool
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.title.id == rhs.title.id && lhs.size == rhs.size && lhs.enrichment == rhs.enrichment
+        }
     }
 
     private var nextArtwork: Preload? {
-        guard isActive, highlights.count > 1 else { return nil }
-        let next = highlights[(min(selected ?? 0, highlights.count - 1) + 1) % highlights.count].title
-        guard let url = app.heroArtwork.backdropURLs(for: next).first else { return nil }
-        return Preload(url: url, size: pixelSize)
+        guard highlights.count > 1 else { return nil }
+        let current = min(max(selected ?? 0, 0), highlights.count - 1)
+        let next = highlights[(current + 1) % highlights.count].title
+        return Preload(title: next, size: pixelSize, enrichment: app.isMetadataEnabled)
     }
 }
 
@@ -296,11 +309,10 @@ private struct HomeLanguageMenu: View {
 private struct HighlightPage: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
-    @Environment(\.isPageActive) private var isActive
     @Environment(\.playPrismItem) private var playItem
-    @Environment(\.displayScale) private var scale
     let highlight: CuratedHighlight
     let size: CGSize
+    let isActive: Bool
 
     private var title: MediaTitle { highlight.title }
     private var resolved: HeroArtworkStore.Entry? { app.heroArtwork.entry(for: title.id) }
@@ -388,10 +400,9 @@ private struct HighlightPage: View {
         }
         .contentShape(.rect)
         .contextMenu { TitleContextMenu(title: title) }
-        // Usually already resolved by the hero's warm-up; joins it otherwise.
         .task(id: ArtworkRequest(active: isActive, enrichmentEnabled: app.isMetadataEnabled)) {
             guard isActive else { return }
-            await app.heroArtwork.resolve(title, app: app, pixelSize: RemoteImage.pixelSize(forPointSize: size, scale: scale))
+            await app.heroArtwork.resolve(title, app: app)
         }
     }
 
@@ -475,9 +486,14 @@ struct BrowsePoster: View {
         }
     }
 
-    private var subtitle: String? {
-        let genre = app.signals(for: item)?.genres.genres.first { $0 != .family }?.label
-        return [item.year.map(String.init), genre].compactMap { $0 }.joined(separator: " · ")
+    private var subtitle: String {
+        let genres = app.signals(for: item)?.genres ?? []
+        let genre = CanonicalGenre.allCases.first { $0 != .family && genres.contains($0) }?.label
+        switch (item.year, genre) {
+        case let (year?, genre?): return "\(year) · \(genre)"
+        case let (year?, nil): return String(year)
+        case let (nil, genre): return genre ?? ""
+        }
     }
 }
 

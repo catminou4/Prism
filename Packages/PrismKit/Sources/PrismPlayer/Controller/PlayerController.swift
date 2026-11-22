@@ -430,8 +430,8 @@ public final class PlayerController {
 
     private func handleTime(current: TimeInterval, buffered: TimeInterval) {
         let now = uptime()
-        if !autoHide.isScrubbing, seekTask == nil { currentTime = current }
-        bufferedTime = buffered
+        if !autoHide.isScrubbing, seekTask == nil, currentTime != current { currentTime = current }
+        if bufferedTime != buffered { bufferedTime = buffered }
         if abs(current - lastObservedTime) > 0.01 {
             lastObservedTime = current
             lastProgressAt = now
@@ -804,6 +804,14 @@ public final class PlayerController {
     public func noteUserActivity() {
         autoHide.registerActivity(at: uptime())
         applyControlsVisibility()
+    }
+
+    func pointerMoved() {
+        // The pending timer reads the latest deadline when it wakes. High-rate
+        // pointer events only need to publish changes when restoring the controls.
+        let wasVisible = autoHide.isVisible
+        autoHide.registerActivity(at: uptime())
+        if !wasVisible { applyControlsVisibility() }
     }
 
     /// Pointer left the window: hide right away while playing.
