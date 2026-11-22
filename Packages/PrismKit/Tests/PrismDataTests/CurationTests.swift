@@ -175,3 +175,15 @@ private struct Library {
         )
     }
 }
+
+@Suite("Sélection canon")
+struct AcclaimedSelectionTests {
+    @Test func everyLineHasAPlausibleYearAndAName() {
+        for line in AcclaimedSelection.movies + AcclaimedSelection.series {
+            let parts = line.split(separator: "|")
+            #expect(parts.count >= 2, "\(line)")
+            #expect((1900...2030).contains(Int(parts.first ?? "") ?? 0), "\(line)")
+            #expect(parts.dropFirst().allSatisfy { !TitleNormalizer.key(String($0)).isEmpty }, "\(line)")
+        }
+    }
+}

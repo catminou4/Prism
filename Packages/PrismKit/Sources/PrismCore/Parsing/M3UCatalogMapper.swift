@@ -282,7 +282,7 @@ private struct CatalogBuilder {
         let movie = Movie(
             sourceID: sourceID,
             nativeID: uniqueID(StableHash.hex(entry.url.absoluteString), kind: .movie),
-            title: n.title.isEmpty ? entry.name : n.title,
+            title: n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title),
             rawName: entry.name,
             year: n.year,
             posterURL: M3UCatalogMapper.imageURL(entry.attributes["tvg-logo"]),
@@ -305,7 +305,7 @@ private struct CatalogBuilder {
         if series[showKey] == nil {
             series[showKey] = SeriesBuilder(
                 nativeID: StableHash.hex(showKey),
-                title: n.title.isEmpty ? entry.name : n.title,
+                title: n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title),
                 categoryID: category?.id,
                 isAdult: (category?.isAdult ?? false) || TitleNormalizer.isAdultName(n)
             )

@@ -66,6 +66,11 @@ struct AppSnapshotTests {
             label: "collection", size: CGSize(width: 1170, height: 870), scheme: .light
         )
         try await write(
+            CollectionView(collection: .curated(CurationQuery(kind: .movie, facet: .top, title: "Top 10 des films")))
+                .environment(demo).environment(navigation),
+            label: "collection-top", size: CGSize(width: 1170, height: 870)
+        )
+        try await write(
             TitleDetailView(titleID: movie.id).environment(app).environment(navigation),
             label: "film", size: CGSize(width: 1170, height: 870)
         )

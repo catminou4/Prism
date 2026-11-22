@@ -138,6 +138,8 @@ public struct TraitFlags: OptionSet, Sendable, Hashable {
     public static let episodeLike = TraitFlags(rawValue: 1 << 13)
     /// At least one category contributed a general-audience (non-regional) signal.
     public static let international = TraitFlags(rawValue: 1 << 14)
+    /// Matched against `AcclaimedSelection`: recognised by awards, critics and audiences over time.
+    public static let canon = TraitFlags(rawValue: 1 << 15)
 }
 
 /// Everything one provider category name tells about its members.
@@ -263,7 +265,8 @@ enum CurationTaxonomy {
         (.lowQualityRelease, [" cam ", " hdcam", " pre-release", " pre release"]),
         (.frenchOrigin, [" french", " francais", " acteurs francais", " louis de funes", " cinema francais", " films francais"]),
         (.asian, [" asia", " asiatique", " korean", " asian", " اسيوي", " أسيوية", " k-drama", " kdrama"]),
-        (.franchise, [" saga", " collection", " kollektion", " marvel", " dc universe", " james bond", " جيمس بوند"]),
+        // Plural "Collections" are franchise boxes; "Classic Movies Collection" is a catalogue section.
+        (.franchise, [" saga", " collections", " kollektion", " marvel", " dc universe", " james bond", " جيمس بوند", " trilog", " universe "]),
         (.regional, [
             " hindi", " tamil", " telugu", " telegu", " bollywood", " punjabi", " malayalam", " kannada", " bangla",
             " marathi", " maharati", " gujarati", " gugarati", " urdu", " pakistan", " turkish", " turske", " dizi",

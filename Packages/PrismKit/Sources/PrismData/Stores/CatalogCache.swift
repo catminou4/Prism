@@ -97,8 +97,21 @@ public actor CatalogCache {
                     guard !Task.isCancelled else { return (index, .invalid) }
                     switch Tag(rawValue: segment.tag) {
                     case .channels: return (index, SegmentedArchive.decodeSegment([Channel].self, from: segment).map(Decoded.channels) ?? .invalid)
-                    case .movies: return (index, SegmentedArchive.decodeSegment([Movie].self, from: segment).map(Decoded.movies) ?? .invalid)
-                    case .series: return (index, SegmentedArchive.decodeSegment([Series].self, from: segment).map(Decoded.series) ?? .invalid)
+                    case .movies:
+                        guard var movies = SegmentedArchive.decodeSegment([Movie].self, from: segment) else { return (index, .invalid) }
+                        // Catalogues cached before a naming fix get it without a network refresh.
+                        for offset in movies.indices {
+                            let refined = TitleRefinement.refine(movies[offset].title)
+                            if refined != movies[offset].title { movies[offset].title = refined }
+                        }
+                        return (index, .movies(movies))
+                    case .series:
+                        guard var series = SegmentedArchive.decodeSegment([Series].self, from: segment) else { return (index, .invalid) }
+                        for offset in series.indices {
+                            let refined = TitleRefinement.refine(series[offset].title)
+                            if refined != series[offset].title { series[offset].title = refined }
+                        }
+                        return (index, .series(series))
                     case .meta, nil: return (index, .invalid)
                     }
                 }

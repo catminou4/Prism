@@ -103,14 +103,19 @@ struct CardMenuButton<MenuContent: View>: View {
     }
 }
 
-/// Reports the press state of a plain button to its container.
-struct PressReportingButtonStyle: ButtonStyle {
-    @Binding var isPressed: Bool
+// CardContainer tracks the hover used by the artwork and menu.
+private struct CardPressStyle: ButtonStyle {
+    let isHovered: Bool
+    let hoverScale: CGFloat
+    let reduceMotion: Bool
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .contentShape(.rect)
-            .onChange(of: configuration.isPressed) { _, pressed in isPressed = pressed }
+            .hoverLiftEffect(
+                isHovered: isHovered, isPressed: configuration.isPressed, scale: hoverScale,
+                pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion
+            )
     }
 }
 
@@ -124,7 +129,6 @@ struct CardContainer<Content: View, MenuContent: View>: View {
     let content: (_ isHovered: Bool) -> Content
 
     @State private var hovering = false
-    @State private var isPressed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotHover) private var forcedHover
 
@@ -150,13 +154,16 @@ struct CardContainer<Content: View, MenuContent: View>: View {
                 Button(action: action) {
                     content(isHovered)
                 }
-                .buttonStyle(PressReportingButtonStyle(isPressed: $isPressed))
+                .buttonStyle(CardPressStyle(isHovered: isHovered, hoverScale: hoverScale, reduceMotion: reduceMotion))
             } else {
                 content(isHovered)
+                    .hoverLiftEffect(
+                        isHovered: isHovered, isPressed: false, scale: hoverScale,
+                        pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion
+                    )
             }
         }
         .environment(\.prismCardLifted, isHovered)
-        .hoverLiftEffect(isHovered: isHovered, isPressed: isPressed, scale: hoverScale, pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion)
         .onHover { hovering = $0 }
         .modifier(OptionalContextMenu(menu: menu))
         .focusEffectDisabled()

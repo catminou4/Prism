@@ -132,7 +132,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
                 page(edge)
             }
             .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
-            .transition(.opacity)
+            .transition(reduceMotion ? AnyTransition.opacity : AnyTransition.opacity.combined(with: .scale(scale: 0.8)))
         }
     }
 

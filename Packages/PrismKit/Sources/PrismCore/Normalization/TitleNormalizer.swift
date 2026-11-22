@@ -1027,8 +1027,10 @@ enum NameCasing {
         return result
     }
 
+    static let romanNumerals: Set<String> = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII"]
+
     private static func caseWord(_ word: String, isFirst: Bool) -> String {
-        if word.contains(where: { $0.isNumber }) { return word }
+        if word.contains(where: { $0.isNumber }) || romanNumerals.contains(word) { return word }
         let folded = NameFolding.key(word).replacingOccurrences(of: " ", with: "").uppercased()
         if keepUpper.contains(word) || keepUpper.contains(folded) { return word }
         let letters = word.filter { $0.isLetter }

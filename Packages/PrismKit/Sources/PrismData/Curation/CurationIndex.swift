@@ -22,6 +22,8 @@ public struct TitleSignals: Sendable, Hashable {
     /// Passes the quality gate: artwork, plausible name, not a clip, a cam or an adult title.
     public var isEligible = false
     public var year: Int16 = 0
+    /// Provider rating × 10 (0 when unrated), before calibration: perfect scores mean few votes.
+    var rating10: UInt8 = 0
     var addedDay: Int32 = 0
     var isEditorial = false
 
@@ -76,11 +78,12 @@ public struct CurationIndex: Sendable {
             categoryTraits[category.id] = CurationTaxonomy.traits(forCategory: category.name, currentYear: currentYear)
         }
         let editorial = Set(recommendations.editorialCopy.keys)
+        let canon = await AcclaimedSelection.matches(in: catalog)
         let latest = (catalog.movies.lazy.compactMap(\.addedAt).max() ?? now).timeIntervalSince1970
         let catalogDay = Int32(latest / 86_400)
         let context = Context(
             catalog: catalog, recommendations: recommendations, categoryTraits: categoryTraits, editorial: editorial,
-            currentYear: currentYear, catalogDay: catalogDay, hasLanguageEvidence: hasLanguageEvidence
+            canon: canon, currentYear: currentYear, catalogDay: catalogDay, hasLanguageEvidence: hasLanguageEvidence
         )
         async let movies = signals(for: catalog.movies, context: context)
         async let series = signals(for: catalog.series, context: context)
@@ -97,6 +100,7 @@ public struct CurationIndex: Sendable {
         let recommendations: Recommendations
         let categoryTraits: [String: CategoryTraits]
         let editorial: Set<TitleID>
+        let canon: Set<TitleID>
         let currentYear: Int
         let catalogDay: Int32
         let hasLanguageEvidence: Bool
@@ -171,6 +175,8 @@ public struct CurationIndex: Sendable {
         result.year = Int16(clamping: title.year ?? 0)
         result.addedDay = Int32((title.addedAt?.timeIntervalSince1970 ?? 0) / 86_400)
         result.isEditorial = context.editorial.contains(title.id)
+        if context.canon.contains(title.id) { result.flags.insert([.canon, .acclaimed]) }
+        if let rating = title.rating, rating > 0, rating <= 10 { result.rating10 = UInt8((rating * 10).rounded()) }
         if CurationTaxonomy.looksLikeEpisode(title.title) { result.flags.insert(.episodeLike) }
 
         // Bayesian rating: wide distribution = more trustworthy rating.
@@ -215,6 +221,7 @@ public struct CurationIndex: Sendable {
         if title.$backdropURL != nil { score += 0.02 }
         if title.plot?.isEmpty == false { score += 0.01 }
         if signals.flags.contains(.acclaimed) { score += 0.06 }
+        if signals.flags.contains(.canon) { score += 0.05 }
         if signals.isEditorial { score += 0.08 }
         if signals.flags.contains(.regional) { score -= 0.22 }
         if signals.flags.contains(.christmas) { score -= 0.04 }

@@ -129,7 +129,7 @@ public enum XtreamDecoder {
             result.append(Movie(
                 sourceID: sourceID,
                 nativeID: id,
-                title: n.title.isEmpty ? rawName : n.title,
+                title: n.title.isEmpty ? rawName : TitleRefinement.refine(n.title),
                 rawName: rawName,
                 year: year,
                 posterURL: obj.url("stream_icon", "cover", "cover_big"),
@@ -166,7 +166,7 @@ public enum XtreamDecoder {
             result.append(Series(
                 sourceID: sourceID,
                 nativeID: id,
-                title: n.title.isEmpty ? rawName : n.title,
+                title: n.title.isEmpty ? rawName : TitleRefinement.refine(n.title),
                 rawName: rawName,
                 year: obj.year("year") ?? obj.year("releaseDate", "releasedate", "release_date") ?? n.year,
                 posterURL: obj.url("cover", "stream_icon", "cover_big"),

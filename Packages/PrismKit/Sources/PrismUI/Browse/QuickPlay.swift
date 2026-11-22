@@ -11,6 +11,12 @@ enum QuickPlay {
     private static let frenchTags: Set<String> = ["FR", "FRA", "FRENCH", "VF", "VFF", "VFQ", "VFI", "TRUEFRENCH", "MULTI"]
     private static let englishTags: Set<String> = ["EN", "ENG", "ENGLISH", "VO", "VOSTFR", "MULTI"]
 
+    static func canPlay(_ title: MediaTitle, app: AppModel) -> Bool {
+        title.kind == .movie && title.variants.contains { variant in
+            variant.movie != nil && app.source(variant.sourceID)?.isEnabled == true
+        }
+    }
+
     static func option(for title: MediaTitle, app: AppModel) -> TitlePlaybackOption? {
         guard title.kind == .movie else { return nil }
         let enabled = title.variants.filter { app.source($0.sourceID)?.isEnabled == true }

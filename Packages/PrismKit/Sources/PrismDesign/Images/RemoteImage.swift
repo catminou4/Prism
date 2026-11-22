@@ -97,18 +97,24 @@ public struct RemoteImage: View {
 
         let artwork = Color.clear
             .overlay(alignment: alignment) {
-                ZStack(alignment: alignment) {
-                    if showsPlaceholder, image == nil {
+                if url == nil {
+                    if showsPlaceholder {
                         PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
-                            // Stay underneath until the artwork has faded in, then drop.
-                            .transition(.asymmetric(insertion: .identity, removal: .opacity.animation(.linear(duration: 0.01).delay(0.25))))
                     }
-                    if let image {
-                        Image(decorative: image, scale: displayScale)
-                            .resizable()
-                            .interpolation(blurRadius > 0 ? .medium : .high)
-                            .aspectRatio(contentMode: contentMode)
-                            .transition(.opacity)
+                } else {
+                    ZStack(alignment: alignment) {
+                        if showsPlaceholder, image == nil {
+                            PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
+                                // Stay underneath until the artwork has faded in, then drop.
+                                .transition(.asymmetric(insertion: .identity, removal: .opacity.animation(.linear(duration: 0.01).delay(0.25))))
+                        }
+                        if let image {
+                            Image(decorative: image, scale: displayScale)
+                                .resizable()
+                                .interpolation(blurRadius > 0 ? .medium : .high)
+                                .aspectRatio(contentMode: contentMode)
+                                .transition(.opacity)
+                        }
                     }
                 }
             }

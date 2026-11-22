@@ -8,6 +8,7 @@ struct BrowseScreen: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
     @State private var motion = BrowseScrollActivity()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let kind: MediaKind?
 
     private var scope: CurationScope {
@@ -43,14 +44,19 @@ struct BrowseScreen: View {
                             .frame(maxWidth: .infinity)
                     } else if !app.hasFeed(for: scope) {
                         CurationPlaceholder()
+                            .transition(.opacity)
                     }
                     curatedShelves(feed)
                     if !feed.genres.isEmpty {
                         GenreTileShelf(tiles: feed.genres, kind: kind)
+                            .rowEntrance()
                     }
-                    if let kind { providerShelves(kind) }
+                    if let kind { providerShelves(kind).rowEntrance() }
                 }
                 .padding(.bottom, 48)
+                // A new composition (first load, languages, a day later) cross-fades row by row
+                // instead of popping.
+                .animation(reduceMotion ? nil : PrismMotion.entrance, value: feed.shelves.map(\.id))
             }
             .onScrollPhaseChange { _, phase in
                 if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
@@ -70,6 +76,11 @@ struct BrowseScreen: View {
     @ViewBuilder private func curatedShelves(_ feed: CuratedFeed) -> some View {
         ForEach(feed.shelves) { shelf in
             CuratedShelfView(shelf: shelf)
+                .rowEntrance()
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .offset(y: 18)),
+                    removal: .opacity.animation(PrismMotion.quickFade)
+                ))
         }
     }
 
@@ -111,11 +122,14 @@ private struct HomeLibraryShelves: View {
             }) { item in
                 ResumeCard(item: item)
             }
+            .rowEntrance()
         }
         SportsHomeShelf()
+            .rowEntrance()
         let watchlist = app.library.watchlist.prefix(24).compactMap(app.catalog.title)
         if !watchlist.isEmpty {
             TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
+                .rowEntrance()
         }
     }
 }
@@ -313,6 +327,8 @@ private struct HighlightPage: View {
     let highlight: CuratedHighlight
     let size: CGSize
     let isActive: Bool
+    /// Copy settles shortly after the artwork, one line after the other.
+    @State private var revealed = false
 
     private var title: MediaTitle { highlight.title }
     private var resolved: HeroArtworkStore.Entry? { app.heroArtwork.entry(for: title.id) }
@@ -341,11 +357,12 @@ private struct HighlightPage: View {
                 leadingScrim: 0.72, extendsUnderSidebar: true, artSize: size
             )
             VStack(alignment: .leading, spacing: 10) {
-                if let label = highlight.label { LabelPill(label) }
+                if let label = highlight.label { LabelPill(label).staggeredReveal(revealed, order: 0) }
                 TitleLogo(
                     url: metadata?.images.logoURL, fallbackTitle: title.title,
                     maxSize: CGSize(width: min(420, size.width * 0.4), height: min(120, size.height * 0.2))
                 )
+                .staggeredReveal(revealed, order: 1, distance: 18)
                 HStack(spacing: 6) {
                     Text(facts.joined(separator: " · "))
                     if let rating = title.rating, rating > 0, rating < 9.6 {
@@ -356,12 +373,15 @@ private struct HighlightPage: View {
                 }
                 .font(PrismFont.heroMeta.weight(.medium))
                 .foregroundStyle(PrismColors.onArtworkSecondary)
+                .staggeredReveal(revealed, order: 2)
                 if let synopsis {
                     Text(synopsis)
                         .font(PrismFont.heroBody)
                         .foregroundStyle(.white.opacity(0.88))
                         .lineLimit(3)
                         .lineSpacing(PrismFont.heroLineSpacing)
+                        .transition(.opacity)
+                        .staggeredReveal(revealed, order: 3)
                 }
                 HStack(spacing: PrismMetrics.heroButtonSpacing) {
                     if let quickPlay {
@@ -391,6 +411,7 @@ private struct HighlightPage: View {
                     }
                 }
                 .padding(.top, 6)
+                .staggeredReveal(revealed, order: 4)
             }
             .frame(maxWidth: min(460, size.width * 0.44), alignment: .leading)
             .foregroundStyle(.white)
@@ -400,6 +421,7 @@ private struct HighlightPage: View {
         }
         .contentShape(.rect)
         .contextMenu { TitleContextMenu(title: title) }
+        .onAppear { revealed = true }
         .task(id: ArtworkRequest(active: isActive, enrichmentEnabled: app.isMetadataEnabled)) {
             guard isActive else { return }
             await app.heroArtwork.resolve(title, app: app)
@@ -476,11 +498,13 @@ struct BrowsePoster: View {
     let item: MediaTitle
     var width: CGFloat? = nil
     var rank: Int? = nil
+    /// Shelves of ranked posters hide names; ranked grids keep them.
+    var showsTitle: Bool? = nil
 
     var body: some View {
         let name = app.recommendations.named(item).title
         PosterCard(imageURL: item.posterURL, seed: name, title: name,
-                   subtitle: subtitle, showsTitle: rank == nil, rank: rank, width: width,
+                   subtitle: subtitle, showsTitle: showsTitle ?? (rank == nil), rank: rank, width: width,
                    action: { navigation.push(.title(item.id)) }) {
             TitleContextMenu(title: item)
         }
@@ -505,8 +529,9 @@ struct TitleContextMenu: View {
     let title: MediaTitle
 
     var body: some View {
-        if title.kind == .movie, let option = QuickPlay.option(for: title, app: app) {
+        if QuickPlay.canPlay(title, app: app) {
             Button("Lecture", systemImage: "play.fill") {
+                guard let option = QuickPlay.option(for: title, app: app) else { return }
                 QuickPlay.play(option, title: title, app: app, playItem: playItem)
             }
         }

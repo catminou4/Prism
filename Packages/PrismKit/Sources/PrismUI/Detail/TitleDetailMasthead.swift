@@ -20,6 +20,7 @@ struct TitleDetailMasthead: View {
     let play: () -> Void
     let toggleWatchlist: () -> Void
     let showEditions: () -> Void
+    @State private var revealed = false
 
     private var displayTitle: String {
         let name = metadata?.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -43,6 +44,7 @@ struct TitleDetailMasthead: View {
                         url: metadata?.images.logoURL, fallbackTitle: displayTitle,
                         maxSize: CGSize(width: min(400, textWidth), height: 112)
                     )
+                    .staggeredReveal(revealed, order: 0, distance: 18)
                     if !facts.isEmpty || quality != nil {
                         HStack(spacing: 9) {
                             Text(facts.joined(separator: "  ·  "))
@@ -53,6 +55,7 @@ struct TitleDetailMasthead: View {
                                 MediaBadge(quality, style: .filled)
                             }
                         }
+                        .staggeredReveal(revealed, order: 1)
                     }
                     if let plot {
                         ExpandableText(
@@ -60,9 +63,11 @@ struct TitleDetailMasthead: View {
                             popoverTitle: "Synopsis", lineSpacing: 3
                         )
                         .foregroundStyle(.white.opacity(0.91))
+                        .staggeredReveal(revealed, order: 2)
                     }
                     actions
                         .padding(.top, 6)
+                        .staggeredReveal(revealed, order: 3)
                 }
                 .frame(width: textWidth, alignment: .leading)
                 .padding(.leading, PrismMetrics.contentMargin)
@@ -70,6 +75,7 @@ struct TitleDetailMasthead: View {
             }
         }
         .frame(height: height)
+        .onAppear { revealed = true }
         .environment(\.colorScheme, .dark)
         .overlay(alignment: .bottom) {
             LinearGradient(colors: [.clear, PrismColors.pageBackground], startPoint: .top, endPoint: .bottom)

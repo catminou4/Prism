@@ -50,33 +50,7 @@ public struct PosterCard<MenuContent: View>: View {
         CardContainer(accessibilityLabel: Text(label), action: action, menu: menu) { _ in
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkSurface(radius: PrismMetrics.posterRadius) {
-                    RemoteImage(url: imageURL, size: artworkSize, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
-                        .overlay(alignment: .topTrailing) {
-                            if let badge {
-                                MediaBadge(badge, style: .filled)
-                                    .foregroundStyle(.white.opacity(0.9))
-                                    .padding(8)
-                            }
-                        }
-                        .overlay(alignment: .topLeading) {
-                            if let rank {
-                                Text(rank, format: .number)
-                                    .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
-                                    .foregroundStyle(.white)
-                                    .frame(minWidth: 34, minHeight: 30)
-                                    .background(.black.opacity(0.64), in: .capsule)
-                                    .padding(8)
-                                    .accessibilityHidden(true)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if let progress {
-                                ProgressCapsule(fraction: progress, width: nil, height: 3)
-                                    .padding(.horizontal, 10)
-                                    .padding(.bottom, 10)
-                                    .shadow(color: .black.opacity(0.4), radius: 3)
-                            }
-                        }
+                    artwork(size: artworkSize)
                 }
                 if showsTitle {
                     VStack(alignment: .leading, spacing: 2) {
@@ -94,6 +68,42 @@ public struct PosterCard<MenuContent: View>: View {
                 }
             }
             .frame(width: w, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func artwork(size: CGSize) -> some View {
+        let image = RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
+        if badge == nil, rank == nil, progress == nil {
+            // The catalogue grid mounts plain posters as each row comes into view.
+            image
+        } else {
+            image
+                .overlay(alignment: .topTrailing) {
+                    if let badge {
+                        MediaBadge(badge, style: .filled)
+                            .foregroundStyle(.white.opacity(0.9))
+                            .padding(8)
+                    }
+                }
+                .overlay(alignment: .topLeading) {
+                    if let rank {
+                        Text(rank, format: .number)
+                            .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .frame(minWidth: 34, minHeight: 30)
+                            .background(.black.opacity(0.64), in: .capsule)
+                            .padding(8)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if let progress {
+                        ProgressCapsule(fraction: progress, width: nil, height: 3)
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 10)
+                            .shadow(color: .black.opacity(0.4), radius: 3)
+                    }
+                }
         }
     }
 }

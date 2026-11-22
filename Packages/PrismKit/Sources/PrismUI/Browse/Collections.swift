@@ -6,6 +6,8 @@ import PrismDesign
 struct TitleGrid: View {
     let items: [MediaTitle]
     var availableWidth: CGFloat
+    /// Numbers posters 1, 2, 3… (Top lists).
+    var ranked = false
 
     var body: some View {
         let spacing: CGFloat = 20
@@ -14,11 +16,46 @@ struct TitleGrid: View {
         let width = (contentWidth - CGFloat(count - 1) * spacing) / CGFloat(count)
         let columns = Array(repeating: GridItem(.fixed(width), spacing: spacing), count: count)
         LazyVGrid(columns: columns, alignment: .leading, spacing: 28) {
-            ForEach(items) { item in
-                BrowsePoster(item: item, width: width)
+            if ranked {
+                ForEach(Array(items.enumerated()), id: \.element.id) { offset, item in
+                    BrowsePoster(item: item, width: width, rank: offset + 1, showsTitle: true)
+                        .rowEntrance()
+                }
+            } else {
+                ForEach(items) { item in
+                    BrowsePoster(item: item, width: width)
+                        .rowEntrance()
+                }
             }
         }
         .padding(.horizontal, PrismMetrics.contentMargin)
+    }
+}
+
+/// How a "Voir tout" page orders its titles.
+enum CollectionSort: String, CaseIterable, Identifiable, Sendable {
+    case relevance, rating, newest, recentlyAdded, title
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .relevance: "Pertinence"
+        case .rating: "Mieux notés"
+        case .newest: "Plus récents"
+        case .recentlyAdded: "Derniers ajouts"
+        case .title: "Titre (A à Z)"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .relevance: "sparkles"
+        case .rating: "star"
+        case .newest: "calendar"
+        case .recentlyAdded: "clock"
+        case .title: "textformat"
+        }
     }
 }
 
@@ -26,7 +63,12 @@ struct CollectionView: View {
     @Environment(AppModel.self) private var app
     @Environment(\.isPageActive) private var isActive
     @State private var resolved: ResolvedItems?
+    @State private var sort: CollectionSort = .relevance
+    @State private var genre: String? = Self.allGenres
+    @State private var arranged: Arranged?
     let collection: CollectionRoute
+
+    nonisolated private static let allGenres = "all"
 
     private enum Request: Equatable {
         case catalog(Int)
@@ -37,29 +79,54 @@ struct CollectionView: View {
     private struct ResolvedItems {
         let request: Request
         let titles: [MediaTitle]
+        let genres: [ChipItem]
+    }
+
+    /// The source list after sorting and filtering, tagged with what produced it.
+    private struct Arranged {
+        let key: ArrangeKey
+        let titles: [MediaTitle]
+    }
+
+    private struct ArrangeKey: Equatable {
+        let source: Int
+        let sort: CollectionSort
+        let genre: String?
     }
 
     var body: some View {
         let request = isActive ? loadRequest : nil
+        let source = items
+        let key = source.map { ArrangeKey(source: sourceRevision($0), sort: sort, genre: genre) }
+        let visible: [MediaTitle]? = if let source, let key {
+            key.sort == .relevance && key.genre == Self.allGenres ? source : (arranged?.key == key ? arranged?.titles : nil)
+        } else {
+            nil
+        }
         GeometryReader { geometry in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 26) {
-                    BrowseHeading(title: title)
+                LazyVStack(alignment: .leading, spacing: 22) {
+                    header(count: visible?.count)
+                    if let genres = resolved?.genres, genres.count > 2, collection != .continueWatching {
+                        ChipBar(items: genres, selection: $genre)
+                    }
                     if collection == .continueWatching {
                         let items = app.library.continueWatching(in: app.catalog, limit: 80)
                         if items.isEmpty {
                             emptyMessage
                         } else {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 20)], spacing: 20) {
-                                ForEach(items) { ResumeCard(item: $0) }
+                                ForEach(items) { ResumeCard(item: $0).rowEntrance() }
                             }
                             .padding(.horizontal, PrismMetrics.contentMargin)
                         }
-                    } else if let titles = items {
+                    } else if let titles = visible {
                         if titles.isEmpty {
                             emptyMessage
                         } else {
-                            TitleGrid(items: titles, availableWidth: geometry.size.width)
+                            TitleGrid(items: titles, availableWidth: geometry.size.width, ranked: isRanking && sort == .relevance)
+                                .id(key.map { "\($0.sort.rawValue)|\($0.genre ?? "")" })
+                                .transition(.opacity)
                         }
                     } else {
                         ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
@@ -67,6 +134,8 @@ struct CollectionView: View {
                 }
                 .padding(.vertical, 24)
                 .padding(.bottom, 28)
+                .animation(PrismMotion.standard, value: key?.sort)
+                .animation(PrismMotion.standard, value: key?.genre)
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
         }
@@ -79,19 +148,77 @@ struct CollectionView: View {
                 titles = await Self.collect(collection, in: app.catalog, index: app.curationIndex)
             }
             guard !Task.isCancelled else { return }
-            resolved = ResolvedItems(request: request, titles: titles)
+            let genres = await Self.genreChips(for: titles, index: app.curationIndex, catalog: app.catalog)
+            guard !Task.isCancelled else { return }
+            resolved = ResolvedItems(request: request, titles: isRanking ? Array(titles.prefix(100)) : titles, genres: genres)
         }
+        .task(id: key) {
+            guard let source, let key, key.sort != .relevance || key.genre != Self.allGenres, arranged?.key != key else { return }
+            let titles = await Self.arrange(
+                source, sort: key.sort, genre: key.genre.flatMap { Int($0) }.flatMap(CanonicalGenre.init(rawValue:)),
+                index: app.curationIndex, catalog: app.catalog
+            )
+            guard !Task.isCancelled else { return }
+            arranged = Arranged(key: key, titles: titles)
+        }
+        .onChange(of: resolved?.genres.map(\.id)) { _, ids in
+            if let genre, genre != Self.allGenres, ids?.contains(genre) != true { self.genre = Self.allGenres }
+        }
+    }
+
+    private func header(count: Int?) -> some View {
+        HStack(alignment: .lastTextBaseline, spacing: 12) {
+            BrowseHeading(title: title, subtitle: count.map(Self.countLabel))
+            if collection != .continueWatching, (items?.count ?? 0) > 1 {
+                Menu {
+                    Picker("Trier par", selection: $sort) {
+                        ForEach(CollectionSort.allCases) { option in
+                            Label(option.label, systemImage: option.systemImage).tag(option)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    GlassCapsuleLabel(title: sort.label, systemImage: "arrow.up.arrow.down")
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(GlassCapsuleStyle(style: .regular))
+                .fixedSize()
+                .help("Trier")
+                .padding(.trailing, PrismMetrics.contentMargin)
+            }
+        }
+    }
+
+    private static func countLabel(_ count: Int) -> String {
+        count == 1 ? "1 titre" : "\(count.formatted()) titres"
+    }
+
+    /// A Top list keeps its numbers while it is shown in its own order.
+    private var isRanking: Bool {
+        if case .curated(let query) = collection, query.facet == .top { return true }
+        return false
+    }
+
+    /// Cheap identity of the source list: the arrangement is recomputed when the list changes.
+    private func sourceRevision(_ titles: [MediaTitle]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(titles.count)
+        hasher.combine(titles.first?.id)
+        hasher.combine(titles.last?.id)
+        hasher.combine(app.catalogRevision)
+        return hasher.finalize()
     }
 
     private var loadRequest: Request? {
         switch collection {
-        case .category, .topRated, .related:
+        case .category, .topRated, .related, .all, .watchlist:
             .catalog(app.catalogRevision)
         case .recentlyAdded:
             .recent(catalog: app.catalogRevision, curation: app.curationRevision)
         case .curated(let query):
             .curated(app.curationRequest(for: query.kind == .movie ? .movies : query.kind == .series ? .series : .home))
-        case .all, .watchlist, .continueWatching:
+        case .continueWatching:
             nil
         }
     }
@@ -105,7 +232,7 @@ struct CollectionView: View {
         case .continueWatching: "Reprendre"
         case .watchlist: "Ma liste"
         case .related: "À voir aussi"
-        case .curated(let query): query.title
+        case .curated(let query): query.facet == .top ? query.title.replacingOccurrences(of: "Top 10 des", with: "Classement des") : query.title
         }
     }
 
@@ -130,8 +257,75 @@ struct CollectionView: View {
             catalog.topRated(kind, limit: 200)
         case .related(let id):
             catalog.title(id).map { catalog.related(to: $0, limit: 80) } ?? []
-        case .all, .watchlist, .continueWatching, .curated: []
+        case .all(let kind):
+            kind == .movie ? catalog.movies : catalog.series
+        case .watchlist, .continueWatching, .curated: []
         }
+    }
+
+    /// Genre chips with counts, most common first. Lists too small or too uniform get none.
+    @concurrent private static func genreChips(for titles: [MediaTitle], index: CurationIndex, catalog: Catalog) async -> [ChipItem] {
+        guard titles.count >= 24 else { return [] }
+        var counts = [Int](repeating: 0, count: CanonicalGenre.allCases.count)
+        for (offset, title) in titles.enumerated() {
+            if offset.isMultiple(of: 4_096), Task.isCancelled { return [] }
+            guard let bits = index.signals(for: title, in: catalog)?.genres.rawValue else { continue }
+            var remaining = bits
+            while remaining != 0 {
+                counts[remaining.trailingZeroBitCount] += 1
+                remaining &= remaining - 1
+            }
+        }
+        let minimum = max(4, titles.count / 50)
+        let genres = CanonicalGenre.allCases
+            .filter { $0 != .sport && counts[$0.rawValue] >= minimum && counts[$0.rawValue] < titles.count }
+            .sorted { counts[$0.rawValue] > counts[$1.rawValue] }
+            .prefix(12)
+        guard genres.count >= 2 else { return [] }
+        return [ChipItem(id: allGenres, title: "Tous")]
+            + genres.map { ChipItem(id: String($0.rawValue), title: $0.label, count: counts[$0.rawValue]) }
+    }
+
+    /// Sorting compares precomputed keys: a localized comparison over 100 000 names takes seconds.
+    @concurrent private static func arrange(
+        _ titles: [MediaTitle], sort: CollectionSort, genre: CanonicalGenre?, index: CurationIndex, catalog: Catalog
+    ) async -> [MediaTitle] {
+        var pool = titles
+        if let genre {
+            pool = pool.filter { index.signals(for: $0, in: catalog)?.genres.contains(genre) == true }
+        }
+        guard !Task.isCancelled else { return [] }
+        switch sort {
+        case .relevance:
+            return pool
+        case .rating:
+            let keys = pool.map { title -> Float in
+                // Calibrated quality: perfect provider ratings with no audience behind them sink.
+                if let quality = index.signals(for: title, in: catalog)?.quality, quality > 0 { return quality }
+                return Float(title.rating ?? 0) * 0.6
+            }
+            return sorted(pool, keys: keys, by: >)
+        case .newest:
+            let keys = pool.map { title in (title.year ?? 0) * 1_000_000 + Int((title.addedAt?.timeIntervalSince1970 ?? 0) / 86_400) % 1_000_000 }
+            return sorted(pool, keys: keys, by: >)
+        case .recentlyAdded:
+            let keys = pool.map { $0.addedAt?.timeIntervalSince1970 ?? 0 }
+            return sorted(pool, keys: keys, by: >)
+        case .title:
+            let keys = pool.map { title -> String in
+                let key = TitleNormalizer.key(title.title)
+                // Names that start with digits or symbols go after the alphabet, as in Apple TV.
+                return key.first.map { $0.isLetter } == true ? key : "~" + key
+            }
+            return sorted(pool, keys: keys, by: <)
+        }
+    }
+
+    nonisolated private static func sorted<Key: Comparable>(_ titles: [MediaTitle], keys: [Key], by order: (Key, Key) -> Bool) -> [MediaTitle] {
+        let indices = titles.indices.sorted { lhs, rhs in
+            keys[lhs] != keys[rhs] ? order(keys[lhs], keys[rhs]) : lhs < rhs
+        }
+        return indices.map { titles[$0] }
     }
 
     private var emptyMessage: some View {

@@ -97,6 +97,7 @@ enum CatalogCommand {
         }
         if ProcessInfo.processInfo.environment["PRISM_DUMP"] != nil { dumpCategories(catalog) }
         if ProcessInfo.processInfo.environment["PRISM_ARTWORK"] != nil { printArtworkStats(catalog) }
+        if ProcessInfo.processInfo.environment["PRISM_TITLES"] != nil { printSuspiciousTitles(catalog) }
         var usage = rusage()
         getrusage(RUSAGE_SELF, &usage)
         print(String(format: "\nmax RSS %.0f MB", Double(usage.ru_maxrss) / 1_048_576))
@@ -135,6 +136,29 @@ enum CatalogCommand {
 }
 
 extension CatalogCommand {
+    /// Display names that still look like provider listings (shown on eligible, artwork-bearing titles).
+    static func printSuspiciousTitles(_ catalog: Catalog) {
+        let patterns: [(String, (String) -> Bool)] = [
+            ("pipe", { $0.contains("|") }),
+            ("brackets", { $0.contains("[") || $0.contains("(") }),
+            ("caps run", { name in
+                let words = name.split(separator: " ").filter { $0.count >= 3 && $0.contains(where: \.isLetter) && !$0.contains(where: \.isLowercase) }
+                return words.count >= 2 && name.contains(where: \.isLowercase)
+            }),
+            ("all caps", { name in name.count > 6 && name.contains(where: \.isLetter) && !name.contains(where: \.isLowercase) }),
+            ("underscore", { $0.contains("_") }),
+            ("trailing punctuation", { $0.hasSuffix("-") || $0.hasSuffix(":") || $0.hasSuffix(",") }),
+        ]
+        for (label, titles) in [("movies", catalog.movies), ("series", catalog.series)] {
+            let visible = titles.filter { !$0.isAdult && $0.$posterURL != nil }
+            print("\nsuspicious \(label) titles (of \(visible.count)):")
+            for (name, predicate) in patterns {
+                let hits = visible.filter { predicate($0.title) }
+                print("  \(name) \(hits.count): " + hits.prefix(25).map(\.title).joined(separator: " ‖ "))
+            }
+        }
+    }
+
     static func printCuration(catalog: Catalog, recommendations: Recommendations) async {
         var start = Date()
         let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations)

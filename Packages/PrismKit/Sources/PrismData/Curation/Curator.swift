@@ -51,6 +51,18 @@ public struct CurationQuery: Hashable, Sendable {
         case classics
         case french
         case hiddenGems
+        /// All-time reach: the works most providers carry in most languages.
+        case popular
+        /// Best ratings backed by wide distribution.
+        case topRated
+        /// First releases in the decade starting that year (1980, 1990…).
+        case decade(Int)
+        /// Sagas, cinematic universes and collections.
+        case franchise
+        /// Offered in 4K / UHD.
+        case uhd
+        /// Asian cinema, K-dramas and anime-adjacent live action.
+        case asian
         /// Everything eligible, best first (small catalogues and "Voir tout").
         case discover
     }
@@ -209,11 +221,13 @@ struct FeedBuilder {
                 personal.append(shelf("for-you", "Pour vous", subtitle: "D’après ce que vous regardez", forYou,
                                       query: CurationQuery(kind: kind, facet: .forYou, title: "Pour vous")))
             }
-            if let seed = becauseSeed(kinds: kinds) {
+            for (offset, seed) in becauseSeeds(kinds: kinds, limit: 2).enumerated() {
                 let name = present(seed).title
                 let query = CurationQuery(kind: seed.kind, facet: .because(seed.id), title: "Parce que vous avez regardé \(name)")
                 let items = take(query, count: Curator.shelfSize)
-                if items.count >= min(6, minimumShelf) { personal.append(shelf("because", query.title, subtitle: nil, items, query: query)) }
+                if items.count >= min(6, minimumShelf) {
+                    personal.append(shelf(offset == 0 ? "because" : "because-\(offset)", query.title, subtitle: nil, items, query: query))
+                }
             }
         }
 
@@ -252,17 +266,65 @@ struct FeedBuilder {
         let frenchTitle = scope == .series ? "Séries françaises" : "Cinéma français"
         let frenchQuery = CurationQuery(kind: kind, facet: .french, title: frenchTitle)
         let french = languages.contains(.french) ? take(frenchQuery, count: Curator.shelfSize) : []
+        let popularTitle = switch scope {
+        case .home: "Les incontournables"
+        case .movies: "Les films incontournables"
+        case .series: "Les séries incontournables"
+        }
+        let popularQuery = CurationQuery(kind: kind, facet: .popular, title: popularTitle)
+        let popular = take(popularQuery, count: Curator.shelfSize)
         let classicsQuery = CurationQuery(kind: kind, facet: .classics, title: "Les grands classiques")
         let gemsQuery = CurationQuery(kind: kind, facet: .hiddenGems, title: "Pépites à découvrir")
 
         shelves.append(contentsOf: charts.dropFirst())
         shelves.append(contentsOf: personal.dropFirst())
+        if popular.count >= minimumShelf {
+            shelves.append(shelf("popular", popularTitle, subtitle: "Ce que tout le monde a vu, ou devrait voir", popular, query: popularQuery))
+        }
         if let first = editorial.first { shelves.append(first) }
         shelves.append(contentsOf: genreShelves.prefix(2))
         if acclaimed.count >= minimumShelf { shelves.append(shelf("acclaimed", acclaimedQuery.title, subtitle: "Oscars, Césars, Emmys et chefs-d’œuvre", acclaimed, query: acclaimedQuery)) }
         if french.count >= minimumShelf { shelves.append(shelf("french", frenchTitle, subtitle: nil, french, query: frenchQuery)) }
-        shelves.append(contentsOf: editorial.dropFirst())
-        shelves.append(contentsOf: genreShelves.dropFirst(2))
+        if scope != .home {
+            let topRatedQuery = CurationQuery(kind: kind, facet: .topRated, title: "Les mieux notés")
+            let topRated = take(topRatedQuery, count: Curator.shelfSize)
+            if topRated.count >= minimumShelf {
+                shelves.append(shelf("top-rated", topRatedQuery.title, subtitle: "Les meilleures notes du public", topRated, query: topRatedQuery))
+            }
+        }
+        shelves.append(contentsOf: editorial.dropFirst().prefix(1))
+        // Themes that give a long page its rhythm: one rotates in on Home, all show on Films and Séries.
+        var themes: [CuratedShelf] = []
+        let franchiseTitle = scope == .series ? "Univers et franchises" : "Sagas et univers"
+        let franchiseQuery = CurationQuery(kind: kind, facet: .franchise, title: franchiseTitle)
+        let franchise = take(franchiseQuery, count: Curator.shelfSize)
+        if franchise.count >= minimumShelf { themes.append(shelf("franchise", franchiseTitle, subtitle: nil, franchise, query: franchiseQuery)) }
+        for decade in rotatingDecades(kind: kind, limit: scope == .home ? 1 : 2) {
+            let title = Self.decadeTitle(decade)
+            let query = CurationQuery(kind: kind, facet: .decade(decade), title: title)
+            let items = take(query, count: Curator.shelfSize)
+            if items.count >= minimumShelf { themes.append(shelf("decade-\(decade)", title, subtitle: nil, items, query: query)) }
+        }
+        let asianTitle = scope == .series ? "K-dramas et séries asiatiques" : "Cinéma asiatique"
+        let asianQuery = CurationQuery(kind: kind, facet: .asian, title: asianTitle)
+        let asian = take(asianQuery, count: Curator.shelfSize)
+        if asian.count >= minimumShelf { themes.append(shelf("asian", asianTitle, subtitle: nil, asian, query: asianQuery)) }
+        let uhdQuery = CurationQuery(kind: kind, facet: .uhd, title: "En 4K")
+        let uhd = take(uhdQuery, count: Curator.shelfSize)
+        if uhd.count >= minimumShelf { themes.append(shelf("uhd", uhdQuery.title, subtitle: "Image Ultra HD", uhd, query: uhdQuery)) }
+        if scope == .home {
+            shelves.append(contentsOf: rotated(themes, window: themes.count).prefix(1))
+            shelves.append(contentsOf: genreShelves.dropFirst(2))
+        } else {
+            // Alternate genres and themes so neighbouring rows never feel alike.
+            var genres = genreShelves.dropFirst(2).makeIterator()
+            for theme in themes {
+                if let genre = genres.next() { shelves.append(genre) }
+                shelves.append(theme)
+            }
+            while let genre = genres.next() { shelves.append(genre) }
+            shelves.append(contentsOf: editorial.dropFirst(2))
+        }
         let gems = take(gemsQuery, count: Curator.shelfSize)
         if gems.count >= minimumShelf { shelves.append(shelf("gems", gemsQuery.title, subtitle: "Très bien notés, moins connus", gems, query: gemsQuery)) }
         let classics = take(classicsQuery, count: Curator.shelfSize)
@@ -327,7 +389,9 @@ struct FeedBuilder {
     mutating func take(_ query: CurationQuery, count: Int) -> [MediaTitle] {
         var result: [MediaTitle] = []
         var genreCounts: [CanonicalGenre: Int] = [:]
-        for candidate in candidates(for: query, limit: count * 4) {
+        // Earlier shelves and the genre cap skip many of the best candidates: look deep enough
+        // that late rows on long pages still fill up.
+        for candidate in candidates(for: query, limit: count * 12) {
             let title = titleAt(candidate.kind, candidate.index)
             guard !used.contains(title.id) else { continue }
             // Diversity: outside genre shelves, no lead genre takes more than a third of the row.
@@ -444,24 +508,65 @@ struct FeedBuilder {
             return signal.score + jitter
         case .acclaimed:
             guard !signal.flags.contains(.regional), !signal.flags.contains(.kids) else { return nil }
-            guard signal.quality >= 7.0, signal.editions >= 2,
-                  signal.flags.contains(.acclaimed) || signal.isEditorial || (signal.quality >= 7.8 && signal.editions >= 10)
+            let isCanon = signal.flags.contains(.canon)
+            guard isCanon || (signal.quality >= 7.0 && signal.editions >= 2
+                  && (signal.flags.contains(.acclaimed) || signal.isEditorial || (signal.quality >= 7.8 && signal.editions >= 10)))
             else { return nil }
-            return signal.quality / 10 + 0.2 * min(log2(1 + Float(signal.editions)) / 4, 1) + (signal.isEditorial ? 0.08 : 0) + jitter
+            // Recognised works lead; provider "Top IMDb" sections fill in behind them.
+            return signal.quality / 10 + 0.2 * reach(signal) + (isCanon ? 0.25 : 0) + (signal.isEditorial ? 0.08 : 0) + jitter
         case .classics:
-            guard isGeneral, year > 0, year <= currentYear - 28, signal.quality >= 6.9 else { return nil }
-            return signal.quality / 10 + 0.35 * min(log2(1 + Float(signal.editions)) / 4, 1) + jitter
+            guard isGeneral, year > 0, year <= currentYear - 25,
+                  signal.quality >= 6.9 || signal.flags.contains(.canon) else { return nil }
+            return signal.quality / 10 + 0.35 * reach(signal) + (signal.flags.contains(.canon) ? 0.2 : 0)
+                + (signal.flags.contains(.classic) ? 0.04 : 0) + jitter
         case .french:
             guard signal.flags.contains(.frenchOrigin) || (signal.isEditorial && recommendations.editorialCopy[titleAt(kind, titleIndex).id]?.originalLanguage == .french),
                   !signal.flags.contains(.kids) else { return nil }
             return signal.score + jitter
         case .hiddenGems:
-            guard isGeneral, signal.quality >= 7.0, (2...4).contains(signal.editions), year >= currentYear - 15 else { return nil }
-            return signal.quality / 10 + jitter
+            // Well rated but not everywhere. Near-perfect provider ratings are a handful of votes,
+            // and seasonal TV films are not what anyone means by a gem.
+            guard isGeneral, signal.quality >= 7.0, (2...6).contains(signal.editions), year >= currentYear - 20,
+                  (70...90).contains(signal.rating10), !signal.flags.contains(.christmas), !signal.flags.contains(.canon),
+                  !signal.genres.contains(.family) || signal.genres.contains(.animation) else { return nil }
+            return signal.quality / 10 + 0.05 * reach(signal) + jitter
+        case .popular:
+            guard isGeneral, isSmall || signal.editions >= 4 || signal.flags.contains(.canon) else { return nil }
+            let quality = min(max((signal.quality - 5.6) / 2.8, 0), 1)
+            return 0.55 * reach(signal) + 0.3 * quality + (signal.flags.contains(.canon) ? 0.22 : 0) + jitter
+        case .topRated:
+            // Provider ratings come without vote counts. Averages above 9 for films, and above 9 for
+            // series (rounded to whole points), are nearly always a handful of votes.
+            let plausible: ClosedRange<UInt8> = kind == .series ? 80...90 : 72...89
+            guard isGeneral, isSmall || signal.editions >= 3 || signal.flags.contains(.canon),
+                  signal.quality >= 7.2 || signal.flags.contains(.canon), plausible.contains(signal.rating10) else { return nil }
+            return signal.quality / 10 + 0.15 * reach(signal) + (signal.flags.contains(.canon) ? (kind == .series ? 0.2 : 0.1) : 0) + jitter
+        case .decade(let start):
+            guard isGeneral, year >= start, year < start + 10 else { return nil }
+            let quality = min(max((signal.quality - 5.6) / 2.8, 0), 1)
+            return 0.5 * quality + 0.4 * reach(signal) + (signal.flags.contains(.canon) ? 0.15 : 0) + jitter
+        case .franchise:
+            guard isGeneral, signal.flags.contains(.franchise) else { return nil }
+            return signal.score + jitter
+        case .uhd:
+            guard isGeneral, signal.flags.contains(.uhd) else { return nil }
+            return signal.score + jitter
+        case .asian:
+            guard signal.flags.contains(.asian) || signal.genres.contains(.anime) && kind == .movie,
+                  !signal.flags.contains(.kids), !signal.flags.contains(.regional) else { return nil }
+            return signal.score + jitter
         case .discover:
             guard !signal.flags.contains(.regional) else { return nil }
             return signal.score + jitter
         }
+    }
+
+    private func reach(_ signal: TitleSignals) -> Float {
+        min(log2(1 + Float(signal.editions)) / 4, 1)
+    }
+
+    static func decadeTitle(_ start: Int) -> String {
+        start >= 2000 ? "Les années \(start)" : "Les années \(start % 100)"
     }
 
     // MARK: Charts
@@ -490,6 +595,14 @@ struct FeedBuilder {
             candidates(for: CurationQuery(kind: kind, facet: .platform(platform), title: ""), limit: 12).count >= 12
         }
         return Array(rotated(available, window: available.count).prefix(limit))
+    }
+
+    /// Decades with a real choice of titles, rotated daily.
+    private func rotatingDecades(kind: MediaKind?, limit: Int) -> [Int] {
+        let decades = (kind == .series ? [1990, 2000, 2010] : [1970, 1980, 1990, 2000, 2010]).filter { decade in
+            candidates(for: CurationQuery(kind: kind, facet: .decade(decade), title: ""), limit: minimumShelf * 2).count >= minimumShelf * 2
+        }
+        return Array(rotated(decades, window: decades.count).prefix(limit))
     }
 
     private func rotatingGenres(kind: MediaKind?, limit: Int) -> [CanonicalGenre] {
@@ -522,13 +635,19 @@ struct FeedBuilder {
 
     // MARK: Personalisation
 
-    private func becauseSeed(kinds: [MediaKind]) -> MediaTitle? {
+    /// The most recent distinct watches with enough genre information to find neighbours.
+    private func becauseSeeds(kinds: [MediaKind], limit: Int) -> [MediaTitle] {
+        var result: [MediaTitle] = []
+        var seenGenres: Set<GenreSet> = []
         for id in profile.watched {
-            guard let title = catalog.title(id), kinds.contains(title.kind),
-                  let signal = index.signals(for: title, in: catalog), signal.genres.count > 0 else { continue }
-            return title
+            guard let title = catalog.title(id), kinds.contains(title.kind), !result.contains(where: { $0.id == title.id }),
+                  let signal = index.signals(for: title, in: catalog), signal.genres.count > 0,
+                  // Two rows about the same kind of story would show the same titles.
+                  seenGenres.insert(signal.genres).inserted else { continue }
+            result.append(title)
+            if result.count == limit { break }
         }
-        return nil
+        return result
     }
 
     static func similarity(_ lhs: TitleSignals, _ rhs: TitleSignals) -> Float {
@@ -647,9 +766,9 @@ extension CurationQuery.Facet {
     /// Facets whose order is close to the general ranking can stop scanning early.
     var followsGeneralScore: Bool {
         switch self {
-        case .top, .newReleases, .platform, .french, .discover: true
+        case .top, .newReleases, .platform, .french, .discover, .franchise, .uhd, .asian: true
         case .genre: false
-        case .forYou, .because, .acclaimed, .classics, .hiddenGems: false
+        case .forYou, .because, .acclaimed, .classics, .hiddenGems, .popular, .topRated, .decade: false
         }
     }
 }
