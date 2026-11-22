@@ -105,6 +105,20 @@ struct LibraryStoreTests {
         #expect(store.isWatched(episode.id))
     }
 
+    @Test func latestProgressTracksUpdatesAndRemovals() {
+        let store = LibraryStore.inMemory()
+        let title = TitleID(rawValue: "movie:x:")
+        let first = ContentID(source: F.a, kind: .movie, nativeID: "1")
+        let second = ContentID(source: F.a, kind: .movie, nativeID: "2")
+        let now = Date.now
+        store.updateProgress(PlaybackProgress(contentID: first, titleID: title, position: 10, duration: 100, updatedAt: now))
+        #expect(store.latestProgress(forTitle: title)?.contentID == first)
+        store.updateProgress(PlaybackProgress(contentID: second, titleID: title, position: 20, duration: 100, updatedAt: now.addingTimeInterval(1)))
+        #expect(store.latestProgress(forTitle: title)?.contentID == second)
+        store.clearProgress(for: second)
+        #expect(store.latestProgress(forTitle: title)?.contentID == first)
+    }
+
     @Test func persistenceWithDebounceAndFlush() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
@@ -207,6 +221,7 @@ struct LibraryStoreTests {
         #expect(items[3].kind == .resume && items[3].episode == nil)
         #expect(items[4].kind == .resume && items[4].contentID.nativeID == "heat")
         #expect(store.continueWatching(in: catalog, limit: 2).count == 2)
+        #expect(await store.loadContinueWatching(in: catalog, limit: 2) == Array(items.prefix(2)))
         #expect(store.continueWatching(in: .empty).isEmpty)
     }
 }

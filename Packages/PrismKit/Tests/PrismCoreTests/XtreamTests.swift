@@ -388,7 +388,12 @@ struct XtreamDecodingTests {
     @Test func emptyAndHostileBodies() throws {
         #expect(try XtreamDecoder.liveStreams(Data(), sourceID: sourceID, credentials: credentials, preferHLS: true).isEmpty)
         #expect(try XtreamDecoder.vodStreams(Data("[]".utf8), sourceID: sourceID, credentials: credentials).isEmpty)
-        #expect(try XtreamDecoder.series(Data(#"{"user_info":{"auth":0}}"#.utf8), sourceID: sourceID).isEmpty)
+        #expect(throws: XtreamError.unauthorized) {
+            try XtreamDecoder.series(Data(#"{"user_info":{"auth":0}}"#.utf8), sourceID: sourceID)
+        }
+        #expect(throws: XtreamError.self) {
+            try XtreamDecoder.categories(Data(#"{"user_info":{"auth":1}}"#.utf8), kind: .movie, sourceID: sourceID)
+        }
         #expect(try XtreamDecoder.categories(Data(#"{"0":{"category_id":"9","category_name":"A"}}"#.utf8), kind: .movie, sourceID: sourceID).map(\.nativeID) == ["9"])
         #expect(throws: XtreamError.self) { try XtreamDecoder.vodStreams(Data("<html>".utf8), sourceID: sourceID, credentials: credentials) }
     }

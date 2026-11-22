@@ -23,27 +23,19 @@ public actor EPGRepository {
 
     /// Merged guide of every enabled source from the disk caches (source order = priority).
     public func cachedGuide(for sources: [Source]) async -> EPGGuide {
-        let cache = self.cache
-        let loaded = await withTaskGroup(of: (Int, SourceID, EPGGuide?, Date?).self) { group in
-            for (index, source) in sources.enumerated() where source.isEnabled {
-                group.addTask {
-                    if let entry = await cache.load(source.id) {
-                        return (index, source.id, await Self.makeGuide(entry.programs, channels: entry.channels), entry.fetchedAt)
-                    }
-                    if DemoContent.isDemo(source) { return (index, source.id, DemoContent.makeGuide(), nil) }
-                    return (index, source.id, nil, nil)
-                }
-            }
-            var results: [(Int, SourceID, EPGGuide?, Date?)] = []
-            for await result in group { results.append(result) }
-            return results.sorted { $0.0 < $1.0 }
-        }
         var ordered: [EPGGuide] = []
-        for (_, id, guide, date) in loaded {
-            guard let guide else { continue }
-            guides[id] = guide
-            if let date { fetchedAt[id] = date }
-            ordered.append(guide)
+        for source in sources where source.isEnabled {
+            guard !Task.isCancelled else { return .empty }
+            if let entry = await cache.load(source.id) {
+                let guide = await Self.makeGuide(entry.programs, channels: entry.channels)
+                guides[source.id] = guide
+                fetchedAt[source.id] = entry.fetchedAt
+                ordered.append(guide)
+            } else if DemoContent.isDemo(source) {
+                let guide = DemoContent.makeGuide()
+                guides[source.id] = guide
+                ordered.append(guide)
+            }
         }
         return await Self.merge(ordered)
     }

@@ -8,6 +8,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
     private let height: CGFloat?
     private let showsDots: Bool
     private let isInteractive: Bool
+    private let extendsUnderSidebar: Bool
     private let content: (Item) -> Content
     @Binding private var externalIndex: Int?
 
@@ -26,6 +27,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         showsDots: Bool = true,
         index: Binding<Int?> = .constant(nil),
         isInteractive: Bool = true,
+        extendsUnderSidebar: Bool = false,
         @ViewBuilder content: @escaping (Item) -> Content
     ) {
         self.items = items
@@ -33,6 +35,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         self.height = height
         self.showsDots = showsDots
         self.isInteractive = isInteractive
+        self.extendsUnderSidebar = extendsUnderSidebar
         self.content = content
         _externalIndex = index
         let initial = min(max(index.wrappedValue ?? 0, 0), max(items.count - 1, 0))
@@ -63,6 +66,8 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         .frame(height: height)
         .frame(maxWidth: .infinity)
         .clipped()
+        // Keep page transitions clipped, then let the system extend their backdrop under the sidebar.
+        .backgroundExtensionEffect(isEnabled: extendsUnderSidebar)
         .overlay(alignment: .bottom) { navigationControls }
         .background {
             WindowOcclusionReader(isVisible: $isWindowVisible)

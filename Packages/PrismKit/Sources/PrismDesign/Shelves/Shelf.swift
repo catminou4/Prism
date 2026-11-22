@@ -26,9 +26,11 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     private let spacing: CGFloat
     private let margin: CGFloat
     private let onHeaderTap: (() -> Void)?
+    private let posterArtwork: KeyPath<Item, URL?>?
     private let card: (Item) -> Card
 
-    @State private var position = ScrollPosition()
+    @State private var leadingItem: Item.ID?
+    @State private var isVisible = false
     @State private var viewport = ShelfViewport()
     @State private var scrollAvailability = ScrollAvailability()
     @State private var measuredWidth: CGFloat = 0
@@ -36,6 +38,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     @Environment(\.prismShelfViewportWidth) private var layoutWidth
     @Environment(\.prismSnapshotHover) private var forcedHover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
 
     private var isHovered: Bool { hovering || forcedHover }
 
@@ -47,6 +50,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         spacing: CGFloat = PrismMetrics.cardSpacing,
         margin: CGFloat = PrismMetrics.contentMargin,
         onHeaderTap: (() -> Void)? = nil,
+        posterArtwork: KeyPath<Item, URL?>? = nil,
         @ViewBuilder card: @escaping (Item) -> Card
     ) {
         self.title = title
@@ -56,6 +60,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         self.spacing = spacing
         self.margin = margin
         self.onHeaderTap = onHeaderTap
+        self.posterArtwork = posterArtwork
         self.card = card
     }
 
@@ -71,6 +76,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     public var body: some View {
+        let warm = warmRequest
         VStack(alignment: .leading, spacing: PrismMetrics.shelfHeaderSpacing) {
             if let title {
                 ShelfHeader(title, subtitle: subtitle, action: onHeaderTap)
@@ -80,6 +86,35 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
             }
             row
         }
+        .onScrollVisibilityChange(threshold: 0.15) { visible in
+            if posterArtwork != nil { isVisible = visible }
+        }
+        .task(id: warm, priority: .utility) {
+            guard let warm else { return }
+            // Avoid queuing artwork for shelves passed during a quick scroll.
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            ImagePipeline.shared.warm(warm.urls, pixelSize: warm.pixelSize)
+        }
+    }
+
+    private struct WarmRequest: Equatable {
+        let urls: [URL]
+        let pixelSize: CGSize
+    }
+
+    private var warmRequest: WarmRequest? {
+        guard let posterArtwork, isVisible, !items.isEmpty else { return nil }
+        let width = itemWidth
+        let available = (layoutWidth ?? measuredWidth) - margin * 2
+        guard available > 0, width > 0 else { return nil }
+        let leading = leadingItem.flatMap { id in items.firstIndex { $0.id == id } } ?? 0
+        let columns = max(1, Int((available + spacing) / (width + spacing)))
+        let first = min(items.count, leading + columns)
+        let urls = items.dropFirst(first).prefix(6).compactMap { $0[keyPath: posterArtwork] }
+        guard !urls.isEmpty else { return nil }
+        let size = CGSize(width: width, height: (width / PrismMetrics.posterAspectRatio).rounded())
+        return WarmRequest(urls: urls, pixelSize: RemoteImage.pixelSize(forPointSize: size, scale: displayScale))
     }
 
     private var row: some View {
@@ -101,7 +136,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .contentMargins(.horizontal, margin, for: .scrollContent)
         .defaultScrollAnchor(.leading, for: .initialOffset)
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
-        .scrollPosition($position)
+        .scrollPosition(id: $leadingItem, anchor: .leading)
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
@@ -138,11 +173,15 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     private func page(_ edge: HorizontalEdge) {
+        guard !items.isEmpty else { return }
         let edges = viewport.edges
         let page = max(edges.width - margin * 2 + spacing, 100)
         let target = edge == .leading ? max(edges.offset - page, edges.minOffset) : min(edges.offset + page, edges.maxOffset)
+        let offset = (target - edges.minOffset) / max(1, itemWidth + spacing)
+        let index = Int(offset.rounded(edge == .leading ? .down : .up))
+        let destination = items[min(max(index, 0), items.count - 1)].id
         withAnimation(reduceMotion ? nil : PrismMotion.standard) {
-            position.scrollTo(x: target)
+            leadingItem = destination
         }
     }
 }

@@ -49,7 +49,7 @@ public enum DemoContent {
         var programs: [EPGProgram] = []
         for channel in channels {
             guard let epgID = channel.epgID else { continue }
-            let blocks = guideBlocks[channel.categoryID ?? ""] ?? guideBlocks["info"] ?? []
+            let blocks = channel.categoryID.flatMap { guideBlocks[$0] } ?? guideBlocks[categoryID(.live, "info")] ?? []
             guard !blocks.isEmpty else { continue }
             var start = hour.addingTimeInterval(-6 * 3_600)
             var index = Int(SafeFileName.stableHash(channel.nativeID) % UInt64(blocks.count))
@@ -302,19 +302,19 @@ public enum DemoContent {
     }
 
     private static let guideBlocks: [String: [GuideBlock]] = [
-        "info": [
+        categoryID(.live, "info"): [
             GuideBlock(title: "Le journal", summary: "Les titres de l’actualité internationale.", category: "Information", minutes: 30),
             GuideBlock(title: "Information en continu", summary: "Actualité, reportages et analyses.", category: "Information", minutes: 60),
             GuideBlock(title: "Le débat", summary: "Experts et invités décryptent l’actualité.", category: "Débat", minutes: 30),
             GuideBlock(title: "Économie", summary: "Marchés, entreprises et tendances.", category: "Économie", minutes: 30),
             GuideBlock(title: "Reportages", summary: "Grands formats et documentaires d’actualité.", category: "Magazine", minutes: 60),
         ],
-        "sport": [
+        categoryID(.live, "sport"): [
             GuideBlock(title: "Sports extrêmes", summary: "Glisse, VTT, escalade et sensations fortes.", category: "Sport", minutes: 60),
             GuideBlock(title: "Aventure", summary: "Expéditions et défis aux quatre coins du monde.", category: "Documentaire", minutes: 90),
             GuideBlock(title: "En direct", summary: "Retransmission d’un événement sportif.", category: "Sport", minutes: 120),
         ],
-        "demo": [
+        categoryID(.live, "demo"): [
             GuideBlock(title: "Démo HLS en boucle", summary: "Flux de démonstration Apple pour tester la lecture adaptative.", category: "Démo", minutes: 60),
         ],
     ]

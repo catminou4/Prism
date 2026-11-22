@@ -257,7 +257,8 @@ struct RepositoryTests {
         #expect(epg.guideURLs(for: source, playlistEPGURLs: []).first?.path == "/xmltv.php")
     }
 
-    @Test func failedXtreamEndpointKeepsThePreviousList() async throws {
+    @Test(arguments: [false, true])
+    func failedXtreamEndpointKeepsThePreviousList(authError: Bool) async throws {
         let host = StubURLProtocol.uniqueHost("xtream-partial")
         StubURLProtocol.register(host: host, handler: Self.xtreamHandler)
         defer { StubURLProtocol.unregister(host: host) }
@@ -272,7 +273,8 @@ struct RepositoryTests {
         // The VOD endpoints now fail: films and their categories must survive the refresh.
         StubURLProtocol.register(host: host) { request in
             switch request.queryValue("action") {
-            case "get_vod_streams", "get_vod_categories": .text("Internal error", status: 500)
+            case "get_vod_streams", "get_vod_categories":
+                authError ? .json(#"{"user_info":{"auth":"0"}}"#) : .text("Internal error", status: 500)
             default: Self.xtreamHandler(request)
             }
         }

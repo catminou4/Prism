@@ -317,6 +317,7 @@ public final class PlayerController {
         lastObservedTime = -1
         firstObservedTime = nil
         lastProgressAt = uptime()
+        isPictureInPictureActive = false
         isPictureInPictureSupported = newEngine.supportsPictureInPicture
         routingPlayer = newEngine.routingPlayer
         supportsAspectRatioOverride = newEngine.supportsAspectRatioOverride

@@ -47,6 +47,14 @@ struct SourceImportTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(reopened.searchIndex?.search("premier contact").movies.count == 1)
+
+        reopened.remove(source.id)
+        #expect(reopened.phase == .onboarding)
+        let removalDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !reopened.catalog.isEmpty, ContinuousClock.now < removalDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(reopened.catalog.isEmpty)
     }
 
     @Test func failedNewSourceDoesNotStayInTheLibrary() async {

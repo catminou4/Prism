@@ -59,6 +59,31 @@ struct XMLTVParserTests {
         #expect(gz.channels == plain.channels)
     }
 
+    @Test func zlibIsTransparentAndRejectsOversizedOutput() throws {
+        let compressed = try #require(Data(base64Encoded: "eJyzKSmzs0nOSMzLS81RyEyxVSpRsrNJySwuyEms1M1LzE21C0ktLrHRRxGy0YfqALKA+gE5Sxf6"))
+        #expect(Gzip.isCompressed(compressed))
+        #expect(try XMLTVParser.parse(compressed).channels.first?.id == "t")
+        #expect(throws: XMLTVError.decompressionFailed) {
+            try Gzip.decompress(compressed, maximumOutputSize: 10)
+        }
+    }
+
+    @Test func namespacedProgrammesWithTheSameStartUseTheNextDistinctStart() throws {
+        let document = try XMLTVParser.parse(Data("""
+        <tv:tv xmlns:tv="urn:xmltv">
+          <tv:channel id="t"><tv:display-name>Test</tv:display-name></tv:channel>
+          <tv:programme channel="t" start="20250101123000"><tv:title>Suite</tv:title></tv:programme>
+          <tv:programme channel="t" start="20250101120000"><tv:title>Journal</tv:title></tv:programme>
+          <tv:programme channel="t" start="20250101120000"><tv:title>Actualités</tv:title></tv:programme>
+        </tv:tv>
+        """.utf8))
+        #expect(document.channels.first?.displayNames == ["Test"])
+        #expect(document.programs.map(\.title) == ["Suite", "Journal", "Actualités"])
+        #expect(document.programs.map(\.end) == [
+            date("2025-01-01T13:30:00Z"), date("2025-01-01T12:30:00Z"), date("2025-01-01T12:30:00Z")
+        ])
+    }
+
     @Test func retainsMultipleProgrammeCategories() throws {
         let input = Data("""
             <tv><programme channel="basket.example" start="20250101120000 +0000" stop="20250101140000 +0000">

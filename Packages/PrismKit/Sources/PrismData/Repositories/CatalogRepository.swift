@@ -19,20 +19,16 @@ public actor CatalogRepository {
 
     // MARK: - Cache
 
-    /// Cached catalogs of `sources` (decoded in parallel), in `sources` order. The demo source never
-    /// needs a cache.
+    /// Cached catalogs in source order. Decode one source at a time to bound launch memory.
     public func cachedCatalogs(for sources: [Source]) async -> [SourceCatalog] {
-        let cache = self.cache
-        let loaded = await withTaskGroup(of: (Int, SourceCatalog?).self) { group in
-            for (index, source) in sources.enumerated() {
-                group.addTask {
-                    if DemoContent.isDemo(source) { return (index, DemoContent.makeCatalog()) }
-                    return (index, await cache.load(source.id))
-                }
+        var loaded: [SourceCatalog] = []
+        for source in sources {
+            guard !Task.isCancelled else { return [] }
+            if DemoContent.isDemo(source) {
+                loaded.append(DemoContent.makeCatalog())
+            } else if let catalog = await cache.load(source.id) {
+                loaded.append(catalog)
             }
-            var results: [(Int, SourceCatalog?)] = []
-            for await result in group { results.append(result) }
-            return results.sorted { $0.0 < $1.0 }.compactMap(\.1)
         }
         for catalog in loaded where lastCatalogs[catalog.sourceID] == nil {
             lastCatalogs[catalog.sourceID] = catalog

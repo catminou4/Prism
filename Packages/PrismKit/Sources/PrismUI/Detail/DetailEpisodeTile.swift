@@ -30,6 +30,7 @@ struct DetailEpisodeTile: View {
         let width = cardWidth ?? 252
         let artworkHeight = (width / PrismMetrics.wideAspectRatio).rounded()
         let size = CGSize(width: width, height: artworkHeight + 101)
+        let imageSize = CGSize(width: width, height: artworkHeight + 31)
         Button(action: onPlay) {
             ZStack(alignment: .topLeading) {
                 Color(white: 0.10)
@@ -38,10 +39,11 @@ struct DetailEpisodeTile: View {
                         url: stillURL, size: size, placeholderSeed: episode.id.rawValue,
                         blurRadius: 24, showsPlaceholder: false
                     )
+                    .blursArtwork(sized: imageSize)
                     .opacity(0.28)
                     .accessibilityHidden(true)
                 }
-                image(size: CGSize(width: width, height: artworkHeight + 31))
+                image(size: imageSize)
                 caption
                     .padding(.horizontal, 13)
                     .padding(.bottom, 14)

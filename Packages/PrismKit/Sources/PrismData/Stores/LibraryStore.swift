@@ -44,10 +44,20 @@ public final class LibraryStore {
     public private(set) var watchlist: [TitleID] = []
     /// Channel group ids, in user order.
     public private(set) var favoriteChannels: [String] = []
-    public private(set) var progress: [ContentID: PlaybackProgress] = [:]
-    public private(set) var watched: Set<ContentID> = []
+    public private(set) var progress: [ContentID: PlaybackProgress] = [:] {
+        didSet {
+            latestByTitle = nil
+            continueWatchingRevision &+= 1
+        }
+    }
+    public private(set) var watched: Set<ContentID> = [] {
+        didSet { continueWatchingRevision &+= 1 }
+    }
     /// Newest first, deduplicated by entry id, at most `maxHistory` entries.
-    public private(set) var history: [HistoryEntry] = []
+    public private(set) var history: [HistoryEntry] = [] {
+        didSet { continueWatchingRevision &+= 1 }
+    }
+    public private(set) var continueWatchingRevision = 0
     public private(set) var preferredVariants: [TitleID: ContentID] = [:]
     public private(set) var preferredChannelVariants: [String: ContentID] = [:]
     /// Titles the user marked “Pas intéressé”: never suggested again by the curated shelves.
@@ -75,6 +85,7 @@ public final class LibraryStore {
     @ObservationIgnored private(set) var saveCount = 0
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private let writer = LibraryWriter()
+    @ObservationIgnored private var latestByTitle: [TitleID: PlaybackProgress]?
 
     /// Loads `library.json` synchronously (small file).
     public convenience init(directories: AppDirectories, saveDelay: Duration = .milliseconds(1_500)) {
@@ -172,7 +183,12 @@ public final class LibraryStore {
 
     /// Latest progress recorded for any content of a grouped title.
     public func latestProgress(forTitle id: TitleID) -> PlaybackProgress? {
-        progress.values.filter { $0.titleID == id }.max { $0.updatedAt < $1.updatedAt }
+        // Read the observed change token even when the index is already built.
+        _ = continueWatchingRevision
+        if latestByTitle == nil {
+            latestByTitle = Self.latestEntries(in: progress)
+        }
+        return latestByTitle?[id]
     }
 
     /// Updates the resume point in memory immediately; the disk write is debounced.
@@ -181,7 +197,7 @@ public final class LibraryStore {
         var value = newValue
         if value.titleID == nil { value.titleID = progress[value.contentID]?.titleID }
         progress[value.contentID] = value
-        if value.isFinished { watched.insert(value.contentID) }
+        if value.isFinished, !watched.contains(value.contentID) { watched.insert(value.contentID) }
         pruneProgressIfNeeded()
         scheduleSave()
     }
@@ -199,6 +215,7 @@ public final class LibraryStore {
         progress[id] = PlaybackProgress(
             contentID: id, titleID: titleID ?? existing?.titleID, position: duration, duration: duration, updatedAt: .now
         )
+        pruneProgressIfNeeded()
         scheduleSave()
     }
 
@@ -299,33 +316,65 @@ public final class LibraryStore {
 
     // MARK: - Continue watching
 
-    /// Movies in progress, episodes to resume and next episodes, newest activity first.
-    public func continueWatching(in catalog: Catalog, limit: Int = 20) -> [ContinueWatchingItem] {
-        guard limit > 0 else { return [] }
+    nonisolated private static func latestEntries(
+        in progress: [ContentID: PlaybackProgress], catalog: Catalog? = nil
+    ) -> [TitleID: PlaybackProgress] {
         var latest: [TitleID: PlaybackProgress] = [:]
         for entry in progress.values {
-            guard let titleID = entry.titleID ?? catalog.titleID(containing: entry.contentID) else { continue }
+            guard let titleID = entry.titleID ?? catalog?.titleID(containing: entry.contentID) else { continue }
             if let existing = latest[titleID],
                existing.updatedAt > entry.updatedAt || (existing.updatedAt == entry.updatedAt && existing.contentID > entry.contentID) {
                 continue
             }
             latest[titleID] = entry
         }
+        return latest
+    }
 
+    /// Movies in progress, episodes to resume and next episodes, newest activity first.
+    public func continueWatching(in catalog: Catalog, limit: Int = 20) -> [ContinueWatchingItem] {
+        Self.continueWatching(in: catalog, limit: limit, progress: progress, watched: watched, history: history)
+    }
+
+    /// Snapshot the library on the main actor, then resolve and sort the shelf on a worker.
+    public func loadContinueWatching(in catalog: Catalog, limit: Int) async -> [ContinueWatchingItem] {
+        await Self.buildContinueWatching(in: catalog, limit: limit, progress: progress, watched: watched, history: history)
+    }
+
+    @concurrent private static func buildContinueWatching(
+        in catalog: Catalog, limit: Int, progress: [ContentID: PlaybackProgress],
+        watched: Set<ContentID>, history: [HistoryEntry]
+    ) async -> [ContinueWatchingItem] {
+        continueWatching(in: catalog, limit: limit, progress: progress, watched: watched, history: history)
+    }
+
+    nonisolated private static func continueWatching(
+        in catalog: Catalog, limit: Int, progress: [ContentID: PlaybackProgress],
+        watched: Set<ContentID>, history: [HistoryEntry]
+    ) -> [ContinueWatchingItem] {
+        guard limit > 0, !Task.isCancelled else { return [] }
+        let latest = latestEntries(in: progress, catalog: catalog)
+        let ordered = latest.sorted {
+            $0.value.updatedAt != $1.value.updatedAt ? $0.value.updatedAt > $1.value.updatedAt : $0.key.rawValue < $1.key.rawValue
+        }
         var items: [ContinueWatchingItem] = []
-        for (titleID, entry) in latest {
+        for (titleID, entry) in ordered {
+            if Task.isCancelled { return [] }
+            if items.count == limit { break }
             guard let title = catalog.title(titleID) else { continue }
             switch title.kind {
             case .series:
+                guard entry.isFinished || entry.position >= 5 else { continue }
                 let location = Self.locateEpisode(entry.contentID, in: title)
                 if !entry.isFinished {
-                    guard entry.position >= 5 else { continue }
                     items.append(ContinueWatchingItem(
                         id: titleID.rawValue, title: title, contentID: entry.contentID, episode: location?.episode,
                         progress: entry, kind: .resume, updatedAt: entry.updatedAt
                     ))
                 } else if let location {
-                    guard let next = nextUnwatchedEpisode(after: location.episode, in: location.seasons) else { continue }
+                    guard let next = nextUnwatchedEpisode(after: location.episode, in: location.seasons, isWatched: {
+                        watched.contains($0) || progress[$0]?.isFinished == true
+                    }) else { continue }
                     items.append(ContinueWatchingItem(
                         id: titleID.rawValue, title: title, contentID: next.id, episode: next,
                         progress: progress[next.id], kind: .nextEpisode, updatedAt: entry.updatedAt
@@ -347,11 +396,11 @@ public final class LibraryStore {
         }
 
         // Series opened recently without any recorded progress.
-        let known = Set(latest.keys)
+        var addedFromHistory: Set<TitleID> = []
         for entry in history {
-            guard case .title(let titleID) = entry.target, !known.contains(titleID),
+            guard case .title(let titleID) = entry.target, latest[titleID] == nil,
                   let title = catalog.title(titleID), title.kind == .series,
-                  !items.contains(where: { $0.id == titleID.rawValue }) else { continue }
+                  addedFromHistory.insert(titleID).inserted else { continue }
             items.append(ContinueWatchingItem(
                 id: titleID.rawValue, title: title, contentID: entry.lastContentID, episode: nil,
                 progress: nil, kind: .startSeries, updatedAt: entry.watchedAt
@@ -362,7 +411,7 @@ public final class LibraryStore {
         return Array(items.prefix(limit))
     }
 
-    static func locateEpisode(_ id: ContentID, in title: MediaTitle) -> (episode: Episode, seasons: [Season])? {
+    nonisolated static func locateEpisode(_ id: ContentID, in title: MediaTitle) -> (episode: Episode, seasons: [Season])? {
         let source = id.sourceID
         for variant in title.variants {
             guard let series = variant.series, series.sourceID == source, let seasons = series.seasons else { continue }
@@ -373,7 +422,9 @@ public final class LibraryStore {
         return nil
     }
 
-    private func nextUnwatchedEpisode(after episode: Episode, in seasons: [Season]) -> Episode? {
+    nonisolated private static func nextUnwatchedEpisode(
+        after episode: Episode, in seasons: [Season], isWatched: (ContentID) -> Bool
+    ) -> Episode? {
         let ordered = seasons.sorted { $0.number < $1.number }
             .flatMap { $0.episodes.sorted { $0.number < $1.number } }
         guard let index = ordered.firstIndex(where: { $0.id == episode.id }) else { return nil }
@@ -388,7 +439,8 @@ public final class LibraryStore {
         saveTask = nil
         guard let fileURL else { return }
         generation += 1
-        writer.writeNow(snapshot(), generation: generation, to: fileURL)
+        let makeFile = snapshot()
+        writer.writeNow(makeFile(), generation: generation, to: fileURL)
         saveCount += 1
     }
 
@@ -403,14 +455,13 @@ public final class LibraryStore {
         }
     }
 
-    /// The state is captured here; encoding and the atomic write run off the main actor
-    /// (they took 10–50 ms with a full history, during playback).
+    /// Capture the current collections here. Sorting, encoding and the write run off the main actor.
     private func saveNow() {
         guard let fileURL else { return }
         generation += 1
-        let file = snapshot(), generation = generation, writer = writer
+        let makeFile = snapshot(), generation = generation, writer = writer
         saveCount += 1
-        Task.detached(priority: .utility) { writer.writeNow(file, generation: generation, to: fileURL) }
+        Task.detached(priority: .utility) { writer.writeNow(makeFile(), generation: generation, to: fileURL) }
     }
 
     private func pruneProgressIfNeeded() {
@@ -419,24 +470,28 @@ public final class LibraryStore {
         progress = Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
     }
 
-    private func snapshot() -> LibraryFile {
-        LibraryFile(
-            watchlist: watchlist,
-            favoriteChannels: favoriteChannels,
-            progress: progress.values.sorted { $0.contentID < $1.contentID },
-            watched: watched.sorted(),
-            history: history,
-            preferredVariants: preferredVariants.map { .init(key: $0.key.rawValue, contentID: $0.value) }.sorted { $0.key < $1.key },
-            preferredChannelVariants: preferredChannelVariants.map { .init(key: $0.key, contentID: $0.value) }.sorted { $0.key < $1.key },
-            lastChannelGroupID: storedLastChannelGroupID,
-            dismissed: dismissed
-        )
+    private func snapshot() -> @Sendable () -> LibraryFile {
+        { [watchlist, favoriteChannels, progress, watched, history, preferredVariants,
+           preferredChannelVariants, storedLastChannelGroupID, dismissed] in
+            LibraryFile(
+                watchlist: watchlist,
+                favoriteChannels: favoriteChannels,
+                progress: progress.values.sorted { $0.contentID < $1.contentID },
+                watched: watched.sorted(),
+                history: history,
+                preferredVariants: preferredVariants.map { .init(key: $0.key.rawValue, contentID: $0.value) }.sorted { $0.key < $1.key },
+                preferredChannelVariants: preferredChannelVariants.map { .init(key: $0.key, contentID: $0.value) }.sorted { $0.key < $1.key },
+                lastChannelGroupID: storedLastChannelGroupID,
+                dismissed: dismissed
+            )
+        }
     }
 
     private func apply(_ file: LibraryFile) {
         watchlist = file.watchlist
         favoriteChannels = file.favoriteChannels
         progress = Dictionary(file.progress.map { ($0.contentID, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
+        pruneProgressIfNeeded()
         watched = Set(file.watched)
         history = Array(file.history.prefix(Self.maxHistory))
         preferredVariants = Dictionary(file.preferredVariants.map { (TitleID(rawValue: $0.key), $0.contentID) }, uniquingKeysWith: { a, _ in a })

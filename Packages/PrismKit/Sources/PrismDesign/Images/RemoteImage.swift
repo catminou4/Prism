@@ -69,7 +69,7 @@ public struct RemoteImage: View {
         return ImagePipeline.key(url: url, pixelSize: pixels, fitting: fitting, blurRadius: blurRadius)
     }
 
-    func blursArtwork(sized sourceSize: CGSize) -> Self {
+    public func blursArtwork(sized sourceSize: CGSize) -> Self {
         var view = self
         view.blurSourceSize = sourceSize
         return view

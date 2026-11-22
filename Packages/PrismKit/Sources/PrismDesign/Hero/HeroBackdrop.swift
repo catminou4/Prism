@@ -61,10 +61,11 @@ public struct HeroBackdrop: View {
         ZStack {
             PlaceholderArtwork(seed: seed, style: .none)
             artwork
-                .modifier(BackgroundExtension(enabled: extendsUnderSidebar))
             scrims
         }
         .clipped()
+        // Extend the completed, clipped backdrop rather than clipping the extension itself.
+        .backgroundExtensionEffect(isEnabled: extendsUnderSidebar)
         .accessibilityHidden(true)
     }
 
@@ -116,13 +117,6 @@ public struct HeroBackdrop: View {
             if artwork.count == 4 { break }
         }
         return artwork
-    }
-}
-
-private struct BackgroundExtension: ViewModifier {
-    let enabled: Bool
-    func body(content: Content) -> some View {
-        if enabled { content.backgroundExtensionEffect() } else { content }
     }
 }
 

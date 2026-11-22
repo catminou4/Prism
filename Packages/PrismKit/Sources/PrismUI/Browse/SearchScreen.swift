@@ -47,8 +47,8 @@ struct SearchScreen: View {
                         title: "À découvrir",
                         items: app.recommendations.selection(for: app.homeAudioLanguages).highlights
                     )
-                } else if let result, resultRequest == request {
-                    if result.isEmpty {
+                } else if let result, resultRequest?.revision == request.revision {
+                    if result.isEmpty, resultRequest?.term == request.term {
                         ContentUnavailableView.search(text: request.term)
                     }
                     TitleShelf(title: "Films", items: result.movies)
@@ -85,6 +85,12 @@ struct SearchScreen: View {
             if isActive { await app.refreshFeed(app.curationRequest(for: .home)) }
         }
         .onChange(of: isActive, initial: true) { _, active in isFocused = active }
+        .onChange(of: request.term) { _, term in
+            if term.isEmpty {
+                result = nil
+                resultRequest = nil
+            }
+        }
     }
 
     private struct SearchRequest: Equatable {

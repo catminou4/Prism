@@ -73,6 +73,24 @@ struct M3UParserTests {
         #expect(playlist.epgURLs.isEmpty)
     }
 
+    @Test func invalidURLDiscardsEntryMetadataAndHeaders() throws {
+        let playlist = M3UParser.parse("""
+        #EXTM3U
+        #EXTINF:120 tvg-id="bad",Entrée invalide
+        #EXTVLCOPT:http-user-agent=Discarded
+        ftp://example.com/invalid
+        https://example.com/recovered.ts
+        #EXTINF:-1 user-agent="Prism",Entrée valide
+        https://example.com/valid.ts
+        """)
+        let recovered = try #require(playlist.entries.first)
+        #expect(playlist.entries.count == 2)
+        #expect(recovered.duration == -1)
+        #expect(recovered.attributes.isEmpty)
+        #expect(recovered.headers.isEmpty)
+        #expect(playlist.entries.last?.headers["User-Agent"] == "Prism")
+    }
+
     @Test func latin1Fallback() {
         var bytes = Array("#EXTM3U\n#EXTINF:-1 group-title=\"Ciné\",Am".utf8)
         bytes.removeLast(0)

@@ -51,7 +51,9 @@ private struct TitleDetailContent: View {
     @State private var seasonMetadata: SeasonMetadata?
     @State private var selectedSeason: Int?
     @State private var loadingEpisodes = true
+    @State private var isAtTop = true
     @State private var failedToLoadEpisodes = false
+    @State private var episodeFailureReason: String?
     @State private var retryCount = 0
     @State private var browseEditionID: ContentID?
     @State private var playbackSelection: TitlePlaybackSelection?
@@ -165,7 +167,19 @@ private struct TitleDetailContent: View {
                 }
                 .padding(.bottom, 52)
             }
+            .scrollContentBackground(.hidden)
+            .onScrollGeometryChange(for: Bool.self) { scroll in
+                scroll.contentOffset.y + scroll.contentInsets.top <= 1
+            } action: { _, atTop in
+                isAtTop = atTop
+            }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .background(alignment: .top) {
+                if isAtTop {
+                    HeroOverscrollBackground(backdropURLs: backdrops, fallbackPosterURLs: posters, seed: title.id.rawValue)
+                        .frame(height: Self.mastheadHeight(for: viewport.size.height))
+                }
+            }
             .ignoresSafeArea(.container, edges: .top)
         }
         .background(PrismColors.pageBackground)
@@ -229,7 +243,7 @@ private struct TitleDetailContent: View {
         } ?? (resuming ? "Reprendre" : "Lecture")
 
         return TitleDetailMasthead(
-            title: title, height: min(630, max(430, viewportHeight * 0.62)), metadata: enriched,
+            title: title, height: Self.mastheadHeight(for: viewportHeight), metadata: enriched,
             backdrops: backdrops, posters: posters, plot: plot, facts: facts,
             quality: movieDetail?.tech?.quality.badge ?? edition?.variant.quality.badge, playLabel: label,
             progress: resuming ? progress?.fraction : nil,
@@ -240,6 +254,10 @@ private struct TitleDetailContent: View {
             toggleWatchlist: { app.library.toggleWatchlist(title.id) },
             showEditions: { choosePlayback(episode: episode, alwaysShowPicker: true) }
         )
+    }
+
+    private static func mastheadHeight(for viewportHeight: CGFloat) -> CGFloat {
+        min(630, max(430, viewportHeight * 0.62))
     }
 
     private var episodes: some View {
@@ -327,9 +345,16 @@ private struct TitleDetailContent: View {
                 Text("Chargement des épisodes…")
             }
         } else if failedToLoadEpisodes {
-            HStack(spacing: 12) {
-                Label("Impossible de charger les épisodes.", systemImage: "exclamationmark.circle")
-                Button("Réessayer") { retryCount += 1 }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 12) {
+                    Label("Impossible de charger les épisodes.", systemImage: "exclamationmark.circle")
+                    Button("Réessayer") { retryCount += 1 }
+                }
+                if let episodeFailureReason {
+                    Text(episodeFailureReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         } else {
             Label("Aucun épisode disponible dans vos sources.", systemImage: "tv")
@@ -563,6 +588,7 @@ private struct TitleDetailContent: View {
         }
 
         failedToLoadEpisodes = false
+        episodeFailureReason = nil
         if inventory?.edition.id != ordered.first?.id {
             inventory = nil
         }
@@ -584,11 +610,27 @@ private struct TitleDetailContent: View {
                 }
             } catch {
                 encounteredFailure = true
+                if episodeFailureReason == nil { episodeFailureReason = Self.episodeErrorDescription(error) }
             }
         }
         guard !Task.isCancelled else { return }
         failedToLoadEpisodes = encounteredFailure
         loadingEpisodes = false
+    }
+
+    private static func episodeErrorDescription(_ error: any Error) -> String {
+        if let error = error as? XtreamError {
+            switch error {
+            case .network:
+                return "Connexion au serveur impossible. Vérifiez votre connexion ou réessayez plus tard."
+            default:
+                return error.errorDescription ?? "La source n’a pas répondu correctement."
+            }
+        }
+        if (error as? SourceError) == .missingCredentials {
+            return "Les identifiants de cette source sont introuvables. Vérifiez les réglages de la source."
+        }
+        return "La source n’a pas répondu correctement. Réessayez ou vérifiez ses réglages."
     }
 
     private func loadAlternateMovieSynopsis(from edition: TitleEdition?) async {

@@ -3,14 +3,22 @@ import zlib
 
 /// Streaming gzip / zlib inflater (zlib `inflateInit2` with automatic header detection).
 public enum Gzip {
-    /// True when `data` starts with the gzip magic bytes `1F 8B`.
+    /// Recognizes the gzip magic bytes and valid zlib DEFLATE headers.
     public static func isCompressed(_ data: Data) -> Bool {
-        data.count >= 2 && data[data.startIndex] == 0x1F && data[data.startIndex + 1] == 0x8B
+        guard data.count >= 2 else { return false }
+        let method = data[data.startIndex]
+        let flags = data[data.startIndex + 1]
+        if method == 0x1F && flags == 0x8B { return true }
+        return method & 0x0F == 8 && method >> 4 <= 7 && (Int(method) * 256 + Int(flags)) % 31 == 0
     }
 
     /// Inflates gzip (or zlib) data in 256 KB chunks. Multi-member gzip files are concatenated.
-    /// Truncated input returns what could be decoded; throws only when nothing could be inflated.
+    /// Truncated input returns what could be decoded. Oversized output is rejected.
     public static func decompress(_ data: Data) throws -> Data {
+        try decompress(data, maximumOutputSize: 1 << 30)
+    }
+
+    static func decompress(_ data: Data, maximumOutputSize: Int) throws -> Data {
         guard !data.isEmpty else { return Data() }
         var stream = z_stream()
         // 32 + MAX_WBITS: auto-detect gzip or zlib headers (16 + MAX_WBITS would be gzip only).
@@ -21,12 +29,12 @@ public enum Gzip {
 
         let chunkSize = 1 << 18
         var output = Data()
-        output.reserveCapacity(min(data.count * 8, 512 << 20))
+        output.reserveCapacity(min(min(data.count, 16 << 20) * 4, maximumOutputSize))
         let chunk = UnsafeMutablePointer<Bytef>.allocate(capacity: chunkSize)
         defer { chunk.deallocate() }
         var failed = false
 
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.bindMemory(to: Bytef.self).baseAddress else { return }
             var offset = 0
             let total = raw.count
@@ -42,6 +50,7 @@ public enum Gzip {
                 stream.avail_out = uInt(chunkSize)
                 status = inflate(&stream, Z_NO_FLUSH)
                 let produced = chunkSize - Int(stream.avail_out)
+                guard produced <= maximumOutputSize - output.count else { throw XMLTVError.decompressionFailed }
                 if produced > 0 { output.append(chunk, count: produced) }
 
                 if status == Z_STREAM_END {

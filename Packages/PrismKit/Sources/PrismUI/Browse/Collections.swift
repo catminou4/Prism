@@ -32,6 +32,35 @@ struct TitleGrid: View {
     }
 }
 
+/// Keeps the last shelf visible while a playback checkpoint is resolved in the background.
+struct ContinueWatchingContent<Content: View>: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.isPageActive) private var isActive
+    @State private var items: [ContinueWatchingItem]?
+    @State private var loadedRequest: Request?
+    let limit: Int
+    @ViewBuilder let content: ([ContinueWatchingItem]?) -> Content
+
+    private struct Request: Equatable {
+        let catalog: Int
+        let library: Int
+    }
+
+    var body: some View {
+        let catalogRevision = app.catalogRevision
+        let request = isActive ? Request(catalog: catalogRevision, library: app.library.continueWatchingRevision) : nil
+        content(loadedRequest?.catalog == catalogRevision ? items : nil)
+            .task(id: request, priority: .utility) {
+                guard let request, request != loadedRequest else { return }
+                let updated = await app.library.loadContinueWatching(in: app.catalog, limit: limit)
+                guard !Task.isCancelled, request.catalog == app.catalogRevision,
+                      request.library == app.library.continueWatchingRevision else { return }
+                loadedRequest = request
+                items = updated
+            }
+    }
+}
+
 /// How a "Voir tout" page orders its titles.
 enum CollectionSort: String, CaseIterable, Identifiable, Sendable {
     case relevance, rating, newest, recentlyAdded, title
@@ -95,6 +124,35 @@ struct CollectionView: View {
     }
 
     var body: some View {
+        if collection == .continueWatching {
+            ContinueWatchingContent(limit: 80) { items in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 22) {
+                        header(count: items?.count)
+                        if let items {
+                            if items.isEmpty {
+                                emptyMessage
+                            } else {
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 20)], spacing: 20) {
+                                    ForEach(items) { ResumeCard(item: $0).rowEntrance() }
+                                }
+                                .padding(.horizontal, PrismMetrics.contentMargin)
+                            }
+                        } else {
+                            loadingIndicator
+                        }
+                    }
+                    .padding(.vertical, 24)
+                    .padding(.bottom, 28)
+                }
+                .scrollEdgeEffectStyle(.soft, for: .top)
+            }
+        } else {
+            titlesPage
+        }
+    }
+
+    private var titlesPage: some View {
         let request = isActive ? loadRequest : nil
         let source = items
         let key = source.map { ArrangeKey(source: sourceRevision($0), sort: sort, genre: genre) }
@@ -103,24 +161,14 @@ struct CollectionView: View {
         } else {
             nil
         }
-        GeometryReader { geometry in
+        return GeometryReader { geometry in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
                     header(count: visible?.count)
-                    if let genres = resolved?.genres, genres.count > 2, collection != .continueWatching {
+                    if let genres = resolved?.genres, genres.count > 2 {
                         ChipBar(items: genres, selection: $genre)
                     }
-                    if collection == .continueWatching {
-                        let items = app.library.continueWatching(in: app.catalog, limit: 80)
-                        if items.isEmpty {
-                            emptyMessage
-                        } else {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 20)], spacing: 20) {
-                                ForEach(items) { ResumeCard(item: $0).rowEntrance() }
-                            }
-                            .padding(.horizontal, PrismMetrics.contentMargin)
-                        }
-                    } else if let titles = visible {
+                    if let titles = visible {
                         if titles.isEmpty {
                             emptyMessage
                         } else {
@@ -129,7 +177,7 @@ struct CollectionView: View {
                                 .transition(.opacity)
                         }
                     } else {
-                        ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
+                        loadingIndicator
                     }
                 }
                 .padding(.vertical, 24)
@@ -164,6 +212,10 @@ struct CollectionView: View {
         .onChange(of: resolved?.genres.map(\.id)) { _, ids in
             if let genre, genre != Self.allGenres, ids?.contains(genre) != true { self.genre = Self.allGenres }
         }
+    }
+
+    private var loadingIndicator: some View {
+        ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(.top, 40)
     }
 
     private func header(count: Int?) -> some View {

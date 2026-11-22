@@ -58,10 +58,20 @@ struct BrowseScreen: View {
                 // instead of popping.
                 .animation(reduceMotion ? nil : PrismMotion.entrance, value: feed.shelves.map(\.id))
             }
+            .scrollContentBackground(.hidden)
+            .onScrollGeometryChange(for: Bool.self) { scroll in
+                scroll.contentOffset.y + scroll.contentInsets.top <= 1
+            } action: { _, atTop in
+                motion.isAtTop = atTop
+            }
             .onScrollPhaseChange { _, phase in
                 if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .background(alignment: .top) {
+                BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
+                    .frame(height: heroHeight)
+            }
             .ignoresSafeArea(.container, edges: feed.highlights.isEmpty ? [] : .top)
         }
         .modifier(BrowseFeedRefresh(scope: scope))
@@ -115,14 +125,15 @@ private struct HomeLibraryShelves: View {
     @Environment(NavigationModel.self) private var navigation
 
     var body: some View {
-        let watching = app.library.continueWatching(in: app.catalog, limit: 14)
-        if !watching.isEmpty {
-            Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
-                navigation.push(.collection(.continueWatching))
-            }) { item in
-                ResumeCard(item: item)
+        ContinueWatchingContent(limit: 14) { watching in
+            if let watching, !watching.isEmpty {
+                Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
+                    navigation.push(.collection(.continueWatching))
+                }) { item in
+                    ResumeCard(item: item)
+                }
+                .rowEntrance()
             }
-            .rowEntrance()
         }
         SportsHomeShelf()
             .rowEntrance()
@@ -137,6 +148,25 @@ private struct HomeLibraryShelves: View {
 /// Only the carousel reads scroll phase, so starting a scroll leaves the shelves alone.
 @Observable private final class BrowseScrollActivity {
     var isScrolling = false
+    var isAtTop = true
+    var heroIndex = 0
+}
+
+private struct BrowseOverscrollBackground: View {
+    @Environment(AppModel.self) private var app
+    let highlights: [CuratedHighlight]
+    let motion: BrowseScrollActivity
+
+    var body: some View {
+        if motion.isAtTop, !highlights.isEmpty {
+            let title = highlights[min(max(motion.heroIndex, 0), highlights.count - 1)].title
+            HeroOverscrollBackground(
+                backdropURLs: app.heroArtwork.backdropURLs(for: title),
+                fallbackPosterURLs: app.heroArtwork.posterURLs(for: title), seed: title.id.rawValue
+            )
+            .id(title.id)
+        }
+    }
 }
 
 /// Hero carousel of a browse page, with the next page's artwork decoded ahead of time.
@@ -158,7 +188,7 @@ private struct BrowseHero: View {
         let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
             items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
-            height: height, index: $selected, isInteractive: isActive
+            height: height, index: $selected, isInteractive: isActive, extendsUnderSidebar: true
         ) { highlight in
             HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
         }
@@ -169,6 +199,7 @@ private struct BrowseHero: View {
                 .padding(.trailing, 18)
         }
         .onScrollVisibilityChange(threshold: 0.15) { isVisible = $0 }
+        .onChange(of: selected, initial: true) { _, index in motion.heroIndex = index ?? 0 }
         .task(id: preload, priority: .utility) {
             guard let preload else { return }
             // Give visible artwork first use of network and decode slots after a gesture.
@@ -354,7 +385,7 @@ private struct HighlightPage: View {
             HeroBackdrop(
                 backdropURLs: app.heroArtwork.backdropURLs(for: title), seed: title.id.rawValue,
                 fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
-                leadingScrim: 0.72, extendsUnderSidebar: true, artSize: size
+                leadingScrim: 0.72, artSize: size
             )
             VStack(alignment: .leading, spacing: 10) {
                 if let label = highlight.label { LabelPill(label).staggeredReveal(revealed, order: 0) }
@@ -454,6 +485,7 @@ struct BrowseHeading: View {
 }
 
 struct TitleShelf: View {
+    @Environment(\.isPageActive) private var isActive
     let title: String
     var subtitle: String? = nil
     let items: [MediaTitle]
@@ -461,7 +493,8 @@ struct TitleShelf: View {
 
     var body: some View {
         if !items.isEmpty {
-            Shelf(title: title, subtitle: subtitle, items: items, onHeaderTap: action) { item in
+            Shelf(title: title, subtitle: subtitle, items: items, onHeaderTap: action,
+                  posterArtwork: isActive ? \.posterURL : nil) { item in
                 BrowsePoster(item: item)
             }
         }
@@ -470,6 +503,7 @@ struct TitleShelf: View {
 
 /// Apple TV "Top 10" row: posters with large rank numerals.
 struct RankedTitleShelf: View {
+    @Environment(\.isPageActive) private var isActive
     let title: String
     var subtitle: String? = nil
     let items: [MediaTitle]
@@ -479,13 +513,14 @@ struct RankedTitleShelf: View {
         let rank: Int
         let title: MediaTitle
         var id: TitleID { title.id }
+        var posterURL: URL? { title.posterURL }
     }
 
     var body: some View {
         Shelf(
             title: title, subtitle: subtitle,
             items: items.prefix(10).enumerated().map { Entry(rank: $0.offset + 1, title: $0.element) },
-            onHeaderTap: action
+            onHeaderTap: action, posterArtwork: isActive ? \.posterURL : nil
         ) { entry in
             BrowsePoster(item: entry.title, rank: entry.rank)
         }
