@@ -1,8 +1,8 @@
 import Foundation
 import PrismCore
 
-public struct SeriesCast: Sendable {
-    public struct Person: Identifiable, Sendable {
+public struct SeriesCast: Sendable, Codable {
+    public struct Person: Identifiable, Sendable, Codable {
         public let id: Int
         public let name: String
         public let role: String?
@@ -15,10 +15,13 @@ public struct SeriesCast: Sendable {
 
 /// Looks up a single series page using only its title and premiere year.
 public actor SeriesCastRepository {
-    public static let shared = SeriesCastRepository()
+    public static let shared = SeriesCastRepository(directory: AppDirectories.standard.metadataCacheDirectory)
 
     private let client: HTTPClient
     private let host: String
+    /// Where answers (cast or "no exact match") survive relaunches; `nil` keeps them in memory
+    /// only. Without it every launch paid the search + cast request pair again per series page.
+    private let directory: URL?
     private var cache: [Lookup: Cached] = [:]
     /// Concurrent lookups of the same (title, year) share one request pair.
     private var inFlight: [Lookup: CastRequest] = [:]
@@ -28,13 +31,14 @@ public actor SeriesCastRepository {
         let task: Task<SeriesCast?, Never>
     }
 
-    public init(session: URLSession = PrismURLSession.shared) {
-        self.init(session: session, host: "api.tvmaze.com")
+    public init(session: URLSession = PrismURLSession.shared, directory: URL? = nil) {
+        self.init(session: session, host: "api.tvmaze.com", directory: directory)
     }
 
-    init(session: URLSession, host: String) {
+    init(session: URLSession, host: String, directory: URL? = nil) {
         self.client = HTTPClient(session: session, userAgent: nil)
         self.host = host
+        self.directory = directory
     }
 
     public func cast(title: String, year: Int) async -> SeriesCast? {
@@ -59,21 +63,46 @@ public actor SeriesCastRepository {
     }
 
     private func fetchAndStore(title: String, lookup: Lookup) async -> SeriesCast? {
+        if let file = file(for: lookup), let stored = await Self.read(file), stored.expiresAt > .now {
+            remember(stored, for: lookup)
+            return stored.cast
+        }
         do {
             let cast = try await fetch(title: title, lookup: lookup)
             guard !Task.isCancelled else { return nil }
-            if cache.count >= 128 {
-                cache = cache.filter { $0.value.expiresAt > .now }
-                if cache.count >= 128, let oldest = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
-                    cache.removeValue(forKey: oldest)
-                }
-            }
             let ttl: TimeInterval = cast == nil ? 86_400 : 7 * 86_400
-            cache[lookup] = Cached(cast: cast, expiresAt: .now.addingTimeInterval(ttl))
+            let entry = Cached(cast: cast, expiresAt: .now.addingTimeInterval(ttl))
+            remember(entry, for: lookup)
+            if let file = file(for: lookup) { await Self.write(entry, to: file) }
             return cast
         } catch {
             return nil
         }
+    }
+
+    private func remember(_ entry: Cached, for lookup: Lookup) {
+        if cache.count >= 128 {
+            cache = cache.filter { $0.value.expiresAt > .now }
+            if cache.count >= 128, let oldest = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+                cache.removeValue(forKey: oldest)
+            }
+        }
+        cache[lookup] = entry
+    }
+
+    private func file(for lookup: Lookup) -> URL? {
+        directory?.appending(path: "tvmaze-" + SafeFileName.make("\(lookup.name)-\(lookup.year)") + ".json", directoryHint: .notDirectory)
+    }
+
+    @concurrent private static func read(_ file: URL) async -> Cached? {
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return try? JSONDecoder().decode(Cached.self, from: data)
+    }
+
+    @concurrent private static func write(_ entry: Cached, to file: URL) async {
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: file, options: [.atomic])
     }
 
     private func fetch(title: String, lookup: Lookup) async throws -> SeriesCast? {
@@ -129,7 +158,7 @@ public actor SeriesCastRepository {
         let year: Int
     }
 
-    private struct Cached {
+    private struct Cached: Codable {
         let cast: SeriesCast?
         let expiresAt: Date
     }

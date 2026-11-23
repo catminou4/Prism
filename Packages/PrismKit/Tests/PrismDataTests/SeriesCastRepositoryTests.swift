@@ -62,4 +62,34 @@ struct SeriesCastRepositoryTests {
         #expect(await repository.cast(title: "La série", year: 2020) == nil)
         #expect(StubURLProtocol.requestCount(host: host) == 1)
     }
+
+    @Test func answersSurviveARelaunchThroughTheDiskCache() async throws {
+        let host = StubURLProtocol.uniqueHost("tvmaze-disk")
+        StubURLProtocol.register(host: host) { request in
+            switch request.url?.path {
+            case "/search/shows":
+                return .json(#"[{"show":{"id":51,"name":"Lupin","premiered":"2021-01-08","url":"https://www.tvmaze.com/shows/51/lupin"}}]"#)
+            case "/shows/51/cast":
+                return .json(#"[{"person":{"id":4,"name":"Omar Sy","image":null},"character":{"name":"Assane Diop"}}]"#)
+            default:
+                return .json("[]")
+            }
+        }
+        defer { StubURLProtocol.unregister(host: host) }
+        let directory = FileManager.default.temporaryDirectory.appending(path: "prism-tvmaze-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = SeriesCastRepository(session: StubURLProtocol.session(), host: host, directory: directory)
+        #expect(await first.cast(title: "Lupin", year: 2021)?.people.map(\.name) == ["Omar Sy"])
+        #expect(await first.cast(title: "Inconnue", year: 2020) == nil)
+        let requests = StubURLProtocol.requestCount(host: host)
+        #expect(requests == 3, "search + cast, then one search without an exact match")
+
+        let relaunched = SeriesCastRepository(session: StubURLProtocol.session(), host: host, directory: directory)
+        let cast = try #require(await relaunched.cast(title: "Lupin", year: 2021))
+        #expect(cast.people.map(\.role) == ["Assane Diop"])
+        #expect(cast.creditURL.absoluteString == "https://www.tvmaze.com/shows/51/lupin")
+        #expect(await relaunched.cast(title: "Inconnue", year: 2020) == nil)
+        #expect(StubURLProtocol.requestCount(host: host) == requests, "both answers served from disk")
+    }
 }
