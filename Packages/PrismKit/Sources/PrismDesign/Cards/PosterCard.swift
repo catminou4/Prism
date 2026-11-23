@@ -90,13 +90,7 @@ public struct PosterCard<MenuContent: View>: View {
                 }
                 .overlay(alignment: .topLeading) {
                     if let rankText {
-                        rankText
-                            .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
-                            .foregroundStyle(.white)
-                            .frame(minWidth: 34, minHeight: 30)
-                            .background(.black.opacity(0.64), in: .capsule)
-                            .padding(8)
-                            .accessibilityHidden(true)
+                        RankedPosterNumber(text: rankText)
                     }
                 }
                 .overlay(alignment: .bottom) {

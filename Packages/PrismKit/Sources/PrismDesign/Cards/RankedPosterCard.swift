@@ -61,13 +61,7 @@ public struct RankedPosterCard<MenuContent: View>: View {
                         }
                     }
                     .overlay(alignment: .topLeading) {
-                        rankText
-                            .font(PrismFont.rankNumber)
-                            .tracking(PrismFont.rankNumberTracking)
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
-                            .padding(.leading, 12)
-                            .padding(.top, 4)
+                        RankedPosterNumber(text: rankText)
                     }
                     .overlay(alignment: .bottom) {
                         if let genre {
@@ -81,6 +75,26 @@ public struct RankedPosterCard<MenuContent: View>: View {
             }
             .frame(width: size.width, height: size.height)
         }
+    }
+}
+
+/// The number stays legible over artwork while retaining the subtle silver fade.
+struct RankedPosterNumber: View {
+    let text: Text
+
+    var body: some View {
+        text
+            .font(PrismFont.rankNumber)
+            .tracking(PrismFont.rankNumberTracking)
+            .foregroundStyle(LinearGradient(
+                colors: [.white, .white, .white.opacity(0.58)],
+                startPoint: .top, endPoint: .bottom
+            ))
+            .shadow(color: .black.opacity(0.32), radius: 3, y: 1)
+            .padding(.leading, 11)
+            .padding(.top, 5)
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
     }
 }
 

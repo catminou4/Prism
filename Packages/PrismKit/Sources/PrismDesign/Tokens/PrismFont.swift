@@ -42,8 +42,8 @@ nonisolated public enum PrismFont {
     public static let episodeBody: Font = .system(size: 13)
     public static let episodeDuration: Font = .system(size: 13, weight: .medium)
     /// Top 10 rank numbers.
-    public static let rankNumber: Font = .system(size: 48, weight: .heavy)
-    public static let rankNumberTracking: CGFloat = -2
+    public static let rankNumber: Font = .system(size: 40, weight: .bold)
+    public static let rankNumberTracking: CGFloat = -1.5
     public static let tileTitle: Font = .system(size: 15, weight: .bold)
     public static let personName: Font = .system(size: 12, weight: .medium)
     public static let personRole: Font = .system(size: 11)

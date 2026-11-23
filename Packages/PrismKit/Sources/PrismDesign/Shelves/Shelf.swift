@@ -277,11 +277,16 @@ private struct ShelfChevrons: View {
 
     @ViewBuilder private func chevron(_ edge: HorizontalEdge, visible: Bool) -> some View {
         if visible {
-            GlassCircleButton(
-                systemName: edge == .leading ? "chevron.left" : "chevron.right",
-                size: PrismMetrics.shelfChevronSize,
-                accessibilityLabel: edge == .leading ? "Précédent" : "Suivant"
-            ) { page(edge) }
+            Button { page(edge) } label: {
+                Image(systemName: edge == .leading ? "chevron.left" : "chevron.right")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: PrismMetrics.shelfChevronSize, height: 52)
+                    .contentShape(.capsule)
+                    .prismGlass(.regular, in: .capsule, interactive: true)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(edge == .leading ? "Précédent" : "Suivant")
             .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
             .transition(reduceMotion ? AnyTransition.opacity : AnyTransition.opacity.combined(with: .scale(scale: 0.8)))
         }
