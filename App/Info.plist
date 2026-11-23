@@ -28,8 +28,6 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsArbitraryLoadsForMedia</key>
-		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Prism accède au réseau local pour lire les flux IPTV de votre serveur.</string>

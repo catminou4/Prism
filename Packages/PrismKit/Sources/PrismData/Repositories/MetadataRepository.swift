@@ -84,10 +84,12 @@ public actor MetadataRepository {
         clearTrends()
     }
 
-    public func metadata(for title: MediaTitle) async -> TMDBMetadata? {
+    public func metadata(for title: MediaTitle, tmdbID detailID: Int? = nil) async -> TMDBMetadata? {
         guard title.kind == .movie || title.kind == .series, let client = currentClient() else { return nil }
-        let tmdbID = title.variants.lazy.compactMap { $0.movie?.tmdbID ?? $0.series?.tmdbID }.first { $0 > 0 }
-        let key = tmdbID.map { "\(title.kind.rawValue)-tmdb-\($0)" } ?? "title-\(title.id.rawValue)"
+        let tmdbID = detailID.flatMap { $0 > 0 ? $0 : nil }
+            ?? title.variants.lazy.compactMap { $0.movie?.tmdbID ?? $0.series?.tmdbID }.first { $0 > 0 }
+        // Invalidate older search matches after changes to the matching and artwork selection rules.
+        let key = tmdbID.map { "v2-\(title.kind.rawValue)-tmdb-\($0)" } ?? "v2-title-\(title.id.rawValue)"
 
         if let entry = memory.value(for: key), Self.isFresh(entry) { return entry.metadata }
         if let entry = await readDisk(key), Self.isFresh(entry) {

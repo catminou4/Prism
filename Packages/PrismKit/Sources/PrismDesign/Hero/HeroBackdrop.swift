@@ -9,6 +9,7 @@ public struct HeroBackdrop: View {
     private let leadingScrim: Double
     private let extendsUnderSidebar: Bool
     private let artSize: CGSize?
+    private let blurAmount: Double?
     @State private var failedBackdrops: Set<URL> = []
     @State private var failedPosters: Set<URL> = []
 
@@ -27,12 +28,14 @@ public struct HeroBackdrop: View {
         leadingScrim: Double = 0.75,
         extendsUnderSidebar: Bool = false,
         animates: Bool = true,
-        artSize: CGSize? = nil
+        artSize: CGSize? = nil,
+        blurAmount: Double? = nil
     ) {
         self.init(
             backdropURLs: [imageURL].compactMap { $0 }, seed: seed,
             fallbackPosterURLs: [fallbackPosterURL].compactMap { $0 }, fadeInto: fadeInto,
-            leadingScrim: leadingScrim, extendsUnderSidebar: extendsUnderSidebar, animates: animates, artSize: artSize
+            leadingScrim: leadingScrim, extendsUnderSidebar: extendsUnderSidebar, animates: animates,
+            artSize: artSize, blurAmount: blurAmount
         )
     }
 
@@ -46,7 +49,8 @@ public struct HeroBackdrop: View {
         leadingScrim: Double = 0.72,
         extendsUnderSidebar: Bool = false,
         animates: Bool = false,
-        artSize: CGSize? = nil
+        artSize: CGSize? = nil,
+        blurAmount: Double? = nil
     ) {
         self.backdropURLs = Self.unique(backdropURLs)
         self.seed = seed
@@ -55,18 +59,38 @@ public struct HeroBackdrop: View {
         self.leadingScrim = leadingScrim
         self.extendsUnderSidebar = extendsUnderSidebar
         self.artSize = artSize
+        self.blurAmount = blurAmount.map { min(1, max(0, $0)) }
     }
 
     public var body: some View {
         ZStack {
             PlaceholderArtwork(seed: seed, style: .none)
             artwork
+            if let blurAmount {
+                blurredArtwork.opacity(blurAmount)
+            }
             scrims
         }
         .clipped()
         // Extend the completed, clipped backdrop rather than clipping the extension itself.
         .backgroundExtensionEffect(isEnabled: extendsUnderSidebar)
         .accessibilityHidden(true)
+    }
+
+    @ViewBuilder private var blurredArtwork: some View {
+        if let url = backdropURLs.first(where: { !failedBackdrops.contains($0) }) {
+            RemoteImage(
+                url: url, alignment: .top, fitting: .landscapeFill, placeholderSeed: seed,
+                blurRadius: 32, showsPlaceholder: false
+            )
+            .id(url)
+        } else if let url = posterURLs.first(where: { !failedPosters.contains($0) }) {
+            RemoteImage(
+                url: url, alignment: .top, fitting: .portraitFit, placeholderSeed: seed,
+                blurRadius: 32, showsPlaceholder: false
+            )
+            .id(url)
+        }
     }
 
     @ViewBuilder private var artwork: some View {

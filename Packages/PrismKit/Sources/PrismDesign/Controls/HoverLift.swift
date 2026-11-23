@@ -13,9 +13,7 @@ extension View {
     }
 }
 
-/// Applies the lift only when it can be seen: while a scroll container is scrolling the
-/// scale/shadow/brightness modifiers are skipped entirely (fewer layout nodes per card
-/// per frame), and restored when the scroll phase ends.
+/// During scroll, return to neutral transforms without replacing the modified view.
 private struct HoverLiftEffect: ViewModifier {
     let isHovered: Bool
     let isPressed: Bool
@@ -23,20 +21,18 @@ private struct HoverLiftEffect: ViewModifier {
     let pressedScale: CGFloat
     let shadow: Bool
     let reduceMotion: Bool
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @ScrollingContent private var isScrollingContent
 
-    @ViewBuilder func body(content: Content) -> some View {
-        if isScrollingContent {
-            content
-        } else {
-            let target: CGFloat = isPressed ? pressedScale : (isHovered ? scale : 1)
-            content
-                .modifier(ContentShadow(enabled: shadow, isHovered: isHovered))
-                .scaleEffect(reduceMotion ? 1 : target)
-                .brightness(reduceMotion && isHovered ? 0.04 : 0)
-                .animation(isPressed ? PrismMotion.press : PrismMotion.hover, value: isHovered)
-                .animation(PrismMotion.press, value: isPressed)
-        }
+    func body(content: Content) -> some View {
+        let hovering = isHovered && !isScrollingContent
+        let pressing = isPressed && !isScrollingContent
+        let target: CGFloat = pressing ? pressedScale : (hovering ? scale : 1)
+        content
+            .modifier(ContentShadow(enabled: shadow, isHovered: hovering))
+            .scaleEffect(reduceMotion ? 1 : target)
+            .brightness(reduceMotion && hovering ? 0.04 : 0)
+            .animation(pressing ? PrismMotion.press : PrismMotion.hover, value: hovering)
+            .animation(PrismMotion.press, value: pressing)
     }
 }
 
@@ -60,17 +56,16 @@ private struct HoverLiftModifier: ViewModifier {
     let shadow: Bool
     @State private var isHovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @ScrollingContent private var isScrollingContent
 
     func body(content: Content) -> some View {
         content
             .hoverLiftEffect(isHovered: isHovered && !isScrollingContent, isPressed: false, scale: scale, pressedScale: 1, shadow: shadow, reduceMotion: reduceMotion)
             .onHover { inside in
-                guard !isScrollingContent else { return }
-                isHovered = inside
+                if !inside || !isScrollingContent { isHovered = inside }
             }
-            .onChange(of: isScrollingContent) { _, scrolling in
-                if !scrolling { isHovered = false }
+            .onChange(of: isHovered && isScrollingContent) { _, shouldReset in
+                if shouldReset { isHovered = false }
             }
     }
 }

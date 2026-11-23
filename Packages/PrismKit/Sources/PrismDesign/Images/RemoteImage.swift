@@ -24,7 +24,8 @@ public struct RemoteImage: View {
 
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.prismScrollActivity) private var scrollActivity
+    @ScrollingContent private var isScrollingContent
 
     private var imageFade: Animation? {
         isScrollingContent ? nil : PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)
@@ -149,11 +150,14 @@ public struct RemoteImage: View {
             loaded = Loaded(key: key, image: cached)
             return
         }
-        if isScrollingContent, !progressive {
-            // Briefly passing through a row should not start a batch of image downloads and decodes.
+        // During vertical browsing, cached posters stay visible. A shelf that passes
+        // through the viewport needn't start a new download or publish a decoded image.
+        let browseActivity = !progressive && blurRadius == 0 ? scrollActivity : nil
+        if !progressive, browseActivity?.isScrolling != true, isScrollingContent {
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled else { return }
         }
+        await browseActivity?.waitUntilIdle()
+        guard !Task.isCancelled else { return }
         // Full-screen artwork: a lighter copy fills the slot while the full resolution downloads.
         // Whichever arrives first wins; a full image already on disk never waits for the copy.
         if progressive, loaded?.key.showsSameArtwork(as: key) != true, let preview = ImagePipeline.previewKey(for: key) {
@@ -181,7 +185,9 @@ public struct RemoteImage: View {
                 fitting: key.fitting, blurRadius: 0
             )
         }
-        finish(await ImagePipeline.shared.image(for: key, blurredFrom: source), key: key)
+        let image = await ImagePipeline.shared.image(for: key, blurredFrom: source)
+        await browseActivity?.waitUntilIdle()
+        finish(image, key: key)
     }
 
     private func finish(_ image: CGImage?, key: ImagePipeline.Key) {

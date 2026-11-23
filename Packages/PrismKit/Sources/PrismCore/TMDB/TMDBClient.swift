@@ -210,7 +210,9 @@ public actor TMDBClient {
             ("include_image_language", "\(languageCode),en,null"),
             ("include_video_language", "\(languageCode),en"),
         ]) else { return nil }
-        let metadata = try Self.decodeMetadata(data, kind: kind == .movie ? .movie : .series, region: region)
+        let metadata = try Self.decodeMetadata(
+            data, kind: kind == .movie ? .movie : .series, region: region, languageCode: languageCode
+        )
         cache[cacheKey] = Entry(metadata: metadata, stamp: cacheStamp())
         if cache.count > Self.cacheLimit {
             let excess = cache.count - Self.cacheLimit / 2
@@ -336,25 +338,33 @@ public actor TMDBClient {
         }
     }
 
-    /// Prefers an exact (folded) title match, then the release year, then TMDB's ranking.
+    /// Avoid attaching unrelated artwork when a provider title gives a poor search result.
     static func bestMatch(_ hits: [TMDBSearchHit], title: String, year: Int?) -> TMDBSearchHit? {
-        guard !hits.isEmpty else { return nil }
         let key = TitleNormalizer.key(title)
+        guard !key.isEmpty else { return nil }
+        let words = Set(key.split(separator: " "))
         var best: (score: Int, index: Int)?
         for (index, hit) in hits.enumerated() {
-            var score = 0
-            if TitleNormalizer.key(hit.title) == key { score += 4 }
-            if let original = hit.originalTitle, TitleNormalizer.key(original) == key { score += 3 }
-            if let year, let hitYear = hit.year {
-                if hitYear == year { score += 3 } else if abs(hitYear - year) == 1 { score += 1 } else { score -= 1 }
+            let names = [hit.title, hit.originalTitle].compactMap { $0 }.map(TitleNormalizer.key)
+            let exact = names.contains(key)
+            let similar = names.contains { name in
+                let candidate = Set(name.split(separator: " "))
+                guard words.count >= 2, candidate.count >= 2 else { return false }
+                return Double(words.intersection(candidate).count) / Double(words.union(candidate).count) >= 0.8
             }
+            guard exact || similar else { continue }
+            var score = exact ? 8 : 5
+            if let year, let hitYear = hit.year {
+                if hitYear == year { score += 3 } else if abs(hitYear - year) == 1 { score += 1 } else { score -= 5 }
+            }
+            guard score >= 4 else { continue }
             if let current = best, current.score >= score { continue }
             best = (score, index)
         }
         return best.map { hits[$0.index] }
     }
 
-    static func decodeMetadata(_ data: Data, kind: MediaKind, region: String = "FR") throws -> TMDBMetadata {
+    static func decodeMetadata(_ data: Data, kind: MediaKind, region: String = "FR", languageCode: String = "fr") throws -> TMDBMetadata {
         let obj = try json(data)
         guard let id = obj.int("id") else { throw TMDBError.decoding("id manquant") }
         let isMovie = kind == .movie
@@ -362,13 +372,16 @@ public actor TMDBClient {
 
         // Logo: fr → en → null, SVG served as PNG.
         let logos = images.array("logos").compactMap(JSONObject.init)
-        let logo = pick(logos, languages: ["fr", "en", nil]) ?? logos.first
+        let logo = pick(logos, languages: [languageCode, "en", nil]) ?? logos.first
         var logoPath = logo?.string("file_path")
         if let path = logoPath, path.lowercased().hasSuffix(".svg") { logoPath = String(path.dropLast(4)) + ".png" }
 
         // Backdrop: textless (null) → en → anything → main backdrop.
         let backdrops = images.array("backdrops").compactMap(JSONObject.init)
         let backdropPath = (pick(backdrops, languages: [nil, "en"]) ?? backdrops.first)?.string("file_path") ?? obj.string("backdrop_path")
+        let posters = images.array("posters").compactMap(JSONObject.init)
+        let posterPath = obj.string("poster_path")
+            ?? (pick(posters, languages: [languageCode, "en", nil]) ?? posters.first)?.string("file_path")
 
         let credits = obj.object("credits") ?? .empty
         let cast = credits.array("cast").compactMap(JSONObject.init)
@@ -398,7 +411,7 @@ public actor TMDBClient {
 
         let videos = (obj.object("videos") ?? .empty).array("results").compactMap(JSONObject.init)
             .filter { $0.string("site")?.lowercased() == "youtube" && $0.string("type")?.lowercased() == "trailer" && $0.string("key") != nil }
-        let trailer = pick(videos, languages: ["fr", "en"]) ?? videos.first
+        let trailer = pick(videos, languages: [languageCode, "en"]) ?? videos.first
         let trailerURL = trailer?.string("key").flatMap { URL(string: "https://www.youtube.com/watch?v=\($0)") }
 
         return TMDBMetadata(
@@ -409,7 +422,7 @@ public actor TMDBClient {
             images: TMDBImageSet(
                 backdropURL: imageURL(path: backdropPath, size: "original"),
                 logoURL: imageURL(path: logoPath, size: "w500"),
-                posterURL: imageURL(path: obj.string("poster_path"), size: "w780")
+                posterURL: imageURL(path: posterPath, size: "w780")
             ),
             cast: Array(cast),
             directors: directors,

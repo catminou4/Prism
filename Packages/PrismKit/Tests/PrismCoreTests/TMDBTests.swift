@@ -28,6 +28,24 @@ struct TMDBTests {
         #expect(TMDBClient.bestMatch([], title: "x", year: nil) == nil)
     }
 
+    @Test func searchRejectsUnrelatedResultsAndWrongRemakes() {
+        let hits = [
+            TMDBSearchHit(id: 1, title: "Un autre film", originalTitle: nil, year: 2020, popularity: 100),
+            TMDBSearchHit(id: 2, title: "Dune", originalTitle: nil, year: 1984, popularity: 20),
+        ]
+        #expect(TMDBClient.bestMatch(hits, title: "Film introuvable", year: 2020) == nil)
+        #expect(TMDBClient.bestMatch(hits, title: "Dune", year: 2021) == nil)
+        #expect(TMDBClient.bestMatch(hits, title: "Dune", year: 1984)?.id == 2)
+    }
+
+    @Test func posterFallsBackToLocalizedImage() throws {
+        let data = Data(#"{"id":1,"title":"Film","images":{"posters":[{"iso_639_1":"en","file_path":"/en.jpg"},{"iso_639_1":"fr","file_path":"/fr.jpg"}]}}"#.utf8)
+        let french = try TMDBClient.decodeMetadata(data, kind: .movie)
+        let english = try TMDBClient.decodeMetadata(data, kind: .movie, languageCode: "en")
+        #expect(french.images.posterURL?.lastPathComponent == "fr.jpg")
+        #expect(english.images.posterURL?.lastPathComponent == "en.jpg")
+    }
+
     @Test func movieDetails() throws {
         let metadata = try TMDBClient.decodeMetadata(try Fixture.data("tmdb_movie_details", "json"), kind: .movie, region: "FR")
         #expect(metadata.tmdbID == 19995)

@@ -84,6 +84,7 @@ private struct TitleDetailContent: View {
     @State private var selectedSeason: Int?
     @State private var loadingEpisodes = true
     @State private var isAtTop = true
+    @State private var heroBlurStep = 0
     @State private var failedToLoadEpisodes = false
     @State private var episodeFailureReason: String?
     @State private var retryCount = 0
@@ -160,7 +161,10 @@ private struct TitleDetailContent: View {
         return SeasonLookup(active: isPageActive && app.isMetadataEnabled, tmdbID: tmdbID, season: displayedSeason?.number)
     }
     private var metadataLookup: MetadataKey {
-        MetadataKey(active: isPageActive, enabled: app.isMetadataEnabled, revision: app.catalogRevision)
+        MetadataKey(
+            active: isPageActive, enabled: app.isMetadataEnabled, revision: app.catalogRevision,
+            tmdbID: movieDetail?.tmdbID ?? inventory?.detail.tmdbID
+        )
     }
     private var hasTMDBPortraits: Bool {
         enriched?.cast.contains { $0.profileURL != nil } == true
@@ -218,6 +222,12 @@ private struct TitleDetailContent: View {
                 scroll.contentOffset.y + scroll.contentInsets.top <= 1
             } action: { _, atTop in
                 isAtTop = atTop
+            }
+            .onScrollGeometryChange(for: Int.self) { scroll in
+                let distance = max(0, scroll.contentOffset.y + scroll.contentInsets.top)
+                return min(20, Int((distance / 240 * 20).rounded()))
+            } action: { _, step in
+                heroBlurStep = step
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
             .prismScrollPhase()
@@ -290,7 +300,8 @@ private struct TitleDetailContent: View {
         } ?? (resuming ? "Reprendre" : "Lecture")
 
         return TitleDetailMasthead(
-            title: title, height: Self.mastheadHeight(for: viewportHeight), metadata: enriched,
+            title: title, height: Self.mastheadHeight(for: viewportHeight), blurAmount: Double(heroBlurStep) / 20,
+            metadata: enriched,
             backdrops: backdrops, posters: posters, plot: plot, facts: facts,
             quality: movieDetail?.tech?.quality.badge ?? edition?.variant.quality.badge, playLabel: label,
             progress: resuming ? progress?.fraction : nil,
@@ -306,7 +317,7 @@ private struct TitleDetailContent: View {
     }
 
     private static func mastheadHeight(for viewportHeight: CGFloat) -> CGFloat {
-        min(630, max(430, viewportHeight * 0.62))
+        min(760, max(460, viewportHeight * 0.78))
     }
 
     private var episodes: some View {
@@ -696,7 +707,7 @@ private struct TitleDetailContent: View {
     }
 
     private func loadEnrichment(for lookup: MetadataKey) async {
-        let metadata = lookup.enabled ? await app.metadataRepository.metadata(for: title) : nil
+        let metadata = lookup.enabled ? await app.metadataRepository.metadata(for: title, tmdbID: lookup.tmdbID) : nil
         guard !Task.isCancelled else { return }
         enriched = metadata
         resolvedMetadata = lookup
@@ -746,6 +757,7 @@ private struct TitleDetailContent: View {
         let active: Bool
         let enabled: Bool
         let revision: Int
+        let tmdbID: Int?
     }
 
     private struct CastLookup: Equatable {

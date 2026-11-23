@@ -5,6 +5,7 @@ import SwiftUI
 struct TitleDetailMasthead: View {
     let title: MediaTitle
     let height: CGFloat
+    let blurAmount: Double
     let metadata: TMDBMetadata?
     let backdrops: [URL]
     let posters: [URL]
@@ -35,7 +36,7 @@ struct TitleDetailMasthead: View {
             ZStack(alignment: .bottomLeading) {
                 HeroBackdrop(
                     backdropURLs: backdrops, seed: title.id.rawValue, fallbackPosterURLs: posters,
-                    leadingScrim: 0.78, extendsUnderSidebar: true, artSize: size
+                    leadingScrim: 0.30, extendsUnderSidebar: true, artSize: size, blurAmount: blurAmount
                 )
                 .allowsHitTesting(false)
 

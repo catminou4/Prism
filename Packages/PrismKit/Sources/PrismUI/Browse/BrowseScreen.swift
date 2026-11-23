@@ -63,7 +63,9 @@ struct BrowseScreen: View {
             } action: { _, atTop in
                 motion.isAtTop = atTop
             }
-            .prismScrollPhase { motion.isScrolling = $0 }
+            .onScrollPhaseChange { _, phase in motion.scroll.update(isScrolling: phase.isScrolling) }
+            .environment(\.prismScrollActivity, motion.scroll)
+            .scrollEdgeEffectHidden(kind == nil, for: .top)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
                 BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
@@ -139,7 +141,7 @@ private struct HomeLibraryShelves: View {
 }
 
 @Observable private final class BrowseScrollActivity {
-    var isScrolling = false
+    let scroll = ScrollActivity()
     var isAtTop = true
     var heroIndex = 0
 }
@@ -184,11 +186,11 @@ private struct BrowseHero: View {
     let motion: BrowseScrollActivity
 
     var body: some View {
-        let canAnimate = isActive && isVisible && !motion.isScrolling
+        let canAnimate = isActive && isVisible && !motion.scroll.isScrolling
         let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
             items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
-            height: height, index: $selected, isInteractive: isActive, extendsUnderSidebar: true
+            height: height, index: $selected, isInteractive: isActive && isVisible
         ) { highlight in
             HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
         }

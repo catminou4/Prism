@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 /// How a shelf sizes its cards.
@@ -33,13 +34,14 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     @State private var leadingItem: Item.ID?
     @State private var warmBox = WarmBox()
     @State private var viewport = ShelfViewport()
-    @State private var scrollAvailability = ScrollAvailability()
     @State private var measuredWidth: CGFloat = 0
     @State private var hovering = false
     @State private var rowScrolling = false
     @Environment(\.prismShelfViewportWidth) private var layoutWidth
     @Environment(\.prismSnapshotHover) private var forcedHover
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.prismIsScrollingContent) private var parentRowIsScrolling
+    @Environment(\.prismScrollActivity) private var scrollActivity
+    @ScrollingContent private var isScrollingContent
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
 
@@ -95,11 +97,11 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         // shelf (header + row) in the middle of a page scroll. The box debounces the
         // warm off the view tree instead.
         .onScrollVisibilityChange(threshold: 0.15) { visible in
-            warmBox.setVisible(visible, warmRequest)
+            warmBox.setVisible(visible, warm, activity: scrollActivity)
         }
         // Row scrolling/resizing changes the warm target without a visibility event.
-        .onChange(of: warmRequest) { _, request in
-            warmBox.refresh(request)
+        .onChange(of: warm) { _, request in
+            warmBox.refresh(request, activity: scrollActivity)
         }
         .onDisappear { warmBox.cancel() }
     }
@@ -131,14 +133,14 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         private var task: Task<Void, Never>?
 
         /// Visibility threshold crossed: remember it, then arm or cancel the pending warm.
-        func setVisible(_ visible: Bool, _ request: WarmRequest?) {
+        func setVisible(_ visible: Bool, _ request: WarmRequest?, activity: ScrollActivity?) {
             isVisible = visible
-            schedule(visible ? request : nil)
+            schedule(visible ? request : nil, activity: activity)
         }
 
         /// The warm target changed (row scrolled, width changed, items swapped).
-        func refresh(_ request: WarmRequest?) {
-            schedule(isVisible ? request : nil)
+        func refresh(_ request: WarmRequest?, activity: ScrollActivity?) {
+            schedule(isVisible ? request : nil, activity: activity)
         }
 
         /// The shelf left the view tree: drop any pending warm (mirrors the old `.task`
@@ -151,15 +153,15 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
 
         /// (Re)arms a ~150 ms debounce so a shelf passed mid-scroll never queues artwork;
         /// the latest call wins and `nil` cancels outright.
-        private func schedule(_ request: WarmRequest?) {
+        private func schedule(_ request: WarmRequest?, activity: ScrollActivity?) {
             task?.cancel()
             task = nil
             guard let request else { return }
             let urls = request.urls
             let pixelSize = request.pixelSize
             task = Task.detached(priority: .utility) {
-                // Avoid queuing artwork for shelves passed during a quick scroll.
                 try? await Task.sleep(for: .milliseconds(150))
+                await activity?.waitUntilIdle()
                 guard !Task.isCancelled else { return }
                 ImagePipeline.shared.warm(urls, pixelSize: pixelSize)
             }
@@ -191,16 +193,14 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
         .scrollPosition(id: $leadingItem, anchor: .leading)
         // Cards suspend hover lift/shadow while this row (or an ancestor scroller) moves.
-        .environment(\.prismIsScrollingContent, isScrollingContent || rowScrolling)
+        .environment(\.prismIsScrollingContent, parentRowIsScrolling || rowScrolling)
         .onScrollPhaseChange { _, phase in
             rowScrolling = phase.isScrolling
         }
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
-            viewport.edges = newValue
-            let availability = newValue.availability
-            if scrollAvailability != availability { scrollAvailability = availability }
+            viewport.update(newValue)
             if layoutWidth == nil, measuredWidth != newValue.width { measuredWidth = newValue.width }
         }
         .padding(.top, -Self.liftInset.top)
@@ -210,38 +210,21 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         // on the row it propagated an animation attribute into every card's subtree each
         // time a shelf materialized (~8 cards × ~30 nodes of wasted attribute writes).
         .overlay {
-            HStack(spacing: 0) {
-                chevron(.leading)
-                Spacer(minLength: 0)
-                chevron(.trailing)
+            if isHovered {
+                ShelfChevrons(viewport: viewport, margin: margin, page: page)
             }
-            .animation(PrismMotion.quickFade, value: scrollAvailability)
         }
         .onHover { inside in
-            guard !isScrollingContent else { return }
-            withAnimation(PrismMotion.quickFade) { hovering = inside }
+            if !inside || !isScrollingContent {
+                withAnimation(PrismMotion.quickFade) { hovering = inside }
+            }
         }
-        .onChange(of: isScrollingContent) { _, scrolling in
-            if !scrolling { hovering = false }
+        .onChange(of: hovering && isScrollingContent) { _, shouldReset in
+            if shouldReset { hovering = false }
         }
         .accessibilityScrollAction { edge in
-            if edge == .leading && scrollAvailability.backward { page(.leading) }
-            if edge == .trailing && scrollAvailability.forward { page(.trailing) }
-        }
-    }
-
-    @ViewBuilder private func chevron(_ edge: HorizontalEdge) -> some View {
-        let canScroll = edge == .leading ? scrollAvailability.backward : scrollAvailability.forward
-        if isHovered && canScroll {
-            GlassCircleButton(
-                systemName: edge == .leading ? "chevron.left" : "chevron.right",
-                size: PrismMetrics.shelfChevronSize,
-                accessibilityLabel: edge == .leading ? "Précédent" : "Suivant"
-            ) {
-                page(edge)
-            }
-            .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
-            .transition(reduceMotion ? AnyTransition.opacity : AnyTransition.opacity.combined(with: .scale(scale: 0.8)))
+            if edge == .leading && viewport.availability.backward { page(.leading) }
+            if edge == .trailing && viewport.availability.forward { page(.trailing) }
         }
     }
 
@@ -264,9 +247,45 @@ extension EnvironmentValues {
     @Entry public var prismShelfViewportWidth: CGFloat? = nil
 }
 
-/// Paging uses the exact current offset. The scroll view only observes changes in edge availability.
-private final class ShelfViewport {
-    var edges = ScrollEdges()
+/// Paging uses the exact offsets. Only the chevron overlay observes edge availability.
+@Observable private final class ShelfViewport {
+    @ObservationIgnored private(set) var edges = ScrollEdges()
+    private(set) var availability = ScrollAvailability()
+
+    func update(_ edges: ScrollEdges) {
+        self.edges = edges
+        let availability = edges.availability
+        if self.availability != availability { self.availability = availability }
+    }
+}
+
+private struct ShelfChevrons: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let viewport: ShelfViewport
+    let margin: CGFloat
+    let page: (HorizontalEdge) -> Void
+
+    var body: some View {
+        let availability = viewport.availability
+        HStack(spacing: 0) {
+            chevron(.leading, visible: availability.backward)
+            Spacer(minLength: 0)
+            chevron(.trailing, visible: availability.forward)
+        }
+        .animation(PrismMotion.quickFade, value: availability)
+    }
+
+    @ViewBuilder private func chevron(_ edge: HorizontalEdge, visible: Bool) -> some View {
+        if visible {
+            GlassCircleButton(
+                systemName: edge == .leading ? "chevron.left" : "chevron.right",
+                size: PrismMetrics.shelfChevronSize,
+                accessibilityLabel: edge == .leading ? "Précédent" : "Suivant"
+            ) { page(edge) }
+            .padding(.horizontal, (margin - PrismMetrics.shelfChevronSize) / 2)
+            .transition(reduceMotion ? AnyTransition.opacity : AnyTransition.opacity.combined(with: .scale(scale: 0.8)))
+        }
+    }
 }
 
 private struct ScrollAvailability: Equatable {

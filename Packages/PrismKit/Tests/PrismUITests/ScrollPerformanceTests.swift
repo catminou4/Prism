@@ -1,11 +1,13 @@
 import AppKit
 import Darwin
+import ImageIO
 import PrismCore
 import PrismData
 import PrismDesign
 import QuartzCore
 import SwiftUI
 import Testing
+import UniformTypeIdentifiers
 @testable import PrismUI
 
 /// Run in Release with PRISM_SCROLL_PERF=1. The window is never ordered onscreen.
@@ -60,10 +62,41 @@ struct ScrollPerformanceTests {
     }
 
     @Test func browseShelves() async throws {
+        try await measureShelves()
+    }
+
+    @Test func fastScrollWithColdArtwork() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "prism-scroll-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let context = try #require(CGContext(
+            data: nil, width: 600, height: 900, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        context.setFillColor(red: 0.2, green: 0.3, blue: 0.5, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 600, height: 900))
+        let image = try #require(context.makeImage())
+        let data = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        #expect(CGImageDestinationFinalize(destination))
+
+        let posters = try (0..<360).map { index in
+            let url = directory.appending(path: "\(index).jpg")
+            try (data as Data).write(to: url)
+            return url
+        }
+        try await measureShelves(posters: posters)
+    }
+
+    private func measureShelves(posters: [URL] = []) async throws {
         _ = NSApplication.shared
+        let activity = ScrollActivity()
+        activity.update(isScrolling: true)
         let titles = (0..<360).map { index in
             MediaTitle(id: TitleID(rawValue: "movie:\(index)"), kind: .movie,
-                       title: "Film \(index)", year: 2000 + index % 25, variants: [])
+                       title: "Film \(index)", year: 2000 + index % 25, variants: [],
+                       posterURL: posters.isEmpty ? nil : posters[index])
         }
         let model = AppModel(directories: .temporary("prism-shelves-bench"), credentials: InMemoryCredentialStore(),
                              library: .inMemory(), isEphemeral: true)
@@ -77,10 +110,9 @@ struct ScrollPerformanceTests {
                 }
             }
         }
-        // `clip.scroll(to:)` is an AppKit-level scroll: SwiftUI's onScrollPhaseChange never
-        // fires, so emulate the scrolling state the real app enters via BrowseScreen —
-        // cards then take their lean path (no hover lift/shadow modifiers) for the whole run.
-        .environment(\.prismIsScrollingContent, true)
+        // Programmatic AppKit offsets don't publish a SwiftUI scroll phase.
+        .environment(\.prismScrollActivity, activity)
+        .environment(\.displayScale, 2)
         .frame(width: size.width, height: size.height)
             .environment(\.prismShelfViewportWidth, size.width)
             .environment(model).environment(navigation))
@@ -98,12 +130,13 @@ struct ScrollPerformanceTests {
         try await Task.sleep(for: .milliseconds(100))
         let clock = ContinuousClock()
         let start = clock.now
-        let steps = 240
+        let steps = posters.isEmpty ? 240 : 120
+        let pointsPerStep = posters.isEmpty ? 24 : 88
         var samples: [Double] = []
         for step in 1...steps {
             try await clock.sleep(until: start.advanced(by: .nanoseconds(8_333_333) * step))
             let offset = min(step, steps - step)
-            let destination = CGPoint(x: origin.x, y: origin.y + direction * CGFloat(offset * 24))
+            let destination = CGPoint(x: origin.x, y: origin.y + direction * CGFloat(offset * pointsPerStep))
             let sampleStart = clock.now
             clip.scroll(to: destination)
             scroll.reflectScrolledClipView(clip)
@@ -113,10 +146,24 @@ struct ScrollPerformanceTests {
         }
         let sorted = samples.sorted()
         let wall = milliseconds(start.duration(to: clock.now))
-        print("[scroll-perf] 20 shelves × 18 posters: p50 \(format(sorted[119])) ms, "
-            + "p95 \(format(sorted[227])) ms, max \(format(sorted[239])) ms, "
-            + "\(samples.count { $0 > 1_000.0 / 120 })/240 over 8.33 ms, wall \(format(wall)) ms")
+        let kind = posters.isEmpty ? "placeholders" : "cold artwork, \(pointsPerStep) pt/step"
+        print("[scroll-perf] 20 shelves × 18 posters (\(kind)): p50 \(format(sorted[steps / 2 - 1])) ms, "
+            + "p95 \(format(sorted[steps * 95 / 100 - 1])) ms, max \(format(sorted[steps - 1])) ms, "
+            + "\(samples.count { $0 > 1_000.0 / 120 })/\(steps) over 8.33 ms, wall \(format(wall)) ms")
         print("[scroll-perf] slow steps: \(samples.enumerated().filter { $0.element > 1_000.0 / 120 }.map { "\($0.offset + 1):\(format($0.element))" }.joined(separator: ", "))")
+
+        if let poster = posters.first {
+            let width = PrismMetrics.columnWidth(available: size.width - PrismMetrics.contentMargin * 2, minWidth: PrismMetrics.posterMinWidth)
+            let pixels = RemoteImage.pixelSize(forPointSize: CGSize(width: width, height: (width / PrismMetrics.posterAspectRatio).rounded()), scale: 2)
+            #expect(ImagePipeline.shared.cachedImage(for: poster, pixelSize: pixels) == nil)
+            activity.update(isScrolling: false)
+            let deadline = clock.now.advanced(by: .seconds(2))
+            while ImagePipeline.shared.cachedImage(for: poster, pixelSize: pixels) == nil && clock.now < deadline {
+                try await Task.sleep(for: .milliseconds(25))
+                layout(host)
+            }
+            #expect(ImagePipeline.shared.cachedImage(for: poster, pixelSize: pixels) != nil)
+        }
     }
 
     @Test func titleGrid() async throws {
