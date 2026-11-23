@@ -50,6 +50,21 @@ enum SegmentedArchive {
         return segments
     }
 
+    /// Deletes `*.<suffix>` archives in `directory` whose embedded version differs from `version`
+    /// (or that are truncated/foreign — they can never be decoded). Reads only the 8-byte header
+    /// of each file; cheap enough to run once at launch, off the main actor.
+    static func purgeObsoleteFiles(in directory: URL, version: UInt32, suffix: String) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path(percentEncoded: false)) else { return }
+        for name in names where name.hasSuffix("." + suffix) {
+            let url = directory.appending(path: name)
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory != true else { continue }
+            let header = (try? Data(contentsOf: url, options: [.mappedIfSafe]))?.prefix(8) ?? Data()
+            let current = header.count == 8 && Array(header.prefix(4)) == magic
+                && readUInt32([UInt8](header.dropFirst(4)), at: 0) == version
+            if !current { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
     // MARK: Segments
 
     static func encodeSegment<T: Encodable>(_ value: T, tag: UInt8) throws -> Segment {
@@ -66,13 +81,15 @@ enum SegmentedArchive {
         }
     }
 
-    /// Expands at most four chunks at a time, then appends them in archive order.
+    /// Expands chunks a few at a time, then appends them in archive order. JSON decoding is
+    /// CPU-bound and single-threaded per chunk, so the batch tracks the core count (capped):
+    /// 39 catalog segments at 4-wide left most cores idle during the ~2 s decode.
     static func decodeChunks<Chunk: Sendable, Result>(
         _ segments: ArraySlice<Segment>, into initial: Result,
         decode: @escaping @Sendable (Segment) -> Chunk?, append: (inout Result, Chunk) -> Void
     ) async -> Result? {
         var result = initial
-        let batchSize = 4
+        let batchSize = min(max(4, ProcessInfo.processInfo.activeProcessorCount), 10)
         for lower in stride(from: segments.startIndex, to: segments.endIndex, by: batchSize) {
             guard !Task.isCancelled else { return nil }
             let batch = segments[lower..<min(lower + batchSize, segments.endIndex)]
@@ -101,21 +118,35 @@ enum SegmentedArchive {
         }
     }
 
-    /// Encodes `items` in chunks of `chunkSize`, concurrently, preserving order.
+    /// Encodes `items` in chunks of `chunkSize`, at most six chunks in flight (each holds a full
+    /// JSON document plus its compressed form, so an unbounded group multiplied peak memory by
+    /// the chunk count), preserving archive order.
     static func encodeChunks<T: Encodable & Sendable>(_ items: [T], tag: UInt8, chunkSize: Int) async throws -> [Segment] {
+        let batchSize = 6
+        // The batch span multiplies chunkSize by batchSize: keep it far from Int.max.
+        precondition(chunkSize > 0 && chunkSize <= Int.max / batchSize)
         guard !items.isEmpty else { return [] }
-        return try await withThrowingTaskGroup(of: (Int, Segment).self) { group in
-            for (index, lower) in stride(from: 0, to: items.count, by: chunkSize).enumerated() {
-                let upper = min(lower + chunkSize, items.count)
-                group.addTask {
-                    try Task.checkCancellation()
-                    return (index, try encodeSegment(Chunk(items: items[lower..<upper]), tag: tag))
+        var segments: [Segment] = []
+        var lower = 0
+        while lower < items.count {
+            try Task.checkCancellation()
+            let upper = min(lower + chunkSize * batchSize, items.count)
+            let batch = try await withThrowingTaskGroup(of: (Int, Segment).self) { group in
+                for start in stride(from: lower, to: upper, by: chunkSize) {
+                    let end = min(start + chunkSize, items.count)
+                    group.addTask {
+                        try Task.checkCancellation()
+                        return (start, try encodeSegment(Chunk(items: items[start..<end]), tag: tag))
+                    }
                 }
+                var parts: [(Int, Segment)] = []
+                for try await part in group { parts.append(part) }
+                return parts.sorted { $0.0 < $1.0 }.map(\.1)
             }
-            var parts: [(Int, Segment)] = []
-            for try await part in group { parts.append(part) }
-            return parts.sorted { $0.0 < $1.0 }.map(\.1)
+            segments.append(contentsOf: batch)
+            lower = upper
         }
+        return segments
     }
 
     // MARK: Integers

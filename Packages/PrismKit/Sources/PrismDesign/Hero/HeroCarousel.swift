@@ -48,6 +48,16 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         return min(max(index, 0), max(items.count - 1, 0))
     }
 
+    /// Order-sensitive fingerprint of the item ids — same change detection as
+    /// `items.map(\.id)` without allocating the id array on every evaluation.
+    private var itemsSignature: Int {
+        var signature = items.count
+        for item in items {
+            signature = signature &* 31 &+ item.id.hashValue
+        }
+        return signature
+    }
+
     private var canPage: Bool { isInteractive && items.count > 1 }
     private var isAutoAdvancing: Bool {
         canPage && !hovering && appearsActive && isWindowVisible && !reduceMotion && interval > 0
@@ -95,7 +105,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         .onChange(of: externalIndex) { _, newValue in
             if let newValue, newValue != currentIndex { go(to: newValue) }
         }
-        .onChange(of: items.map(\.id)) { _, _ in
+        .onChange(of: itemsSignature) { _, _ in
             let current = currentIndex
             index = current
             visibleID = items.indices.contains(current) ? items[current].id : nil

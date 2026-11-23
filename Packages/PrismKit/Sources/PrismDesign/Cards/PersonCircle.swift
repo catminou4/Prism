@@ -7,6 +7,7 @@ public struct PersonCircle: View {
     private let imageURL: URL?
     private let diameter: CGFloat
     private let action: (() -> Void)?
+    private let accessibilityText: Text
 
     public init(name: String, role: String? = nil, imageURL: URL? = nil, diameter: CGFloat = PrismMetrics.personDiameter, action: (() -> Void)? = nil) {
         self.name = name
@@ -14,15 +15,25 @@ public struct PersonCircle: View {
         self.imageURL = imageURL
         self.diameter = diameter
         self.action = action
+        accessibilityText = Text([name, role].compactMap { $0 }.joined(separator: ", "))
     }
 
     public var body: some View {
-        CardContainer(accessibilityLabel: Text([name, role].compactMap { $0 }.joined(separator: ", ")), action: action, menu: EmptyView()) { _ in
+        CardContainer(accessibilityLabel: accessibilityText, action: action, menu: { EmptyView() }) { _ in
             VStack(spacing: 10) {
-                RemoteImage(
-                    url: imageURL, size: CGSize(width: diameter, height: diameter), placeholderSeed: name,
-                    placeholderTitle: name, placeholderStyle: .monogram
-                )
+                Group {
+                    if let imageURL {
+                        RemoteImage(
+                            url: imageURL, size: CGSize(width: diameter, height: diameter), placeholderSeed: name,
+                            placeholderTitle: name, placeholderStyle: .monogram
+                        )
+                    } else {
+                        // Same tree as RemoteImage's nil-URL path, minus the loader node
+                        // and the no-op clip (the placeholder fills its frame exactly).
+                        PlaceholderArtwork(seed: name, title: name, style: .monogram)
+                            .frame(width: diameter, height: diameter)
+                    }
+                }
                 .clipShape(.circle)
                 .overlay { Circle().strokeBorder(.primary.opacity(0.06), lineWidth: 1) }
                 VStack(spacing: 2) {

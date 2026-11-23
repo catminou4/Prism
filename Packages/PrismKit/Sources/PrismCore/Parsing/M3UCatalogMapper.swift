@@ -47,19 +47,79 @@ public enum M3UCatalogMapper {
             default: break
             }
         }
-        switch pathMarker(entry.url.path(percentEncoded: true)) {
+        switch pathMarker(entry.url) {
         case .series?: return .series
         case .movie?: return .movie
         case .live?: return .live
         default: break
         }
-        let ext = entry.url.pathExtension.lowercased()
         if name.season != nil, name.episode != nil { return .series }
-        let hasLiveMarkers = entry.attributes["catchup"] != nil || entry.attributes["timeshift"] != nil
-            || entry.attributes["tvg-rec"] != nil || entry.attributes["catchup-days"] != nil
-        if movieExtensions.contains(ext), !hasLiveMarkers { return .movie }
-        if entry.duration > 0, !liveExtensions.contains(ext), !hasLiveMarkers { return .movie }
-        return .live
+        let ext = entry.url.pathExtension.lowercased()
+        // Live extensions are unambiguous (never in movieExtensions); checking them first
+        // skips the four attribute lookups `hasLiveMarkers` costs on every live entry.
+        if liveExtensions.contains(ext) { return .live }
+        if movieExtensions.contains(ext) { return hasLiveMarkers(entry.attributes) ? .live : .movie }
+        return entry.duration > 0 && !hasLiveMarkers(entry.attributes) ? .movie : .live
+    }
+
+    /// Catch-up/timeshift attributes turn an otherwise movie-looking entry into a live channel.
+    private static func hasLiveMarkers(_ attributes: [String: String]) -> Bool {
+        attributes["catchup"] != nil || attributes["timeshift"] != nil
+            || attributes["tvg-rec"] != nil || attributes["catchup-days"] != nil
+    }
+
+    /// First directory segment of the path naming the content type (`/series/`, `/movie/`, `/live/`…).
+    /// Scans `absoluteString` bytes (case-insensitive, no allocation); exotic URLs without
+    /// "scheme://" fall back to the Foundation path.
+    static func pathMarker(_ url: URL) -> MediaKind? {
+        let bytes = url.absoluteString.utf8
+        var i = bytes.startIndex
+        var hierarchical = false
+        while i < bytes.endIndex {
+            let byte = bytes[i]
+            if byte == 0x3A { // ':' ends the scheme when followed by "//"
+                let slash1 = bytes.index(after: i)
+                if slash1 < bytes.endIndex, bytes[slash1] == 0x2F {
+                    let slash2 = bytes.index(after: slash1)
+                    if slash2 < bytes.endIndex, bytes[slash2] == 0x2F {
+                        i = bytes.index(after: slash2)
+                        hierarchical = true
+                    }
+                }
+                break
+            }
+            if byte == 0x2F || byte == 0x3F || byte == 0x23 { break } // '/', '?', '#' before ':' → no "scheme://"
+            i = bytes.index(after: i)
+        }
+        guard hierarchical else { return pathMarker(url.path(percentEncoded: true)) }
+        // Skip the authority: the path starts at the first '/', ends at '?' or '#'.
+        while i < bytes.endIndex {
+            let byte = bytes[i]
+            if byte == 0x2F { break }
+            if byte == 0x3F || byte == 0x23 { return nil }
+            i = bytes.index(after: i)
+        }
+        guard i < bytes.endIndex else { return nil }
+        var segment = PackedKey()
+        var overflow = false
+        var isFirstByte = true
+        while i < bytes.endIndex {
+            let byte = bytes[i]
+            if byte == 0x3F || byte == 0x23 { break }
+            if byte == 0x2F {
+                if !isFirstByte, !overflow, segment.count > 0, let kind = markerSegments[segment] { return kind }
+                segment = PackedKey()
+                overflow = false
+                isFirstByte = false
+                i = bytes.index(after: i)
+                continue
+            }
+            isFirstByte = false
+            let lower = byte >= 0x41 && byte <= 0x5A ? byte | 0x20 : byte
+            if !segment.append(lower) { overflow = true }
+            i = bytes.index(after: i)
+        }
+        return nil // the last segment is the file name, never a marker
     }
 
     /// First directory segment of the path naming the content type (`/series/`, `/movie/`, `/live/`…),
@@ -154,8 +214,21 @@ public enum M3UCatalogMapper {
         "MULTI", "VOSTFR", "VOSTA", "VOST", "SUBFRENCH", "VFF", "VFQ", "VFI", "VF2", "TRUEFRENCH", "FRENCH", "VF", "VO",
     ]
 
+    /// Edition → position in `explicitEditions`; first match wins, as before.
+    private static let editionRank: [String: Int] = Dictionary(
+        explicitEditions.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first }
+    )
+
     static func audioEdition(tags: [String], declared: Set<String>) -> String? {
-        if let edition = explicitEditions.first(where: tags.contains) { return edition }
+        var bestRank = Int.max
+        var edition: String?
+        for tag in tags {
+            if let rank = editionRank[tag], rank < bestRank {
+                bestRank = rank
+                edition = tag
+            }
+        }
+        if let edition { return edition }
         if !declared.isEmpty { return declared.sorted().joined(separator: "+") }
         let locales = tags.filter { NameTables.trailingCodes.contains($0) || NameTables.longCodes.contains($0) }
         return locales.isEmpty ? nil : Set(locales).sorted().joined(separator: "+")

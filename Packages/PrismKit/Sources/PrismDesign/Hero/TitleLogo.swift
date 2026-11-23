@@ -9,6 +9,7 @@ public struct TitleLogo: View {
     private let maxSize: CGSize
     @State private var logo: CGImage?
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(url: URL?, fallbackTitle: String, maxSize: CGSize = CGSize(width: PrismMetrics.titleLogoMaxWidth, height: PrismMetrics.titleLogoMaxHeight)) {
         self.url = url
@@ -33,11 +34,16 @@ public struct TitleLogo: View {
             }
         }
         .accessibilityAddTraits(.isHeader)
+        .onChange(of: url) { _, _ in logo = nil }
         .task(id: url) {
             guard let url else { logo = nil; return }
             let pixels = CGSize(width: maxSize.width * displayScale, height: maxSize.height * displayScale)
-            if let image = await ImagePipeline.shared.image(for: url, pixelSize: pixels, fitting: .fit), !Task.isCancelled {
-                withAnimation(PrismMotion.imageFade) { logo = image }
+            var image = ImagePipeline.shared.cachedImage(for: url, pixelSize: pixels, fitting: .fit)
+            if image == nil {
+                image = await ImagePipeline.shared.image(for: url, pixelSize: pixels, fitting: .fit)
+            }
+            if let image, !Task.isCancelled {
+                withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) { logo = image }
             }
         }
     }

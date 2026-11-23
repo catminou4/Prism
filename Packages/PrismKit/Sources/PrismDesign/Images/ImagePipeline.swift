@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import SwiftUI
+import Synchronization
 
 /// Shared image loader: request de-duplication, memory cache (≈ 160 MiB, byte cost), disk cache
 /// (1 GB, survives relaunch), ImageIO downsampling off the main thread.
@@ -50,7 +51,6 @@ public actor ImagePipeline {
         let blur: Int
 
         var target: CGSize { CGSize(width: width, height: height) }
-        var cacheKey: NSString { "\(width)x\(height)|\(fitting.rawValue)|\(blur)|\(url.absoluteString)" as NSString }
 
         func showsSameArtwork(as other: Key) -> Bool {
             url == other.url && fitting == other.fitting && blur == other.blur
@@ -61,6 +61,10 @@ public actor ImagePipeline {
     private final class InFlight<Value: Sendable> {
         let task: Task<Value, Never>
         var waiters = 0
+        /// Set when the fetch was started by the background warm path: its failure cools
+        /// `warmFailedRequests` only — foreground callers joining the same entry must not
+        /// poison `failedRequests` through `releaseData`.
+        var warmOwned = false
         init(task: Task<Value, Never>) { self.task = task }
     }
 
@@ -75,12 +79,19 @@ public actor ImagePipeline {
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
     private var failedRequests: [URL: ContinuousClock.Instant] = [:]
-    private var prefetches: [URL: Task<Void, Never>] = [:]
+    /// Decode-level failures (bytes arrived, thumbnail rejected/undecodable). Deterministic
+    /// per key, so a card remounting during a scroll doesn't pay the decode cost again.
+    /// Time-boxed like `failedRequests`: cached bytes can be replaced by a later fetch.
+    private var failedDecodes: [Key: ContinuousClock.Instant] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
     private var warmQueue: [ArtworkURL.Resolved] = []
     private var warmQueued: Set<URL> = []
     private var warmRunning = 0
+    /// Warm-path-only failures: a background-priority timeout must not poison the
+    /// foreground 120 s cooldown (`failedRequests`) for a URL that would succeed
+    /// interactively. Warm enqueues check both tables.
+    private var warmFailedRequests: [URL: ContinuousClock.Instant] = [:]
     private static let warmConcurrency = 3
 
     public init(memoryCapacity: Int = 160 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
@@ -98,7 +109,9 @@ public actor ImagePipeline {
         configuration.waitsForConnectivity = false
         configuration.httpAdditionalHeaders = ["Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8"]
         if warming { configuration.networkServiceType = .background }
-        return URLSession(configuration: configuration)
+        // `download` drives its tasks manually: the async `URLSession` APIs bypass session
+        // delegates entirely, so the 2xx/MIME/size checks and the byte cap live in the delegate.
+        return URLSession(configuration: configuration, delegate: downloadDelegate, delegateQueue: nil)
     }
 
     // MARK: Public API
@@ -118,6 +131,7 @@ public actor ImagePipeline {
     func image(for key: Key, blurredFrom source: Key? = nil) async -> CGImage? {
         guard !Task.isCancelled else { return nil }
         if let hit = memory.image(for: key) { return hit }
+        if isCoolingDown(key, in: &failedDecodes) { return nil }
 
         let entry: InFlight<CGImage?>
         if let existing = inFlight[key] {
@@ -160,24 +174,27 @@ public actor ImagePipeline {
     public nonisolated func warm(_ urls: [URL], pixelSize: CGSize, fitting: Fitting = .fill) {
         guard !urls.isEmpty, let probe = Self.key(url: urls[0], pixelSize: pixelSize, fitting: fitting, blurRadius: 0) else { return }
         let target = probe.target
-        Task(priority: .utility) { await self.enqueueWarm(urls, target: target, fitting: fitting) }
+        Task(priority: .utility) {
+            // URL → provider-URL resolution is pure parsing (~4 µs per URL): keep it off the
+            // pipeline actor, which also serves on-screen `image(for:)` calls.
+            var requests: [ArtworkURL.Resolved] = []
+            requests.reserveCapacity(urls.count)
+            for url in urls where !url.isFileURL {
+                requests.append(ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false))
+            }
+            await self.enqueueWarm(requests)
+        }
     }
 
-    /// Warms the caches for upcoming items (low priority, de-duplicated).
+    /// Kept for API compatibility: prefetching now means warming the encoded bytes
+    /// (what `warm` does); there is no separate decode-level prefetch anymore.
     public nonisolated func prefetch(_ urls: [URL], maxPixelSize: CGFloat) {
-        guard !urls.isEmpty else { return }
-        Task(priority: .utility) { await self.startPrefetch(urls, pixelSize: CGSize(width: maxPixelSize, height: maxPixelSize), fitting: .fit) }
+        warm(urls, pixelSize: CGSize(width: maxPixelSize, height: maxPixelSize), fitting: .fit)
     }
 
-    /// Warms the caches for a fill target (same key as `RemoteImage` with that size).
+    /// Kept for API compatibility — see `prefetch(_:maxPixelSize:)`.
     public nonisolated func prefetch(_ urls: [URL], pixelSize: CGSize) {
-        guard !urls.isEmpty else { return }
-        Task(priority: .utility) { await self.startPrefetch(urls, pixelSize: pixelSize, fitting: .fill) }
-    }
-
-    /// Cancels pending prefetches for `urls` (all when `nil`).
-    public nonisolated func cancelPrefetch(_ urls: [URL]? = nil) {
-        Task { await self.stopPrefetch(urls) }
+        warm(urls, pixelSize: pixelSize)
     }
 
     /// Average (vibrance-boosted) colour of the image, cached per URL.
@@ -186,18 +203,36 @@ public actor ImagePipeline {
     }
 
     /// Average colour as plain components (for gradients/tinting maths).
+    ///
+    /// Reuses the decode a visible card already runs for the same URL (any size/fitting) —
+    /// decoded images feed `averageColors` — so no second download or decode is needed.
+    /// Falls back to a tiny 64 px decode only when nothing is in flight.
     public func averageRGBA(for url: URL) async -> RGBA? {
         if let cached = averageColors[url] { return cached }
+        let candidates = inFlight.compactMap { $0.key.url == url && $0.key.blur == 0 ? $0.value : nil }
+        for entry in candidates {
+            if let image = await entry.task.value {
+                // A finished decode already stored its own sample (see `makeTask`); reuse it
+                // instead of drawing the 12 px average a second time. The fallback covers a
+                // decode that returned an image without memoizing (cancelled mid-store).
+                if let rgba = averageColors[url] { return rgba }
+                return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
+            }
+        }
+        // A same-URL decode may have memoized while the in-flight ones were awaited.
+        if let cached = averageColors[url] { return cached }
         guard let image = await image(for: url, maxPixelSize: 64) else { return nil }
-        let rgba = await ImageDecoder.averageColor(of: image)
-        averageColors[url] = rgba
-        if averageColors.count > 4000 { averageColors.removeAll(keepingCapacity: true) }
-        return rgba
+        // Same reuse: the 64 px decode memoizes too unless it was a memory-cache hit.
+        if let rgba = averageColors[url] { return rgba }
+        return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
     }
 
-    /// Synchronous lookup of an already computed average colour.
-    public func cachedAverageColor(for url: URL) -> Color? {
-        averageColors[url]??.color
+    /// Memoizes a sampled colour (a `nil` sample is memoized too) and keeps the table bounded.
+    @discardableResult
+    private func storeAverageColor(_ url: URL, _ rgba: RGBA?) -> RGBA? {
+        averageColors[url] = rgba
+        if averageColors.count > 16_384 { averageColors.removeAll(keepingCapacity: true) }
+        return rgba
     }
 
     /// Drops the memory cache (e.g. on memory pressure); the disk cache is kept.
@@ -209,6 +244,8 @@ public actor ImagePipeline {
         disk.removeAll()
         averageColors.removeAll()
         failedRequests.removeAll()
+        failedDecodes.removeAll()
+        warmFailedRequests.removeAll()
     }
 
     // MARK: Internals
@@ -239,13 +276,16 @@ public actor ImagePipeline {
         let blur = CGFloat(key.blur)
         let target = key.target
         return Task.detached(priority: .userInitiated) {
+            var reachedDecode = false
             let image: CGImage?
             if blur > 0, let source {
                 guard let sharp = await self.image(for: source) else { return nil }
+                reachedDecode = true
                 image = await decoder.decode {
                     return ImageDecoder.blurred(sharp, radius: blur * 0.25, target: target)
                 }
             } else if key.url.isFileURL {
+                reachedDecode = true
                 image = await decoder.decode {
                     let thumbnail = ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
                     return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
@@ -253,6 +293,7 @@ public actor ImagePipeline {
             } else if let data = await self.sharedData(
                 for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             ) {
+                reachedDecode = true
                 image = await decoder.decode {
                     let thumbnail = ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
                     return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
@@ -260,8 +301,26 @@ public actor ImagePipeline {
             } else {
                 image = nil
             }
+            // The decode queue only yields nil without running the work when the task was
+            // cancelled — a live task plus a nil means the bytes were fine but the thumbnail
+            // was rejected or undecodable, which repeats identically on every remount.
+            if reachedDecode, image == nil, !Task.isCancelled {
+                await self.noteDecodeFailure(key)
+            }
             if let image, !Task.isCancelled {
                 memory.insert(image, for: key)
+                // Feed the colour memo from the decode that already happened: `averageRGBA`
+                // then never needs a second download for artwork on screen. Blurred variants
+                // would tint the sample, so only sharp decodes count. Sampling is ~40 µs–19 ms
+                // nobody waits for (only CategoryTile reads the memo) — keep it off the
+                // decode→display path.
+                if key.blur == 0 {
+                    let url = key.url
+                    Task { [image] in
+                        let rgba = await ImageDecoder.averageColor(of: image)
+                        await self.storeAverageColor(url, rgba)
+                    }
+                }
             }
             return image
         }
@@ -274,7 +333,7 @@ public actor ImagePipeline {
         if let existing = dataInFlight[url] {
             entry = existing
         } else {
-            guard !isCoolingDown(url) else { return nil }
+            guard !isCoolingDown(url, in: &failedRequests) else { return nil }
             let disk = disk, session = session
             entry = InFlight(task: Task.detached(priority: .userInitiated) {
                 await Self.encodedData(for: request, disk: disk, session: session)
@@ -292,19 +351,40 @@ public actor ImagePipeline {
         return data
     }
 
+    /// `true` while `key` is inside its failure cooldown; drops the entry once it expires.
+    private func isCoolingDown<K: Hashable>(_ key: K, in table: inout [K: ContinuousClock.Instant]) -> Bool {
+        guard let expiry = table[key] else { return false }
+        if expiry > ContinuousClock.now { return true }
+        table[key] = nil
+        return false
+    }
+
+    /// Records a failure for `key`, bounded like the request table: expired entries go first,
+    /// then the soonest-to-expire ones if the table is still full.
+    private func noteFailure<K: Hashable>(_ table: inout [K: ContinuousClock.Instant], _ key: K) {
+        if table.count >= 2_048 {
+            let now = ContinuousClock.now
+            table = table.filter { $0.value > now }
+            if table.count >= 2_048 {
+                // Evict the entries closest to expiry: they are the least valuable.
+                for (k, _) in table.sorted(by: { $0.value < $1.value }).prefix(128) {
+                    table[k] = nil
+                }
+            }
+        }
+        table[key] = ContinuousClock.now.advanced(by: .seconds(120))
+    }
+
+    private func noteDecodeFailure(_ key: Key) {
+        noteFailure(&failedDecodes, key)
+    }
+
     private func releaseData(_ url: URL, token: ObjectIdentifier, finished: Bool, failed: Bool = false) {
         guard let entry = dataInFlight[url], ObjectIdentifier(entry) == token else { return }
         if finished {
             dataInFlight[url] = nil
-            if failed, !entry.task.isCancelled {
-                if failedRequests.count >= 2_048 {
-                    let now = ContinuousClock.now
-                    failedRequests = failedRequests.filter { $0.value > now }
-                    if failedRequests.count >= 2_048 {
-                        for key in Array(failedRequests.keys.prefix(128)) { failedRequests[key] = nil }
-                    }
-                }
-                failedRequests[url] = ContinuousClock.now.advanced(by: .seconds(120))
+            if failed, !entry.task.isCancelled, !entry.warmOwned {
+                noteFailure(&failedRequests, url)
             }
             return
         }
@@ -315,45 +395,71 @@ public actor ImagePipeline {
         }
     }
 
-    private func isCoolingDown(_ url: URL) -> Bool {
-        guard let expiry = failedRequests[url] else { return false }
-        if expiry > ContinuousClock.now { return true }
-        failedRequests[url] = nil
-        return false
-    }
+    /// Largest encoded payload accepted. Checked on `Content-Length` before the body is read
+    /// and while streaming, so a hostile or broken "image" URL can neither balloon memory nor
+    /// disk beyond this. Overshooting by a few KiB between checks is harmless.
+    private static let maxImageBytes = 48 << 20
 
-    /// Disk hit, else network (validated as an image before being stored). A resized TMDB request
-    /// falls back to the provider's own URL, from disk when its copy is large enough, else online.
+    /// Attached to both sessions in `makeSession`; `download` relies on its callbacks.
+    private static let downloadDelegate = ImageDownloadDelegate(limit: maxImageBytes)
+
+    /// Disk hit, else network. Bytes are validated (status, MIME, size cap) and — when no
+    /// fallback exists — stored even if undecodable, which prevents a refetch loop for dead
+    /// artwork URLs. `isDecodable` gates the return value so `encodedData` falls through to
+    /// the provider's own URL; the decode step downstream is the image validator.
     @concurrent private nonisolated static func encodedData(for request: ArtworkURL.Resolved, disk: ImageDiskCache, session: URLSession) async -> Data? {
         if let data = disk.data(for: request.primary) { return data }
         if request.fallbackIsLarger, let fallback = request.fallback, let data = disk.data(for: fallback) { return data }
-        if let data = await download(request.primary, disk: disk, session: session) { return data }
+        // Storing undecodable bytes for the primary would shadow the fallback on later
+        // requests (the disk hit always wins), so only fallback-less URLs keep them.
+        if let data = await download(request.primary, disk: disk, session: session, storeUndecodable: request.fallback == nil) { return data }
         guard !Task.isCancelled, let fallback = request.fallback else { return nil }
         if !request.fallbackIsLarger, let data = disk.data(for: fallback) { return data }
-        return await download(fallback, disk: disk, session: session)
+        return await download(fallback, disk: disk, session: session, storeUndecodable: true)
     }
 
-    @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession) async -> Data? {
+    /// Downloads through a manually driven `URLSessionDataTask`: `ImageDownloadDelegate`
+    /// rejects bad statuses, non-image MIME types and oversized `Content-Length` before the
+    /// body starts, then accumulates chunks with memcpy and cancels the moment the running
+    /// total passes the cap. This replaces `URLSession.AsyncBytes`, whose per-byte iteration
+    /// cost tens of ns per byte (~0.3–0.8 s of CPU for a 10 MB backdrop).
+    @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession, storeUndecodable: Bool) async -> Data? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        do {
-            let (data, response) = try await session.data(from: url)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
-            if let mime = response.mimeType?.lowercased(), mime.hasPrefix("text/") || mime.contains("json") || mime.contains("html") {
-                return nil
+        let task = session.dataTask(with: url)
+        let data = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                downloadDelegate.begin(task, continuation)
+                task.resume()
             }
-            guard ImageDecoder.isDecodable(data) else { return nil }
-            disk.store(data, for: url)
-            return data
-        } catch {
+        } onCancel: {
+            task.cancel()
+        }
+        guard let data, !data.isEmpty, data.count <= maxImageBytes else { return nil }
+        guard ImageDecoder.isDecodable(data) else {
+            if storeUndecodable { disk.store(data, for: url) }
             return nil
         }
+        disk.store(data, for: url)
+        return data
     }
 
-    private func enqueueWarm(_ urls: [URL], target: CGSize, fitting: Fitting) {
+    /// True when `encodedData` would answer from disk without touching the network —
+    /// warming such a URL is pure churn. Mirrors the lookup order in `encodedData`:
+    /// the larger fallback only short-circuits the fetch when it is the preferred size.
+    private func warmServedFromDisk(_ request: ArtworkURL.Resolved) -> Bool {
+        disk.contains(request.primary)
+            || (request.fallbackIsLarger && request.fallback.map { disk.contains($0) } ?? false)
+    }
+
+    private func enqueueWarm(_ requests: [ArtworkURL.Resolved]) {
         var fresh: [ArtworkURL.Resolved] = []
-        for url in urls where !url.isFileURL {
-            let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary),
+        for request in requests {
+            // Bytes already on disk make the warm-up pure churn (a detached task plus a
+            // ~40 µs mmap read per URL on every scroll stop).
+            guard dataInFlight[request.primary] == nil,
+                  !isCoolingDown(request.primary, in: &failedRequests),
+                  !isCoolingDown(request.primary, in: &warmFailedRequests),
+                  !warmServedFromDisk(request),
                   warmQueued.insert(request.primary).inserted else { continue }
             fresh.append(request)
         }
@@ -371,7 +477,10 @@ public actor ImagePipeline {
         while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
             let request = warmQueue.removeFirst()
             warmQueued.remove(request.primary)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary) else { continue }
+            guard dataInFlight[request.primary] == nil,
+                  !isCoolingDown(request.primary, in: &failedRequests),
+                  !isCoolingDown(request.primary, in: &warmFailedRequests),
+                  !warmServedFromDisk(request) else { continue }
             warmRunning += 1
             let disk = disk, session = prefetchSession
             // Registered like any fetch, so an on-screen decode of the same image joins it.
@@ -379,11 +488,17 @@ public actor ImagePipeline {
                 await Self.encodedData(for: request, disk: disk, session: session)
             })
             entry.waiters = 1
+            entry.warmOwned = true
             dataInFlight[request.primary] = entry
             let token = ObjectIdentifier(entry)
             Task(priority: .utility) {
                 let data = await entry.task.value
-                self.releaseData(request.primary, token: token, finished: true, failed: data == nil)
+                // Warm failures cool the warm path only — a throttled background timeout
+                // must not mark the URL dead for on-screen loads (`failedRequests`).
+                self.releaseData(request.primary, token: token, finished: true, failed: false)
+                if data == nil, !entry.task.isCancelled {
+                    self.noteFailure(&self.warmFailedRequests, request.primary)
+                }
                 self.warmRunning -= 1
                 self.startWarming()
             }
@@ -404,27 +519,73 @@ public actor ImagePipeline {
             inFlight[key] = nil
         }
     }
+}
 
-    private func startPrefetch(_ urls: [URL], pixelSize: CGSize, fitting: Fitting) {
-        for url in urls where prefetches[url] == nil {
-            guard let key = Self.key(url: url, pixelSize: pixelSize, fitting: fitting, blurRadius: 0),
-                  memory.image(for: key) == nil else { continue }
-            prefetches[url] = Task(priority: .utility) {
-                _ = await self.image(for: key)
-                self.prefetchFinished(url)
-            }
-        }
+/// Drives the data tasks `ImagePipeline.download` creates manually. The async `URLSession`
+/// APIs (`data(from:)`, `bytes(from:)`, completion-handler tasks) bypass session delegates on
+/// macOS 26 — verified empirically — so header checks and the byte cap can only live here.
+///
+/// Callbacks arrive on each session's serial delegate queue; `pending` is locked because the
+/// foreground and prefetch sessions have separate queues. Every resumed task produces exactly
+/// one `didCompleteWithError`, which is the single point where the continuation resumes.
+private final class ImageDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private struct Pending {
+        var data = Data()
+        /// `Content-Length` hint used to pre-size the accumulation (0 = unknown).
+        var hint = 0
+        var continuation: CheckedContinuation<Data?, Never>?
     }
 
-    private func prefetchFinished(_ url: URL) { prefetches[url] = nil }
+    private let pending = Mutex<[ObjectIdentifier: Pending]>([:])
+    private let limit: Int
 
-    private func stopPrefetch(_ urls: [URL]?) {
-        if let urls {
-            for url in urls { prefetches.removeValue(forKey: url)?.cancel() }
-        } else {
-            prefetches.values.forEach { $0.cancel() }
-            prefetches.removeAll()
+    init(limit: Int) { self.limit = limit }
+
+    /// Registers the continuation before `task.resume()`; safe even if the caller is already
+    /// cancelled — a task cancelled before resume still reports `didCompleteWithError`.
+    func begin(_ task: URLSessionDataTask, _ continuation: CheckedContinuation<Data?, Never>) {
+        pending.withLock { $0[ObjectIdentifier(task)] = Pending(continuation: continuation) }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            completionHandler(.cancel)
+            return
         }
+        if let mime = response.mimeType?.lowercased(), mime.hasPrefix("text/") || mime.contains("json") || mime.contains("html") {
+            completionHandler(.cancel)
+            return
+        }
+        // Headers arrive before the body: refuse oversized payloads without consuming them.
+        let expected = response.expectedContentLength
+        if expected > Int64(limit) {
+            completionHandler(.cancel)
+            return
+        }
+        if expected > 0 {
+            pending.withLock { $0[ObjectIdentifier(dataTask)]?.hint = Int(min(expected, Int64(limit))) }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let over = pending.withLock { state -> Bool in
+            guard var entry = state[ObjectIdentifier(dataTask)] else { return true }
+            if entry.data.isEmpty, entry.hint > 0 { entry.data.reserveCapacity(entry.hint) }
+            entry.data.append(data)
+            state[ObjectIdentifier(dataTask)] = entry
+            return entry.data.count > limit
+        }
+        if over { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        let entry = pending.withLock { $0.removeValue(forKey: ObjectIdentifier(task)) }
+        // Any error — network failure, our own oversize/status/MIME cancel, caller cancel —
+        // yields nil; only a clean finish returns the accumulated bytes.
+        entry?.continuation?.resume(returning: error == nil ? entry?.data : nil)
     }
 }
 
@@ -479,27 +640,64 @@ private actor ImageDecodeQueue {
     }
 }
 
-/// Thread-safe byte-cost memory cache.
+/// Thread-safe byte-cost memory cache keyed by the decode `Key`.
+///
+/// A plain dictionary + mutex replaces `NSCache<NSString, …>`: lookups hash the `Key` directly,
+/// so the hot `RemoteImage.body` path allocates nothing (no per-eval `NSString` for the cache
+/// key). Eviction approximates LRU — reads refresh a stamp — batched to ~20 % headroom so
+/// inserts stay amortised O(1) apart from the occasional sort.
 nonisolated final class MemoryCache: @unchecked Sendable {
-    private final class Box {
+    private struct Entry {
         let image: CGImage
-        init(_ image: CGImage) { self.image = image }
+        let bytes: Int
+        var stamp: UInt64
     }
 
-    private let cache = NSCache<NSString, Box>()
-
-    init(costLimit: Int) {
-        cache.totalCostLimit = costLimit
-        cache.countLimit = 4000
+    private struct State {
+        var entries: [ImagePipeline.Key: Entry] = [:]
+        var bytes = 0
+        var clock: UInt64 = 0
     }
+
+    private let state = Mutex(State())
+    private let byteLimit: Int
+    private static let countLimit = 4096
+
+    init(costLimit: Int) { byteLimit = costLimit }
 
     func image(for key: ImagePipeline.Key) -> CGImage? {
-        cache.object(forKey: key.cacheKey)?.image
+        state.withLock { state in
+            state.clock &+= 1
+            guard var entry = state.entries[key] else { return nil }
+            entry.stamp = state.clock
+            state.entries[key] = entry
+            return entry.image
+        }
     }
 
     func insert(_ image: CGImage, for key: ImagePipeline.Key) {
-        cache.setObject(Box(image), forKey: key.cacheKey, cost: image.bytesPerRow * image.height)
+        let bytes = image.bytesPerRow * image.height
+        state.withLock { state in
+            state.clock &+= 1
+            if let old = state.entries.updateValue(Entry(image: image, bytes: bytes, stamp: state.clock), forKey: key) {
+                state.bytes -= old.bytes
+            }
+            state.bytes += bytes
+            evict(&state)
+        }
     }
 
-    func removeAll() { cache.removeAllObjects() }
+    /// Drops the stalest entries until back under ~80 % of both budgets.
+    private func evict(_ state: inout State) {
+        let byteTarget = byteLimit * 8 / 10
+        let countTarget = Self.countLimit * 8 / 10
+        guard state.bytes > byteTarget || state.entries.count > Self.countLimit else { return }
+        for (key, entry) in state.entries.sorted(by: { $0.value.stamp < $1.value.stamp }) {
+            guard state.bytes > byteTarget || state.entries.count > countTarget else { break }
+            state.entries[key] = nil
+            state.bytes -= entry.bytes
+        }
+    }
+
+    func removeAll() { state.withLock { $0 = State() } }
 }

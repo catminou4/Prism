@@ -161,20 +161,18 @@ public actor CatalogRepository {
         let account = try await client.authenticate()
         report(ImportProgress(stage: .account(account), fraction: 0.1))
 
+        // Categories are small but their fetch used to sit serially in front of the giant
+        // lists: run both passes concurrently. The list endpoints only need the adult-ID
+        // sets (which join these same in-flight fetches inside the client), so nothing
+        // waits on the category responses before the list GETs start.
         async let liveCategories = try? client.categories(.live)
         async let movieCategories = try? client.categories(.movie)
         async let seriesCategories = try? client.categories(.series)
-        let fetchedCategories = await (live: liveCategories, movie: movieCategories, series: seriesCategories)
-        let categories = (fetchedCategories.live ?? []) + (fetchedCategories.movie ?? []) + (fetchedCategories.series ?? [])
-        var failedCategoryKinds: Set<MediaKind> = []
-        if fetchedCategories.live == nil { failedCategoryKinds.insert(.live) }
-        if fetchedCategories.movie == nil { failedCategoryKinds.insert(.movie) }
-        if fetchedCategories.series == nil { failedCategoryKinds.insert(.series) }
         try Task.checkCancellation()
         report(ImportProgress(stage: .downloading(fraction: nil), fraction: 0.2))
 
         let preferHLS = source.preferHLSForLive
-        var catalog = SourceCatalog(sourceID: source.id, categories: categories, account: account, fetchedAt: .now)
+        var catalog = SourceCatalog(sourceID: source.id, categories: [], account: account, fetchedAt: .now)
         var counts = ImportCounts()
         var failures: [(kind: MediaKind, error: any Error)] = []
         try await withThrowingTaskGroup(of: XtreamList.self) { group in
@@ -211,6 +209,15 @@ public actor CatalogRepository {
             }
         }
         try Task.checkCancellation()
+        // The category fetches ran concurrently with the lists; collect them now (they are
+        // long done — the lists are the slow pole).
+        let fetchedCategories = await (live: liveCategories, movie: movieCategories, series: seriesCategories)
+        let categories = (fetchedCategories.live ?? []) + (fetchedCategories.movie ?? []) + (fetchedCategories.series ?? [])
+        var failedCategoryKinds: Set<MediaKind> = []
+        if fetchedCategories.live == nil { failedCategoryKinds.insert(.live) }
+        if fetchedCategories.movie == nil { failedCategoryKinds.insert(.movie) }
+        if fetchedCategories.series == nil { failedCategoryKinds.insert(.series) }
+        catalog.categories = categories
         // Panels often fail on one endpoint: keep what worked, fail only when everything failed.
         if failures.count == 3, let first = failures.first { throw first.error }
         // A list or category endpoint that failed this time keeps its previous content instead of
@@ -270,8 +277,12 @@ public actor CatalogRepository {
 
     @concurrent
     static func parsePlaylist(_ data: Data, sourceID: SourceID) async throws -> (SourceCatalog, [URL]) {
-        guard looksLikePlaylist(data.prefix(8_192)) else { throw SourceError.notAPlaylist }
-        let playlist = M3UParser.parse(data)
+        // Local `.gz` files or broken servers can deliver gzip without Content-Encoding:
+        // URLSession only decompresses when the header is present. A failed inflate falls
+        // back to the raw bytes, preserving the previous notAPlaylist error.
+        let bytes = Gzip.isCompressed(data) ? (try? Gzip.decompress(data)) ?? data : data
+        guard looksLikePlaylist(bytes.prefix(8_192)) else { throw SourceError.notAPlaylist }
+        let playlist = M3UParser.parse(bytes)
         guard !playlist.entries.isEmpty else { throw SourceError.emptyPlaylist }
         try Task.checkCancellation()
         let catalog = M3UCatalogMapper.makeCatalog(from: playlist, sourceID: sourceID, now: .now)
@@ -325,16 +336,18 @@ public actor CatalogRepository {
             return SourceValidation(account: try await client.authenticate())
         case .m3uURL:
             guard let url = source.serverURL, ["http", "https", "file"].contains(url.scheme?.lowercased() ?? "") else { throw SourceError.missingURL }
-            let prefix: Data
+            var prefix: Data
             if url.isFileURL {
                 prefix = try await Self.readLocalPlaylist(bookmark: nil, fallbackURL: url).prefix(8_192)
+                if Gzip.isCompressed(prefix), let inflated = try? Gzip.decompress(prefix) { prefix = inflated }
             } else {
                 prefix = try await sniff(url, userAgent: source.userAgent)
             }
             guard Self.looksLikePlaylist(prefix) else { throw SourceError.notAPlaylist }
             return SourceValidation()
         case .m3uFile:
-            let data = try await Self.readLocalPlaylist(bookmark: source.fileBookmark, fallbackURL: source.serverURL)
+            var data = try await Self.readLocalPlaylist(bookmark: source.fileBookmark, fallbackURL: source.serverURL)
+            if Gzip.isCompressed(data), let inflated = try? Gzip.decompress(data) { data = inflated }
             guard Self.looksLikePlaylist(data.prefix(8_192)) else { throw SourceError.notAPlaylist }
             let (catalog, _) = try await Self.parsePlaylist(data, sourceID: source.id)
             return SourceValidation(sampleCounts: ImportCounts(catalog))
@@ -356,6 +369,11 @@ public actor CatalogRepository {
                 if prefix.count >= 8_192 { break }
             }
             bytes.task.cancel()
+            // Gzipped playlists decompress partially from the first chunk: enough to see
+            // the #EXTM3U header a few KB in.
+            if Gzip.isCompressed(prefix), let inflated = try? Gzip.decompress(prefix) {
+                prefix = inflated
+            }
             return prefix
         } catch let error as URLError {
             throw SourceError.from(error)

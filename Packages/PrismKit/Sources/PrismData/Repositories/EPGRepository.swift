@@ -9,6 +9,19 @@ public actor EPGRepository {
     nonisolated let session: URLSession
     private var guides: [SourceID: EPGGuide] = [:]
     private var fetchedAt: [SourceID: Date] = [:]
+    /// One refresh per source at a time: concurrent callers (guide screen, sports page, import)
+    /// share the same download/parse cycle instead of duplicating it.
+    private var refreshes: [SourceID: GuideRequest] = [:]
+
+    private struct GuideRequest {
+        let id = UUID()
+        let task: Task<EPGGuide, any Error>
+    }
+
+    private enum FeedDownload: Sendable {
+        case success(XMLTVDocument)
+        case failure(any Error)
+    }
 
     /// Programmes kept around "now" (the XMLTV of large providers covers weeks).
     public static let pastWindow: TimeInterval = 2 * 86_400
@@ -28,9 +41,17 @@ public actor EPGRepository {
             guard !Task.isCancelled else { return .empty }
             if let entry = await cache.load(source.id) {
                 let guide = await Self.makeGuide(entry.programs, channels: entry.channels)
-                guides[source.id] = guide
-                fetchedAt[source.id] = entry.fetchedAt
-                ordered.append(guide)
+                // Bootstrap now awaits this after `.ready`: a refresh that landed while
+                // the entry was being read must not be overwritten by the older disk
+                // snapshot. The decoded guide still feeds the merge when nothing fresher
+                // is in memory.
+                if let known = fetchedAt[source.id], known > entry.fetchedAt {
+                    ordered.append(guides[source.id] ?? guide)
+                } else {
+                    guides[source.id] = guide
+                    fetchedAt[source.id] = entry.fetchedAt
+                    ordered.append(guide)
+                }
             } else if DemoContent.isDemo(source) {
                 let guide = DemoContent.makeGuide()
                 guides[source.id] = guide
@@ -50,10 +71,11 @@ public actor EPGRepository {
         await Self.merge(sources.filter(\.isEnabled).compactMap { guides[$0.id] })
     }
 
-    /// When the guide of a source was last downloaded.
+    /// When the guide of a source was last downloaded (archive header only — never decodes
+    /// the programme segments).
     public func lastFetched(_ id: SourceID) async -> Date? {
         if let date = fetchedAt[id] { return date }
-        return await cache.load(id)?.fetchedAt
+        return await cache.fetchedAt(id)
     }
 
     /// XMLTV URL of a source: explicit `epgURL`, else Xtream `xmltv.php`, else the playlist header.
@@ -66,7 +88,7 @@ public actor EPGRepository {
     }
 
     /// Downloads and caches the guide around the current time, including two days of replay when available.
-    /// Returns this source's guide.
+    /// Returns this source's guide. Concurrent calls for the same source share one refresh.
     public func refresh(_ source: Source, playlistEPGURLs: [URL]) async throws -> EPGGuide {
         if DemoContent.isDemo(source) {
             let guide = DemoContent.makeGuide()
@@ -74,29 +96,65 @@ public actor EPGRepository {
             fetchedAt[source.id] = .now
             return guide
         }
+        let request: GuideRequest
+        if let pending = refreshes[source.id] {
+            request = pending
+        } else {
+            request = GuideRequest(task: Task { try await self.performRefresh(source, playlistEPGURLs: playlistEPGURLs) })
+            refreshes[source.id] = request
+        }
+        defer {
+            if refreshes[source.id]?.id == request.id { refreshes[source.id] = nil }
+        }
+        return try await request.task.value
+    }
+
+    private func performRefresh(_ source: Source, playlistEPGURLs: [URL]) async throws -> EPGGuide {
         let urls = guideURLs(for: source, playlistEPGURLs: playlistEPGURLs)
         guard !urls.isEmpty else { throw SourceError.noGuide }
         let now = Date.now
         let window = DateInterval(start: now.addingTimeInterval(-Self.pastWindow), end: now.addingTimeInterval(Self.futureWindow))
+        let timeShift = source.epgTimeShiftHours
         let http = HTTPClient(session: session, userAgent: source.userAgent)
+
+        // Up to three feeds (explicit / Xtream XMLTV / playlist headers): download and parse
+        // them concurrently, then merge in URL order so earlier feeds win same-start
+        // conflicts, exactly like the previous sequential loop.
+        let results = await withTaskGroup(of: (Int, FeedDownload).self) { group in
+            for (index, url) in urls.enumerated() {
+                group.addTask {
+                    do {
+                        let (data, response) = try await http.data(for: url, timeout: 120, retries: 1)
+                        try SourceError.check(status: response.statusCode)
+                        let document = try await Self.parse(data, window: window, timeShift: timeShift)
+                        return (index, .success(document))
+                    } catch {
+                        return (index, .failure(error))
+                    }
+                }
+            }
+            var collected: [(Int, FeedDownload)] = []
+            for await result in group { collected.append(result) }
+            return collected.sorted { $0.0 < $1.0 }
+        }
+        try Task.checkCancellation()
 
         var programs: [EPGProgram] = []
         var channels: [XMLTVChannel] = []
         var firstError: (any Error)?
-        for url in urls {
-            do {
-                let (data, response) = try await http.data(for: url, timeout: 120, retries: 1)
-                try SourceError.check(status: response.statusCode)
-                let document = try await Self.parse(data, window: window, timeShift: source.epgTimeShiftHours)
+        for (_, result) in results {
+            switch result {
+            case .success(let document):
                 programs += document.programs
                 channels += document.channels
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch let error as URLError {
-                if error.code == .cancelled { throw CancellationError() }
-                firstError = firstError ?? SourceError.from(error)
-            } catch {
-                firstError = firstError ?? error
+            case .failure(let error):
+                if error is CancellationError { throw CancellationError() }
+                if let urlError = error as? URLError {
+                    if urlError.code == .cancelled { throw CancellationError() }
+                    firstError = firstError ?? SourceError.from(urlError)
+                } else {
+                    firstError = firstError ?? error
+                }
             }
         }
         if programs.isEmpty, channels.isEmpty, let firstError { throw firstError }
@@ -123,10 +181,12 @@ public actor EPGRepository {
         }
     }
 
-    /// Drops the cached guide of a deleted source.
+    /// Drops the cached guide of a deleted source (and cancels its refresh if still running).
     public func forget(_ id: SourceID) async {
         guides[id] = nil
         fetchedAt[id] = nil
+        refreshes[id]?.task.cancel()
+        refreshes[id] = nil
         await cache.remove(id)
     }
 

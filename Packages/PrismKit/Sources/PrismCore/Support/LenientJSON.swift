@@ -4,6 +4,24 @@ import Foundation
 /// strings, `""`/`null` for missing values, booleans as `0/1/"0"/"1"/true`, `[]` instead of `{}`…
 /// Values are only used locally inside decoding functions (not `Sendable`).
 enum LenientValue {
+    /// `trimmingCharacters(in: .whitespacesAndNewlines)` without the copy when the string has
+    /// no leading/trailing whitespace — the common case for JSON payloads. Trimming is only
+    /// needed at the edges, so checking the first and last scalars decides it in ~ns.
+    static func trim(_ s: String) -> String {
+        guard let first = s.unicodeScalars.first, let last = s.unicodeScalars.last,
+              !CharacterSet.whitespacesAndNewlines.contains(first),
+              !CharacterSet.whitespacesAndNewlines.contains(last) else {
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return s
+    }
+
+    /// True when every scalar is whitespace — same result as
+    /// `s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty` without allocating.
+    static func isAllWhitespace(_ s: String) -> Bool {
+        s.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
     static func parse(_ data: Data) throws -> Any {
         var bytes = data
         if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
@@ -17,7 +35,7 @@ enum LenientValue {
     static func string(_ value: Any?) -> String? {
         switch value {
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = trim(s)
             if trimmed.isEmpty || trimmed == "null" { return nil }
             return trimmed
         case let n as NSNumber:
@@ -37,10 +55,11 @@ enum LenientValue {
             guard d.isFinite, abs(d) < 9e15 else { return nil }
             return Int(d)
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = trim(s)
             guard !trimmed.isEmpty else { return nil }
             if let i = Int(trimmed) { return i }
-            if let d = Double(trimmed.replacingOccurrences(of: ",", with: ".")), d.isFinite, abs(d) < 9e15 { return Int(d) }
+            let normalized = trimmed.contains(",") ? trimmed.replacingOccurrences(of: ",", with: ".") : trimmed
+            if let d = Double(normalized), d.isFinite, abs(d) < 9e15 { return Int(d) }
             return nil
         default:
             return nil
@@ -54,7 +73,8 @@ enum LenientValue {
             let d = n.doubleValue
             return d.isFinite ? d : nil
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+            var trimmed = trim(s)
+            if trimmed.contains(",") { trimmed = trimmed.replacingOccurrences(of: ",", with: ".") }
             guard !trimmed.isEmpty, let d = Double(trimmed), d.isFinite else { return nil }
             return d
         default:
@@ -67,7 +87,7 @@ enum LenientValue {
         case let n as NSNumber:
             return n.doubleValue != 0
         case let s as String:
-            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            switch trim(s).lowercased() {
             case "1", "true", "yes", "y", "on": return true
             case "0", "false", "no", "n", "off", "-1": return false
             default: return int(s).map { $0 != 0 }
@@ -101,9 +121,9 @@ enum LenientValue {
     }
 
     /// Unix timestamp (seconds, or milliseconds when huge) as number or string; or a calendar date.
+    /// Bare small numbers ("2023") are dates, not 1970 epochs: only values past ~1973 count as timestamps.
     static func date(_ value: Any?) -> Date? {
-        if let seconds = double(value) {
-            guard seconds > 0 else { return nil }
+        if let seconds = double(value), seconds > 100_000 {
             return Date(timeIntervalSince1970: seconds > 1e11 ? seconds / 1000 : seconds)
         }
         return day(value)
@@ -126,6 +146,7 @@ enum LenientValue {
         let hh = digits.count > 3 ? digits[3] : 0
         let mm = digits.count > 4 ? digits[4] : 0
         let ss = digits.count > 5 ? digits[5] : 0
+        guard hh < 24, mm < 60, ss < 61 else { return nil }
         return civil(y, m, d, hh, mm, ss)
     }
 
@@ -198,9 +219,29 @@ enum LenientValue {
         return seconds > 0 && seconds <= 604_800 ? seconds : nil
     }
 
+    /// Letters, digits, whitespace and punctuation — the repertoire of readable text in any
+    /// script. Mojibake from coincidental base64 scatters into symbols and rare blocks.
+    private static let proseCharacters: CharacterSet = {
+        var set = CharacterSet.alphanumerics
+        set.formUnion(.whitespacesAndNewlines)
+        set.formUnion(.punctuationCharacters)
+        return set
+    }()
+
+    private static func proseScore(_ s: String) -> Double {
+        let count = s.unicodeScalars.count
+        guard count > 0 else { return 0 }
+        var good = 0
+        for scalar in s.unicodeScalars where proseCharacters.contains(scalar) { good += 1 }
+        return Double(good) / Double(count)
+    }
+
     /// Lenient base64 (missing padding, URL-safe alphabet, embedded whitespace). Falls back to the raw text.
+    /// The decoded text is only preferred when it reads better than the input: plain titles that
+    /// happen to be valid base64 must not turn into mojibake.
     static func base64Text(_ value: Any?) -> String? {
         guard let raw = string(value) else { return nil }
+        if raw.contains(" ") { return raw }
         var cleaned = raw.filter { !$0.isWhitespace }
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
@@ -208,8 +249,11 @@ enum LenientValue {
         if remainder > 0 { cleaned += String(repeating: "=", count: 4 - remainder) }
         if let data = Data(base64Encoded: cleaned), let text = String(data: data, encoding: .utf8),
            !text.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\r" && $0 != "\t" }) {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            let score = proseScore(text)
+            if score >= 0.85, score >= proseScore(raw) {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
         }
         return raw
     }
@@ -233,7 +277,7 @@ struct JSONObject {
     func value(_ keys: [String]) -> Any? {
         for key in keys {
             if let v = raw[key], !(v is NSNull) {
-                if let s = v as? String, s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                if let s = v as? String, LenientValue.isAllWhitespace(s) { continue }
                 return v
             }
         }

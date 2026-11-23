@@ -4,13 +4,14 @@ import SwiftUI
 public struct ChannelTile<MenuContent: View>: View {
     private let logoURL: URL?
     private let name: String
-    private let number: Int?
+    private let numberText: Text?
     private let programTitle: String?
     private let progress: Double?
     private let isLive: Bool
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -23,17 +24,22 @@ public struct ChannelTile<MenuContent: View>: View {
         tint _: PrismTint? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
         self.logoURL = logoURL
         self.name = name
-        self.number = number
+        numberText = number.map { Text($0, format: .number.grouping(.never)) }
         self.programTitle = programTitle
         self.progress = progress
         self.isLive = isLive
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        var parts = [name]
+        if let number { parts.append("chaîne \(number)") }
+        if let programTitle { parts.append(programTitle) }
+        if isLive { parts.append("en direct") }
+        accessibilityText = Text(parts.joined(separator: ", "))
     }
 
     /// Tile height for a given width.
@@ -49,16 +55,24 @@ public struct ChannelTile<MenuContent: View>: View {
                 ArtworkSurface(radius: PrismMetrics.wideRadius) {
                     Color(white: logoURL == nil ? 0.16 : 0.36)
                         .overlay {
-                            RemoteImage(
-                                url: logoURL, size: CGSize(width: w * 0.56, height: artworkHeight * 0.54),
-                                contentMode: .fit, placeholderSeed: name, placeholderTitle: name,
-                                placeholderStyle: .channelLogo
-                            )
-                            .accessibilityHidden(true)
+                            if let logoURL {
+                                RemoteImage(
+                                    url: logoURL, size: CGSize(width: w * 0.56, height: artworkHeight * 0.54),
+                                    contentMode: .fit, placeholderSeed: name, placeholderTitle: name,
+                                    placeholderStyle: .channelLogo
+                                )
+                                .accessibilityHidden(true)
+                            } else {
+                                // Same tree as RemoteImage's nil-URL path, minus the loader node
+                                // and the no-op clip (the placeholder fills its frame exactly).
+                                PlaceholderArtwork(seed: name, title: name, style: .channelLogo)
+                                    .frame(width: w * 0.56, height: artworkHeight * 0.54)
+                                    .accessibilityHidden(true)
+                            }
                         }
                         .overlay(alignment: .topLeading) {
-                            if let number {
-                                Text(number, format: .number.grouping(.never))
+                            if let numberText {
+                                numberText
                                     .font(.system(size: 11, weight: .medium).monospacedDigit())
                                     .foregroundStyle(.white.opacity(0.65))
                                     .padding(10)
@@ -93,14 +107,6 @@ public struct ChannelTile<MenuContent: View>: View {
             }
             .frame(width: w, height: Self.height(forWidth: w), alignment: .topLeading)
         }
-    }
-
-    private var accessibilityText: Text {
-        var parts = [name]
-        if let number { parts.append("chaîne \(number)") }
-        if let programTitle { parts.append(programTitle) }
-        if isLive { parts.append("en direct") }
-        return Text(parts.joined(separator: ", "))
     }
 }
 

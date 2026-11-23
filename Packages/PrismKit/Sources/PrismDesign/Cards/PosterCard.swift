@@ -9,10 +9,12 @@ public struct PosterCard<MenuContent: View>: View {
     private let showsTitle: Bool
     private let badge: String?
     private let rank: Int?
+    private let rankText: Text?
     private let progress: Double?
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -26,7 +28,7 @@ public struct PosterCard<MenuContent: View>: View {
         progress: Double? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
         self.imageURL = imageURL
         self.seed = seed ?? title
@@ -35,10 +37,12 @@ public struct PosterCard<MenuContent: View>: View {
         self.showsTitle = showsTitle
         self.badge = badge
         self.rank = rank
+        rankText = rank.map { Text($0, format: .number) }
         self.progress = progress
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        accessibilityText = Text([title, subtitle, rank.map { "Rang \($0)" }].compactMap { $0 }.joined(separator: ", "))
     }
 
     private var resolvedWidth: CGFloat { width ?? shelfWidth ?? PrismMetrics.posterWidth }
@@ -46,8 +50,7 @@ public struct PosterCard<MenuContent: View>: View {
     public var body: some View {
         let w = resolvedWidth
         let artworkSize = CGSize(width: w, height: (w / PrismMetrics.posterAspectRatio).rounded())
-        let label = [title, subtitle, rank.map { "Rang \($0)" }].compactMap { $0 }.joined(separator: ", ")
-        CardContainer(accessibilityLabel: Text(label), action: action, menu: menu) { _ in
+        CardContainer(accessibilityLabel: accessibilityText, action: action, menu: menu) { _ in
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkSurface(radius: PrismMetrics.posterRadius) {
                     artwork(size: artworkSize)
@@ -72,12 +75,12 @@ public struct PosterCard<MenuContent: View>: View {
     }
 
     @ViewBuilder private func artwork(size: CGSize) -> some View {
-        let image = RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
+        let base = baseArtwork(size: size)
         if badge == nil, rank == nil, progress == nil {
             // The catalogue grid mounts plain posters as each row comes into view.
-            image
+            base
         } else {
-            image
+            base
                 .overlay(alignment: .topTrailing) {
                     if let badge {
                         MediaBadge(badge, style: .filled)
@@ -86,8 +89,8 @@ public struct PosterCard<MenuContent: View>: View {
                     }
                 }
                 .overlay(alignment: .topLeading) {
-                    if let rank {
-                        Text(rank, format: .number)
+                    if let rankText {
+                        rankText
                             .font(.system(size: 21, weight: .semibold, design: .rounded).monospacedDigit())
                             .foregroundStyle(.white)
                             .frame(minWidth: 34, minHeight: 30)
@@ -104,6 +107,19 @@ public struct PosterCard<MenuContent: View>: View {
                             .shadow(color: .black.opacity(0.4), radius: 3)
                     }
                 }
+        }
+    }
+
+    /// The artwork or, when no URL exists, the exact tree `RemoteImage`'s nil-URL path
+    /// produces — minus the loader's view node, state and environment reads. Shelves
+    /// materialize ~8 cards per layout pass, so the shortcut is worth it.
+    @ViewBuilder private func baseArtwork(size: CGSize) -> some View {
+        if let imageURL {
+            RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
+        } else {
+            // `.clipped()` would be a no-op here: the placeholder fills its frame exactly.
+            PlaceholderArtwork(seed: seed, title: showsTitle ? nil : title)
+                .frame(width: size.width, height: size.height)
         }
     }
 }

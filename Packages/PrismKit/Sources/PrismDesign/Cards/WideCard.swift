@@ -16,7 +16,8 @@ public struct WideCard<MenuContent: View>: View {
     private let placeholderTitle: String?
     private let width: CGFloat?
     private let action: (() -> Void)?
-    private let menu: MenuContent
+    private let menu: () -> MenuContent
+    private let accessibilityText: Text
     @Environment(\.prismCardWidth) private var shelfWidth
 
     public init(
@@ -31,7 +32,7 @@ public struct WideCard<MenuContent: View>: View {
         placeholderTitle: String? = nil,
         width: CGFloat? = nil,
         action: (() -> Void)? = nil,
-        @ViewBuilder menu: () -> MenuContent
+        @ViewBuilder menu: @escaping () -> MenuContent
     ) {
         self.placeholderTitle = placeholderTitle
         self.imageURL = imageURL
@@ -44,7 +45,12 @@ public struct WideCard<MenuContent: View>: View {
         self.showsPlayGlyph = showsPlayGlyph ?? (progress != nil || metadata != nil)
         self.width = width
         self.action = action
-        self.menu = menu()
+        self.menu = menu
+        var parts = [caption]
+        if let metadata { parts.append(metadata) }
+        if isLive { parts.append("En direct") }
+        if let progress { parts.append("\(Int((progress * 100).rounded())) % regardé") }
+        accessibilityText = Text(parts.joined(separator: ", "))
     }
 
     private var resolvedWidth: CGFloat { width ?? shelfWidth ?? PrismMetrics.wideCardWidth }
@@ -117,14 +123,6 @@ public struct WideCard<MenuContent: View>: View {
         .padding(.leading, 12)
         .padding(.trailing, 10)
         .padding(.bottom, twoLines ? 9 : 8)
-    }
-
-    private var accessibilityText: Text {
-        var parts = [caption]
-        if let metadata { parts.append(metadata) }
-        if isLive { parts.append("En direct") }
-        if let progress { parts.append("\(Int((progress * 100).rounded())) % regardé") }
-        return Text(parts.joined(separator: ", "))
     }
 }
 

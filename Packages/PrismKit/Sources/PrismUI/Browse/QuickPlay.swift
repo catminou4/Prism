@@ -23,12 +23,15 @@ enum QuickPlay {
         guard !enabled.isEmpty else { return nil }
         let preferredID = app.library.preferredVariant(for: title.id)
         let languages = app.homeAudioLanguages
-        let ranked = enabled.sorted { lhs, rhs in
-            let left = rank(lhs, preferredID: preferredID, languages: languages)
-            let right = rank(rhs, preferredID: preferredID, languages: languages)
-            return left != right ? left > right : lhs.quality > rhs.quality
+        // `rank` builds a Set of uppercased tags, and `MediaVariant` payloads are large:
+        // score once per variant and sort indices so neither the Set work nor ~3 array
+        // copies of every variant payload repeat per sort comparison / pass.
+        let scores = enabled.map { rank($0, preferredID: preferredID, languages: languages) }
+        let order = enabled.indices.sorted { lhs, rhs in
+            scores[lhs] != scores[rhs] ? scores[lhs] > scores[rhs] : enabled[lhs].quality > enabled[rhs].quality
         }
-        for variant in ranked {
+        for index in order {
+            let variant = enabled[index]
             guard let source = app.source(variant.sourceID),
                   let option = TitlePlaybackOption(edition: TitleEdition(
                       variant: variant, source: source, categoryLanguages: app.catalog.providerLanguages(for: variant)

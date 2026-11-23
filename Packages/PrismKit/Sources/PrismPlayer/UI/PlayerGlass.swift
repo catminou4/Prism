@@ -39,6 +39,9 @@ extension EnvironmentValues {
     /// Offscreen snapshot rendering: Liquid Glass cannot be captured by `CALayer.render(in:)`,
     /// so glass surfaces draw an opaque approximation instead.
     @Entry public var playerSnapshotRendering: Bool = false
+    /// Seconds left in the current VOD item, injected by `PlayerView`'s up-next host so
+    /// `PlayerUpNextCard` can count its ring down when the caller passes `0, 0`.
+    @Entry var playerUpNextRemaining: TimeInterval? = nil
 }
 
 /// Liquid Glass surface used by every player control (dark appearance, over video).

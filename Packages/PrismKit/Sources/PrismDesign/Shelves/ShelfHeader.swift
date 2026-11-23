@@ -73,17 +73,18 @@ extension ShelfHeader where Accessory == EmptyView {
 /// Shelf header whose title is a menu (`Saison 1 ⌃⌄` season picker).
 public struct ShelfMenuHeader<MenuContent: View>: View {
     private let title: String
-    private let menu: MenuContent
+    /// Evaluated when the menu opens, not on every header render.
+    private let menu: () -> MenuContent
     @State private var isHovered = false
 
-    public init(_ title: String, @ViewBuilder menu: () -> MenuContent) {
+    public init(_ title: String, @ViewBuilder menu: @escaping () -> MenuContent) {
         self.title = title
-        self.menu = menu()
+        self.menu = menu
     }
 
     public var body: some View {
         Menu {
-            menu
+            menu()
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Text(title)

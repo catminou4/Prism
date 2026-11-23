@@ -342,8 +342,19 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
 
     /// Prefers French, then the first value.
     static func preferred(_ values: [(String?, String)]) -> String? {
-        if let fr = values.first(where: { $0.0?.lowercased().hasPrefix("fr") == true }) { return fr.1 }
+        if let fr = values.first(where: { isFrench($0.0) }) { return fr.1 }
         return values.first?.1
+    }
+
+    /// `lang` starting with "fr" in any letter case — same as `lowercased().hasPrefix("fr")`
+    /// without allocating a folded copy (called per programme × 4 fields).
+    static func isFrench(_ lang: String?) -> Bool {
+        guard let lang else { return false }
+        let bytes = lang.utf8
+        guard bytes.count >= 2 else { return false }
+        let a = bytes[bytes.startIndex]
+        let b = bytes[bytes.index(after: bytes.startIndex)]
+        return (a == 0x66 || a == 0x46) && (b == 0x72 || b == 0x52)
     }
 
     static func url(_ raw: String?) -> URL? {

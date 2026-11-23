@@ -16,6 +16,7 @@ public struct LiveScreen: View {
     @State private var query = ""
     @State private var results: FilteredChannels?
     @State private var guideStart: Date?
+    @State private var guideRefreshTask: Task<Void, Never>?
 
     private let favoritesOnly: Bool
 
@@ -34,15 +35,41 @@ public struct LiveScreen: View {
 
     private nonisolated struct Filter: Hashable, Sendable {
         let category: String?
+        /// Fingerprint of `favorites`: `LibraryStore` exposes no favorites revision,
+        /// so the hash memoizes identity — task-id comparisons stay O(1) instead of
+        /// rescanning the whole array on every body evaluation.
+        let favoritesKey: Int
         let favorites: [String]?
         let query: String
         let revision: Int
         let isActive: Bool
 
+        init(category: String?, favorites: [String]?, query: String, revision: Int, isActive: Bool) {
+            self.category = category
+            self.favoritesKey = favorites.hashValue
+            self.favorites = favorites
+            self.query = query
+            self.revision = revision
+            self.isActive = isActive
+        }
+
         var isUnfiltered: Bool { category == nil && favorites == nil && query.isEmpty }
 
         func hasSameScope(as other: Self) -> Bool {
-            revision == other.revision && category == other.category && favorites == other.favorites
+            revision == other.revision && category == other.category && favoritesKey == other.favoritesKey
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.category == rhs.category && lhs.favoritesKey == rhs.favoritesKey
+                && lhs.query == rhs.query && lhs.revision == rhs.revision && lhs.isActive == rhs.isActive
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(category)
+            hasher.combine(favoritesKey)
+            hasher.combine(query)
+            hasher.combine(revision)
+            hasher.combine(isActive)
         }
     }
 
@@ -61,18 +88,53 @@ public struct LiveScreen: View {
         )
     }
 
-    private func channels(for request: Filter) -> [ChannelGroup]? {
+    /// Channels for the current filter.
+    ///
+    /// Scope-only filters (category / favorites, no query) resolve through catalog
+    /// indexes in ~0.1–0.2 ms even for the largest category, so they are computed
+    /// inline: chip taps never swap the grid for a spinner, and scroll position +
+    /// materialized tiles survive the change. The full-catalog query scan (~75 ms
+    /// over 45k groups) stays on the debounced background task; while it runs, the
+    /// scope's unfiltered list — or the previous query's results — stays on screen.
+    private func channels(for request: Filter) -> [ChannelGroup] {
         if request.isUnfiltered { return model.catalog.channels }
-        guard let results, results.request.hasSameScope(as: request) else { return nil }
+        if request.query.isEmpty {
+            // `results` holds this exact scope once its task lands — reuse it so
+            // later evaluations don't rematerialize the member array.
+            if let results,
+               results.request.hasSameScope(as: request),
+               results.request.query == request.query {
+                return results.channels
+            }
+            return Self.scopedChannels(in: model.catalog, request: request)
+        }
+        guard let results, results.request.hasSameScope(as: request) else {
+            return Self.scopedChannels(in: model.catalog, request: request)
+        }
         if results.request.query == request.query { return results.channels }
-        return results.channels.isEmpty ? nil : results.channels
+        return results.channels.isEmpty
+            ? Self.scopedChannels(in: model.catalog, request: request)
+            : results.channels
+    }
+
+    /// Base channel list for a filter's scope — favorites, then category, then
+    /// everything — before any query filtering. Same selection `filteredChannels`
+    /// performs; only indexed lookups, cheap enough for body evaluation.
+    private nonisolated static func scopedChannels(in catalog: Catalog, request: Filter) -> [ChannelGroup] {
+        if let favorites = request.favorites {
+            return favorites.compactMap(catalog.channelGroup)
+        }
+        if let categoryID = request.category, let category = catalog.categoryGroup(categoryID) {
+            return catalog.channels(in: category)
+        }
+        return catalog.channels
     }
 
     public var body: some View {
         let request = filter
         let channels = channels(for: request)
         VStack(alignment: .leading, spacing: 0) {
-            header(channelCount: channels?.count)
+            header(channelCount: channels.count)
             if !model.catalog.channels.isEmpty, !favoritesOnly {
                 categoryRail
             }
@@ -138,21 +200,22 @@ public struct LiveScreen: View {
         .scrollIndicators(.never)
         .contentMargins(.horizontal, PrismMetrics.contentMargin, for: .scrollContent)
         .accessibilityLabel("Catégories de chaînes")
+        .prismScrollPhase()
     }
 
-    private func header(channelCount: Int?) -> some View {
+    private func header(channelCount: Int) -> some View {
         HStack(alignment: .center, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(favoritesOnly ? "Chaînes favorites" : "TV en direct")
                     .font(.system(size: 34, weight: .bold))
                     .tracking(-1)
                     .accessibilityAddTraits(.isHeader)
-                Text(channelCount == 1 ? "1 chaîne" : "\((channelCount ?? 0).formatted()) chaînes")
+                Text(channelCount == 1 ? "1 chaîne" : "\(channelCount.formatted()) chaînes")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-                    .opacity(channelCount.map { $0 > 0 } == true ? 1 : 0)
-                    .accessibilityHidden(channelCount.map { $0 > 0 } != true)
+                    .opacity(channelCount > 0 ? 1 : 0)
+                    .accessibilityHidden(channelCount <= 0)
             }
             .layoutPriority(1)
             Spacer(minLength: 10)
@@ -191,8 +254,8 @@ public struct LiveScreen: View {
         .padding(.bottom, 14)
     }
 
-    @ViewBuilder private func content(channels: [ChannelGroup]?) -> some View {
-        if let channels, !channels.isEmpty {
+    @ViewBuilder private func content(channels: [ChannelGroup]) -> some View {
+        if !channels.isEmpty {
             ZStack {
                 if mode == .channels {
                     grid(channels: channels)
@@ -202,7 +265,7 @@ public struct LiveScreen: View {
                         symbol: "calendar.badge.exclamationmark", title: "Aucun programme disponible",
                         message: "Vérifiez l’adresse XMLTV dans les réglages de votre source ou actualisez le guide.",
                         actionTitle: model.isRefreshingGuide ? nil : "Actualiser le guide"
-                    ) { Task { await refreshGuide() } }
+                    ) { refreshGuide() }
                     .overlay(alignment: .bottom) {
                         if model.isRefreshingGuide { ProgressView().controlSize(.small).padding(32) }
                     }
@@ -210,7 +273,7 @@ public struct LiveScreen: View {
                 } else {
                     LiveGuide(
                         channels: channels, guide: model.guide, start: $guideStart,
-                        isRefreshing: model.isRefreshingGuide, onRefresh: { Task { await refreshGuide() } },
+                        isRefreshing: model.isRefreshingGuide, onRefresh: { refreshGuide() },
                         onPlay: { play($0, program: $1) },
                         onReplay: replayAction,
                         channelMenu: { group, program in channelMenu(group, program: program) }
@@ -219,11 +282,6 @@ public struct LiveScreen: View {
                 }
             }
             .animation(reduceMotion ? nil : PrismMotion.quickFade, value: mode)
-        } else if channels == nil {
-            ProgressView()
-                .controlSize(.small)
-                .accessibilityLabel("Chargement des chaînes")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             emptyState
         }
@@ -270,6 +328,7 @@ public struct LiveScreen: View {
                     .padding(.bottom, 36)
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                .prismScrollPhase()
             }
         }
     }
@@ -319,10 +378,16 @@ public struct LiveScreen: View {
         return { playItem(replay.item, .channel(groupID: channel.id), replay.variant.id) }
     }
 
-    private func refreshGuide() async {
-        for source in model.sources where source.isEnabled {
-            guard !Task.isCancelled else { return }
-            await model.refreshGuide(for: source.id)
+    /// One guide refresh at a time per screen: the task handle is assigned
+    /// synchronously so rapid taps cannot start overlapping per-source loops.
+    private func refreshGuide() {
+        guard guideRefreshTask == nil, !model.isRefreshingGuide else { return }
+        guideRefreshTask = Task {
+            defer { guideRefreshTask = nil }
+            for source in model.sources where source.isEnabled {
+                guard !Task.isCancelled else { return }
+                await model.refreshGuide(for: source.id)
+            }
         }
     }
 

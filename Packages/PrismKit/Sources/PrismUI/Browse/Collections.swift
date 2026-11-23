@@ -146,6 +146,7 @@ struct CollectionView: View {
                     .padding(.bottom, 28)
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                .prismScrollPhase()
             }
         } else {
             titlesPage
@@ -186,6 +187,7 @@ struct CollectionView: View {
                 .animation(PrismMotion.standard, value: key?.genre)
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .prismScrollPhase()
         }
         .task(id: request) {
             guard let request, resolved?.request != request else { return }
@@ -438,6 +440,7 @@ struct HistoryScreen: View {
             }
             .padding(.vertical, 24)
         }
+        .prismScrollPhase()
         .confirmationDialog("Effacer l’historique de lecture ?", isPresented: $confirmingClear) {
             Button("Effacer l’historique", role: .destructive) { app.library.clearHistory() }
         }

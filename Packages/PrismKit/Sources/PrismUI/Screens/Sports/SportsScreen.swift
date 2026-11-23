@@ -18,6 +18,7 @@ struct SportsScreen: View {
     @State private var scrollTarget: ScrollTarget?
     @State private var scrollRegion: ScrollRegion = .top
     @State private var isRefreshingGuide = false
+    @State private var guideRefreshTask: Task<Void, Never>?
     @State private var showsGuidePrograms = false
 
     private enum Period: Hashable { case schedule, live }
@@ -269,10 +270,16 @@ struct SportsScreen: View {
         }
     }
 
+    /// One guide refresh at a time: the task handle is assigned synchronously so
+    /// rapid taps cannot start overlapping per-source download loops.
     private func refreshGuide() {
-        isRefreshingGuide = true
-        Task {
-            defer { isRefreshingGuide = false }
+        guard guideRefreshTask == nil, !app.isRefreshingGuide else { return }
+        guideRefreshTask = Task {
+            isRefreshingGuide = true
+            defer {
+                isRefreshingGuide = false
+                guideRefreshTask = nil
+            }
             for source in app.sources where source.isEnabled {
                 guard !Task.isCancelled else { return }
                 await app.refreshGuide(for: source.id)

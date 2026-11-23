@@ -175,6 +175,23 @@ struct M3UCatalogMapperTests {
         #expect(kind("X", "http://h/x.ts", attributes: ["tvg-type": "movie"]) == .movie)
     }
 
+    @Test func pathMarkerScansURLBytes() {
+        func marker(_ url: String) -> MediaKind? {
+            M3UCatalogMapper.pathMarker(URL(string: url)!)
+        }
+        #expect(marker("http://h:8080/live/u/p/1.ts") == .live)
+        #expect(marker("http://user:pass@h/movie/x.mkv") == .movie)
+        #expect(marker("HTTP://H/SERIES/X") == .series)
+        #expect(marker("file:///live/x.ts") == .live)
+        #expect(marker("http://h//live/x") == .live)
+        #expect(marker("http://h/a/b?next=/live/") == nil) // markers in the query don't count
+        #expect(marker("http://h/x.ts?next=/series/") == nil)
+        #expect(marker("http://h/files/show.S01E01.mp4") == nil) // last segment is the file name
+        #expect(marker("http://h") == nil)
+        #expect(marker("http://h/") == nil)
+        #expect(marker("http://h/live") == nil) // a marker needs a following segment
+    }
+
     @Test func largePlaylistMapping() {
         let data = M3UParserTests.generatePlaylist(count: 30_000)
         let playlist = M3UParser.parse(data)

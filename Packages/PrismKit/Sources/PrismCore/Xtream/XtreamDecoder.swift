@@ -43,19 +43,28 @@ public enum XtreamDecoder {
     static func serverURL(_ info: JSONObject) -> URL? {
         guard let host = info.string("url") else { return nil }
         let scheme = info.string("server_protocol")?.lowercased() == "https" ? "https" : "http"
-        let port = scheme == "https" ? (info.string("https_port") ?? info.string("port")) : info.string("port")
-        var string = host.contains("://") ? host : "\(scheme)://\(host)"
-        if let port, !port.isEmpty, !host.contains("://"), Int(port) != nil, port != "80" || scheme != "http", port != "443" || scheme != "https" {
-            string += ":\(port)"
+        // `url` may be "host", "host:port", "//host" or already carry a scheme.
+        let string = host.hasPrefix("//") ? "\(scheme):\(host)" : host.contains("://") ? host : "\(scheme)://\(host)"
+        // Userinfo in a panel-reported URL is rejected rather than silently dropped.
+        guard var components = URLComponents(string: string),
+              components.user == nil, components.password == nil,
+              components.host != nil else { return nil }
+        if components.port == nil, !host.contains("://"),
+           let port = scheme == "https" ? (info.string("https_port") ?? info.string("port")) : info.string("port"),
+           let number = Int(port), (1...65_535).contains(number),
+           !(scheme == "http" && number == 80), !(scheme == "https" && number == 443) {
+            components.port = number
         }
-        return XtreamCredentials.normalizeServer(string)
+        return XtreamCredentials.normalizeServer(components.string ?? string)
     }
 
     // MARK: Categories
 
     public static func categories(_ data: Data, kind: MediaKind, sourceID: SourceID) throws -> [Category] {
+        let items = try elements(data)
         var result: [Category] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("category_id") else { continue }
             let raw = obj.string("category_name") ?? "Sans nom"
             result.append(Category(
@@ -73,13 +82,24 @@ public enum XtreamDecoder {
         _ data: Data, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
         allowedFormats: [String] = [], adultCategoryIDs: Set<String> = []
     ) throws -> [Channel] {
+        try liveStreams(elements(data)[...], sourceID: sourceID, credentials: credentials, preferHLS: preferHLS,
+                        allowedFormats: allowedFormats, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → channels. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func liveStreams(
+        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
+        allowedFormats: [String] = [], adultCategoryIDs: Set<String> = []
+    ) -> [Channel] {
         let formats = Set(allowedFormats.map { $0.lowercased() })
         let canHLS = formats.isEmpty || formats.contains("m3u8") || formats.contains("hls")
         let canTS = formats.isEmpty || formats.contains("ts") || formats.contains("mpegts")
         let primaryIsHLS = (preferHLS && canHLS) || !canTS
 
         var result: [Channel] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("stream_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Chaîne \(id)"
             let n = TitleNormalizer.normalize(rawName)
@@ -118,8 +138,17 @@ public enum XtreamDecoder {
     public static func vodStreams(
         _ data: Data, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
     ) throws -> [Movie] {
+        try vodStreams(elements(data)[...], sourceID: sourceID, credentials: credentials, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → movies. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func vodStreams(
+        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
+    ) -> [Movie] {
         var result: [Movie] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("stream_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Film \(id)"
             let n = TitleNormalizer.normalize(rawName)
@@ -157,8 +186,15 @@ public enum XtreamDecoder {
     // MARK: Series
 
     public static func series(_ data: Data, sourceID: SourceID, adultCategoryIDs: Set<String> = []) throws -> [Series] {
+        try series(elements(data)[...], sourceID: sourceID, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → series. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func series(_ items: ArraySlice<Any>, sourceID: SourceID, adultCategoryIDs: Set<String> = []) -> [Series] {
         var result: [Series] = []
-        for element in try elements(data) {
+        result.reserveCapacity(items.count)
+        for element in items {
             guard let obj = JSONObject(element), let id = obj.string("series_id", "id") else { continue }
             let rawName = obj.string("name", "title") ?? "Série \(id)"
             let n = TitleNormalizer.normalize(rawName)
@@ -245,6 +281,7 @@ public enum XtreamDecoder {
 
         var bySeason: [Int: [Episode]] = [:]
         var seenIDs = Set<String>()
+        let seriesKey = TitleNormalizer.key(series.title)
         for item in raw {
             guard let ep = JSONObject(item.value), let id = ep.string("id", "stream_id"), seenIDs.insert(id).inserted else { continue }
             let epInfo = ep.object("info") ?? JSONObject.empty
@@ -258,7 +295,7 @@ public enum XtreamDecoder {
                 nativeID: id,
                 season: season,
                 number: number,
-                title: episodeTitle(ep.string("title") ?? epInfo.string("name", "title"), number: number, seriesTitle: series.title),
+                title: episodeTitle(ep.string("title") ?? epInfo.string("name", "title"), number: number, seriesKey: seriesKey),
                 plot: epInfo.string("plot", "overview", "description"),
                 durationSeconds: duration.flatMap { $0 > 0 ? $0 : nil },
                 stillURL: epInfo.url("movie_image", "cover_big", "still_path", "cover"),
@@ -336,7 +373,13 @@ public enum XtreamDecoder {
         }
         do {
             // Some panels prepend whitespace before a UTF-8 BOM.
-            let payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+            var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+            // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
+            // (URLSession only decompresses when the header is present). A failed inflate falls
+            // back to the raw bytes, preserving the previous parse error.
+            if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
+                payload = inflated
+            }
             return try LenientValue.parse(payload)
         } catch {
             let preview = String(decoding: data[first...].prefix(80), as: UTF8.self)
@@ -383,14 +426,19 @@ public enum XtreamDecoder {
 
     /// Episode title without the redundant "Show - S01E02 -" prefix; "Épisode N" when empty.
     static func episodeTitle(_ raw: String?, number: Int, seriesTitle: String) -> String {
+        episodeTitle(raw, number: number, seriesKey: TitleNormalizer.key(seriesTitle))
+    }
+
+    /// `seriesKey` = `TitleNormalizer.key(seriesTitle)`, hoisted out of per-episode loops.
+    static func episodeTitle(_ raw: String?, number: Int, seriesKey: String) -> String {
         guard let raw, !raw.isEmpty else { return "Épisode \(number)" }
         let n = TitleNormalizer.normalize(raw)
         if n.season != nil || n.episode != nil {
-            if let title = n.episodeTitle, !title.isEmpty, TitleNormalizer.key(title) != TitleNormalizer.key(seriesTitle) { return title }
-            if n.key != TitleNormalizer.key(seriesTitle), !n.title.isEmpty, n.episodeTitle != nil { return n.title }
+            if let title = n.episodeTitle, !title.isEmpty, TitleNormalizer.key(title) != seriesKey { return title }
+            if n.key != seriesKey, !n.title.isEmpty, n.episodeTitle != nil { return n.title }
             return "Épisode \(number)"
         }
-        if n.key == TitleNormalizer.key(seriesTitle) { return "Épisode \(number)" }
+        if n.key == seriesKey { return "Épisode \(number)" }
         return raw
     }
 

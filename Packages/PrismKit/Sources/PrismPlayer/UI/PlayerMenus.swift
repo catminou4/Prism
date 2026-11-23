@@ -60,7 +60,11 @@ struct SubtitlesMenuContent: View {
                     let preferred = TrackAutoSelector.bestTrack(
                         in: controller.subtitleTracks,
                         preferredLanguage: controller.preferences.preferredSubtitleLanguage)
-                    controller.select(subtitle: (preferred ?? controller.subtitleTracks.first)?.id)
+                    // Fallback: first non-forced track (forced subs are hearing-
+                    // impaired captions, not a sane default pick).
+                    let fallback = controller.subtitleTracks.first(where: { !$0.isForced })
+                        ?? controller.subtitleTracks.first
+                    controller.select(subtitle: (preferred ?? fallback)?.id)
                 } else {
                     controller.select(subtitle: nil)
                 }
@@ -83,6 +87,7 @@ struct SubtitlesMenuContent: View {
             TrackAutoSelector.bestTrack(
                 in: controller.subtitleTracks,
                 preferredLanguage: controller.preferences.preferredSubtitleLanguage)
+            ?? controller.subtitleTracks.first(where: { !$0.isForced })
             ?? controller.subtitleTracks.first
         guard let name = (selected ?? fallback)?.name else { return "Activés" }
         return "Activés (\(name))"
@@ -209,9 +214,13 @@ struct SourceMenuContent: View {
     var body: some View {
         Section("Sources") {
             ForEach(options) { option in
+                // Only react when a row is switched ON: tapping the current source
+                // would otherwise toggle "off" and tear down + reload the same stream.
                 Toggle(
                     option.menuTitle,
-                    isOn: Binding(get: { option.isCurrent }, set: { _ in option.action() }))
+                    isOn: Binding(
+                        get: { option.isCurrent },
+                        set: { on in if on { option.action() } }))
             }
         }
     }

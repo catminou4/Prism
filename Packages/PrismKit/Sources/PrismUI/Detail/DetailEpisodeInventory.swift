@@ -40,6 +40,9 @@ nonisolated struct DetailEpisodeInventory: Sendable {
         return orderedEpisodes.lazy.compactMap { progress[$0.id] }.max(by: older)
     }
 
+    /// Whether `id` is one of this edition's episode streams.
+    func contains(_ id: ContentID) -> Bool { episodeIndices[id] != nil }
+
     func nextAvailableEpisode(after id: ContentID) -> Episode? {
         guard let index = episodeIndices[id], orderedEpisodes.indices.contains(index + 1) else { return nil }
         return orderedEpisodes[index + 1]
@@ -53,6 +56,12 @@ nonisolated struct DetailEpisodeInventory: Sendable {
             if let next = orderedEpisodes.dropFirst(index + 1).first(where: { !isWatched($0.id) }) {
                 return next
             }
+            // The forward scan proved every episode past `index` is watched, so the
+            // resume fallback only needs the prefix — not a second pass over the tail.
+            let prefix = orderedEpisodes[...index]
+            return prefix.first { $0.season > 0 && !isWatched($0.id) }
+                ?? prefix.first { !isWatched($0.id) }
+                ?? first
         }
         return orderedEpisodes.first { $0.season > 0 && !isWatched($0.id) }
             ?? orderedEpisodes.first { !isWatched($0.id) }

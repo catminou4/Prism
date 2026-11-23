@@ -70,6 +70,23 @@ public struct AppDirectories: Sendable, Hashable {
         }
     }
 
+    /// Deletes every regular file in `directory` whose modification date is older than `ttl`.
+    /// Modification date is a safe proxy for the entry's `savedAt` (files are written atomically
+    /// right after it). Cheap opportunistic cleanup; call it off the main actor.
+    public static func purgeExpiredFiles(in directory: URL, ttl: TimeInterval, now: Date = .now) {
+        let cutoff = now.addingTimeInterval(-ttl)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey]
+        ) else { return }
+        for url in urls {
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey]),
+                  values.isDirectory != true,
+                  let modified = values.contentModificationDate,
+                  modified < cutoff else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     @discardableResult
     static func ensure(_ directory: URL) -> URL {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

@@ -19,8 +19,10 @@ nonisolated struct PlaybackSheetFilter: Identifiable, Hashable {
         }
     }
 
+    private static let displayLocale = Locale(identifier: "fr-FR")
+
     private static func audio(_ code: String) -> Self {
-        let locale = Locale(identifier: "fr-FR")
+        let locale = displayLocale
         let label = locale.localizedString(forLanguageCode: code.lowercased()) ?? code
         return Self(id: "audio-\(code)", title: label.capitalized(with: locale))
     }

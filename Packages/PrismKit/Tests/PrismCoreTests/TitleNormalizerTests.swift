@@ -233,4 +233,65 @@ struct TitleNormalizerTests {
         _ = TitleNormalizer.normalize("Série 12x99999999999999999999 FR")
         #expect(TitleNormalizer.normalize("The Office 2x05").title.isEmpty == false)
     }
+
+    @Test func memoizedResultsNeverLeakAcrossInputs() {
+        // Every bounded memo is keyed by the complete raw string: interleaved calls on
+        // distinct inputs must each return their own result — the second pass below is
+        // entirely cache hits and must return identical values.
+        struct Case {
+            let raw: String
+            let title: String
+            let key: String?
+            let quality: VideoQuality
+            let tags: [String]?
+            let containsTags: [String]
+        }
+        let cases: [Case] = [
+            .init(raw: "FR: TF1 HD", title: "TF1", key: "tf1", quality: .hd, tags: ["FR"], containsTags: []),
+            .init(raw: "UK: BBC One HD", title: "BBC One", key: "bbc one", quality: .hd, tags: ["UK"], containsTags: []),
+            .init(raw: "[FR] Canal+", title: "Canal+", key: "canal plus", quality: .unknown, tags: ["FR"], containsTags: []),
+            .init(raw: "FR - France 2", title: "France 2", key: "france 2", quality: .unknown, tags: ["FR"], containsTags: []),
+            .init(raw: "Dune DV ATMOS", title: "Dune", key: nil, quality: .unknown, tags: ["DV", "ATMOS"], containsTags: []),
+            .init(raw: "4K | Avatar (2009) [MULTI] HDR", title: "Avatar", key: "avatar", quality: .uhd, tags: nil, containsTags: ["MULTI", "HDR"]),
+            .init(raw: "Inception VF", title: "Inception", key: nil, quality: .unknown, tags: ["VF"], containsTags: []),
+        ]
+        for _ in 0..<2 {
+            for (index, testCase) in cases.enumerated() {
+                _ = TitleNormalizer.normalize(cases[(index + 1) % cases.count].raw) // interleave: keys can't cross-talk
+                let n = TitleNormalizer.normalize(testCase.raw)
+                #expect(n.title == testCase.title, "\(testCase.raw)")
+                if let key = testCase.key { #expect(n.key == key, "\(testCase.raw)") }
+                #expect(n.quality == testCase.quality, "\(testCase.raw)")
+                if let tags = testCase.tags { #expect(n.tags == tags, "\(testCase.raw)") }
+                for tag in testCase.containsTags { #expect(n.tags.contains(tag), "\(testCase.raw)") }
+            }
+        }
+    }
+
+    @Test func memoizedHelpersNeverLeakAcrossInputs() {
+        // Same keyed-memo contract for `cleanCategoryName` and the strict/loose adult
+        // verdicts: distinct inputs — and distinct strictness levels — stay isolated.
+        let categories = [
+            ("FR | FILMS ACTION", "Films Action"),
+            ("|FR| SÉRIES TV", "Séries TV"),
+            ("UK | BBC CHANNELS", "BBC Channels"),
+            ("===== DOCUMENTAIRES =====", "Documentaires"),
+        ]
+        for _ in 0..<2 {
+            for (index, pair) in categories.enumerated() {
+                _ = TitleNormalizer.cleanCategoryName(categories[(index + 1) % categories.count].0)
+                #expect(TitleNormalizer.cleanCategoryName(pair.0) == pair.1, "\(pair.0)")
+            }
+        }
+        // "hot" is an adult marker in the loose pass but legitimate in titles: the strict
+        // and loose memos must never share a verdict.
+        for _ in 0..<2 {
+            #expect(TitleNormalizer.isAdult("Hot Fuzz") == true)
+            #expect(TitleNormalizer.isAdultName("Hot Fuzz") == false)
+            #expect(TitleNormalizer.isAdult("XXX Films") == true)
+            #expect(TitleNormalizer.isAdultName("XXX Films") == true)
+            #expect(TitleNormalizer.isAdult("Films Action") == false)
+            #expect(TitleNormalizer.isAdultName("Films Action") == false)
+        }
+    }
 }

@@ -8,8 +8,11 @@ public struct SourceCard: View {
     private let tint: PrismTint
     private let isSelected: Bool
     private let logoURL: URL?
+    private let initials: String
     private let width: CGFloat
     private let action: (() -> Void)?
+    private let accessibilityText: Text
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(name: String, detail: String? = nil, tint: PrismTint, isSelected: Bool = false, logoURL: URL? = nil, width: CGFloat = 292, action: (() -> Void)? = nil) {
         self.name = name
@@ -17,12 +20,14 @@ public struct SourceCard: View {
         self.tint = tint
         self.isSelected = isSelected
         self.logoURL = logoURL
+        initials = logoURL == nil ? Monogram.initials(from: name) : ""
         self.width = width
         self.action = action
+        accessibilityText = Text([name, detail].compactMap { $0 }.joined(separator: ", "))
     }
 
     public var body: some View {
-        CardContainer(accessibilityLabel: Text([name, detail].compactMap { $0 }.joined(separator: ", ")), action: action, hoverScale: 1.02, menu: EmptyView()) { _ in
+        CardContainer(accessibilityLabel: accessibilityText, action: action, hoverScale: 1.02, menu: { EmptyView() }) { _ in
             HStack(spacing: 14) {
                 tile
                 VStack(alignment: .leading, spacing: 2) {
@@ -51,7 +56,7 @@ public struct SourceCard: View {
                 RoundedRectangle(cornerRadius: PrismMetrics.sourceCardRadius, style: .continuous)
                     .strokeBorder(Color.accentColor, lineWidth: isSelected ? 2 : 0)
             }
-            .animation(PrismMotion.standard, value: isSelected)
+            .animation(PrismMotion.respecting(reduceMotion, PrismMotion.standard), value: isSelected)
         }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -63,7 +68,7 @@ public struct SourceCard: View {
                 if let logoURL {
                     RemoteImage(url: logoURL, size: CGSize(width: 40, height: 40), contentMode: .fit, placeholderSeed: name, showsPlaceholder: false)
                 } else {
-                    Text(Monogram.initials(from: name))
+                    Text(initials)
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white)
                 }

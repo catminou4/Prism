@@ -277,7 +277,10 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
                 .help("Image dans l’image")
                 .accessibilityLabel("Image dans l’image")
             }
-            PlayerAirPlayButton(player: controller.routingPlayer)
+            // VLC has no AVPlayer to route: an empty picker would only mirror app audio.
+            if controller.routingPlayer != nil {
+                PlayerAirPlayButton(player: controller.routingPlayer)
+            }
             if let onShare {
                 Button(action: onShare) { Image(systemName: "square.and.arrow.up") }
                     .buttonStyle(PlayerCapsuleButtonStyle())
@@ -557,23 +560,23 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
     }
 }
 
-/// Shows the `upNext` slot during the last 30 s of a VOD item (reads the 4 Hz clock in isolation).
+/// Shows the `upNext` slot during the last 30 s of a VOD item. Reads the controller's
+/// `upNextVisible` flag (flips once) instead of the 4 Hz clock, so the host only
+/// subscribes to `currentTime` while the card is actually on screen.
 private struct PlayerUpNextHost<Content: View>: View {
     let controller: PlayerController
     @ViewBuilder let content: Content
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var isVisible: Bool {
-        guard !controller.isLive, let duration = controller.duration, duration > 60,
-            let remaining = controller.remainingTime
-        else { return false }
-        return remaining <= 30 && (remaining > 0 || controller.phase == .ended)
-    }
+    private var isVisible: Bool { controller.upNextVisible }
 
     var body: some View {
         ZStack {
             if isVisible {
                 content
+                    // Lets the card count its ring down from the real remaining time
+                    // even when the caller hardcoded `remaining: 0`.
+                    .environment(\.playerUpNextRemaining, controller.remainingTime)
                     .transition(reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity))
             }
         }

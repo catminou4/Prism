@@ -41,9 +41,13 @@ public struct ContinueWatchingItem: Identifiable, Sendable, Hashable {
 @Observable
 public final class LibraryStore {
     /// Most recent first.
-    public private(set) var watchlist: [TitleID] = []
+    public private(set) var watchlist: [TitleID] = [] {
+        didSet { watchlistSet = Set(watchlist) }
+    }
     /// Channel group ids, in user order.
-    public private(set) var favoriteChannels: [String] = []
+    public private(set) var favoriteChannels: [String] = [] {
+        didSet { favoriteChannelSet = Set(favoriteChannels) }
+    }
     public private(set) var progress: [ContentID: PlaybackProgress] = [:] {
         didSet {
             latestByTitle = nil
@@ -61,7 +65,17 @@ public final class LibraryStore {
     public private(set) var preferredVariants: [TitleID: ContentID] = [:]
     public private(set) var preferredChannelVariants: [String: ContentID] = [:]
     /// Titles the user marked “Pas intéressé”: never suggested again by the curated shelves.
-    public private(set) var dismissed: [TitleID] = []
+    public private(set) var dismissed: [TitleID] = [] {
+        didSet { dismissedSet = Set(dismissed) }
+    }
+
+    /// O(1) membership mirrors of the ordered arrays above — context menus and cards
+    /// probe `isInWatchlist`/`isDismissed`/`isFavorite` per item, and linear scans over
+    /// ~2 000-entry arrays were measurable on every library mutation. Tracked (not
+    /// `@ObservationIgnored`) so readers keep their observation subscription.
+    private var watchlistSet: Set<TitleID> = []
+    private var dismissedSet: Set<TitleID> = []
+    private var favoriteChannelSet: Set<String> = []
 
     public var lastChannelGroupID: String? {
         get { storedLastChannelGroupID }
@@ -77,17 +91,31 @@ public final class LibraryStore {
     public static let maxHistory = 200
     static let maxDismissed = 2_000
     static let maxProgressEntries = 3_000
+    static let maxWatched = 20_000
+    static let maxWatchlist = 2_000
+    static let maxFavoriteChannels = 1_000
+    static let maxPreferredEntries = 5_000
 
     @ObservationIgnored private let fileURL: URL?
     @ObservationIgnored private let saveDelay: Duration
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    /// Disk decode started in `init`, finishing off the main actor; `nil` for
+    /// in-memory stores. Tests await it before asserting persisted state.
+    @ObservationIgnored private(set) var loadTask: Task<Void, Never>?
+    /// `true` once a mutator diverged the in-memory state from the file (every
+    /// mutation path goes through `scheduleSave`). Guards the asynchronous disk
+    /// apply: a change landing before the decode finishes wins over `library.json`.
+    @ObservationIgnored private var hasLocalChanges = false
     /// Number of disk writes performed (tests).
     @ObservationIgnored private(set) var saveCount = 0
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private let writer = LibraryWriter()
     @ObservationIgnored private var latestByTitle: [TitleID: PlaybackProgress]?
 
-    /// Loads `library.json` synchronously (small file).
+    /// Loads `library.json` off the main actor (a few MB at the collection caps
+    /// would otherwise decode synchronously inside `AppModel.init`, on the first
+    /// frame's critical path). The launch/onboarding phases never read the
+    /// library, so nothing observes the briefly-empty state.
     public convenience init(directories: AppDirectories, saveDelay: Duration = .milliseconds(1_500)) {
         self.init(fileURL: directories.libraryFile, saveDelay: saveDelay)
     }
@@ -95,13 +123,23 @@ public final class LibraryStore {
     init(fileURL: URL?, saveDelay: Duration) {
         self.fileURL = fileURL
         self.saveDelay = saveDelay
-        if let fileURL, let data = try? Data(contentsOf: fileURL) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let file = try? decoder.decode(LibraryFile.self, from: data) {
-                apply(file)
+        self.loadTask = nil
+        if let fileURL {
+            loadTask = Task { [weak self] in
+                guard let file = await Self.decode(fileURL), let self,
+                      !Task.isCancelled, !self.hasLocalChanges else { return }
+                self.apply(file)
             }
         }
+    }
+
+    /// Reads and decodes `library.json` on a worker: JSON decoding a multi-MB
+    /// file on the main actor stalls first-frame work.
+    nonisolated private static func decode(_ url: URL) async -> LibraryFile? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(LibraryFile.self, from: data)
     }
 
     /// Non-persistent store for previews and tests.
@@ -109,9 +147,17 @@ public final class LibraryStore {
         LibraryStore(fileURL: nil, saveDelay: .zero)
     }
 
+    /// Resolves once the background `library.json` decode has been applied — or
+    /// skipped because the store was mutated first. Instant for in-memory stores
+    /// and once the file is loaded; `AppModel.bootstrap` awaits it so the first
+    /// catalogue publish reconciles the real collections, not empty ones.
+    public func awaitDiskLoad() async {
+        await loadTask?.value
+    }
+
     // MARK: - Watchlist
 
-    public func isInWatchlist(_ id: TitleID) -> Bool { watchlist.contains(id) }
+    public func isInWatchlist(_ id: TitleID) -> Bool { watchlistSet.contains(id) }
 
     public func toggleWatchlist(_ id: TitleID) {
         if isInWatchlist(id) { removeFromWatchlist(id) } else { addToWatchlist(id) }
@@ -120,6 +166,7 @@ public final class LibraryStore {
     public func addToWatchlist(_ id: TitleID) {
         watchlist.removeAll { $0 == id }
         watchlist.insert(id, at: 0)
+        if watchlist.count > Self.maxWatchlist { watchlist.removeLast(watchlist.count - Self.maxWatchlist) }
         scheduleSave()
     }
 
@@ -131,7 +178,7 @@ public final class LibraryStore {
 
     // MARK: - Dismissed suggestions
 
-    public func isDismissed(_ id: TitleID) -> Bool { dismissed.contains(id) }
+    public func isDismissed(_ id: TitleID) -> Bool { dismissedSet.contains(id) }
 
     /// Hides a title from recommendations (and from Ma liste, which it contradicts).
     public func dismiss(_ id: TitleID) {
@@ -156,13 +203,16 @@ public final class LibraryStore {
 
     // MARK: - Favourite channels
 
-    public func isFavorite(_ groupID: String) -> Bool { favoriteChannels.contains(groupID) }
+    public func isFavorite(_ groupID: String) -> Bool { favoriteChannelSet.contains(groupID) }
 
     public func toggleFavorite(_ groupID: String) {
         if isFavorite(groupID) {
             favoriteChannels.removeAll { $0 == groupID }
         } else {
             favoriteChannels.append(groupID)
+            if favoriteChannels.count > Self.maxFavoriteChannels {
+                favoriteChannels.removeLast(favoriteChannels.count - Self.maxFavoriteChannels)
+            }
         }
         scheduleSave()
     }
@@ -174,6 +224,9 @@ public final class LibraryStore {
         let insertion = destination - valid.filter { $0 < destination }.count
         for index in valid.sorted(by: >) { favoriteChannels.remove(at: index) }
         favoriteChannels.insert(contentsOf: moving, at: min(max(insertion, 0), favoriteChannels.count))
+        if favoriteChannels.count > Self.maxFavoriteChannels {
+            favoriteChannels.removeLast(favoriteChannels.count - Self.maxFavoriteChannels)
+        }
         scheduleSave()
     }
 
@@ -199,6 +252,7 @@ public final class LibraryStore {
         progress[value.contentID] = value
         if value.isFinished, !watched.contains(value.contentID) { watched.insert(value.contentID) }
         pruneProgressIfNeeded()
+        pruneWatchedIfNeeded()
         scheduleSave()
     }
 
@@ -216,6 +270,7 @@ public final class LibraryStore {
             contentID: id, titleID: titleID ?? existing?.titleID, position: duration, duration: duration, updatedAt: .now
         )
         pruneProgressIfNeeded()
+        pruneWatchedIfNeeded()
         scheduleSave()
     }
 
@@ -435,9 +490,16 @@ public final class LibraryStore {
 
     /// Writes immediately (call on app termination).
     public func flush() {
+        // A pending disk decode must not land after this write (it would replace
+        // the flushed state in memory); an unchanged store already matches the
+        // file, so quitting without mutations skips the encode entirely — unless
+        // the file vanished or was corrupted externally mid-session.
+        loadTask?.cancel()
+        loadTask = nil
         saveTask?.cancel()
         saveTask = nil
-        guard let fileURL else { return }
+        guard let fileURL,
+              hasLocalChanges || !FileManager.default.fileExists(atPath: fileURL.path) else { return }
         generation += 1
         let makeFile = snapshot()
         writer.writeNow(makeFile(), generation: generation, to: fileURL)
@@ -445,6 +507,7 @@ public final class LibraryStore {
     }
 
     private func scheduleSave() {
+        hasLocalChanges = true
         guard fileURL != nil else { return }
         saveTask?.cancel()
         let delay = saveDelay
@@ -465,20 +528,76 @@ public final class LibraryStore {
     }
 
     private func pruneProgressIfNeeded() {
-        guard progress.count > Self.maxProgressEntries else { return }
+        let overflow = progress.count - Self.maxProgressEntries
+        guard overflow > 0 else { return }
+        // Mutations past the cap overflow by one entry at a time: a full sort of
+        // thousands of values ran on the main actor on EVERY playback tick. Drop the
+        // few oldest entries with linear scans instead (updatedAt ties were already
+        // arbitrary — `sorted` is not stable); large overflows (disk apply) still sort.
+        if overflow <= 8 {
+            for _ in 0..<overflow {
+                var oldest: (key: ContentID, updatedAt: Date)?
+                for (key, value) in progress {
+                    guard let current = oldest else { oldest = (key, value.updatedAt); continue }
+                    if value.updatedAt < current.updatedAt { oldest = (key, value.updatedAt) }
+                }
+                guard let drop = oldest else { break }
+                progress[drop.key] = nil
+            }
+            return
+        }
         let keep = progress.values.sorted { $0.updatedAt > $1.updatedAt }.prefix(Self.maxProgressEntries)
         progress = Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
     }
 
+    /// `watched` has no timestamps: entries without a progress entry are the oldest (progress
+    /// itself keeps only the 3 000 most recent), then the oldest resume points go first.
+    private func pruneWatchedIfNeeded() {
+        let overflow = watched.count - Self.maxWatched
+        guard overflow > 0 else { return }
+        // Same small-overflow fast path as `pruneProgressIfNeeded`: the drop candidate is
+        // the smallest progress-updatedAt (distantPast when absent), then — matching the
+        // sort's ascending rawValue tiebreak — the largest rawValue.
+        if overflow <= 8 {
+            for _ in 0..<overflow {
+                var oldest: (id: ContentID, date: Date)?
+                for id in watched {
+                    let date = progress[id]?.updatedAt ?? .distantPast
+                    guard let current = oldest else { oldest = (id, date); continue }
+                    if date < current.date || (date == current.date && id.rawValue > current.id.rawValue) {
+                        oldest = (id, date)
+                    }
+                }
+                guard let drop = oldest else { break }
+                watched.remove(drop.id)
+            }
+            return
+        }
+        let ordered = watched.sorted { lhs, rhs in
+            let l = progress[lhs]?.updatedAt ?? .distantPast
+            let r = progress[rhs]?.updatedAt ?? .distantPast
+            return l == r ? lhs.rawValue < rhs.rawValue : l > r
+        }
+        watched = Set(ordered.prefix(Self.maxWatched))
+    }
+
+    /// Capture the current collections here. Encoding and the write run off the
+    /// main actor; the large set/dictionary collections are written unsorted —
+    /// `apply(_:)` rebuilds them by key, so file order carries no meaning and
+    /// sorting ~30k ids per save (and synchronously in `flush()`) was wasted work.
+    /// The small preferred-variant maps stay sorted (see below).
     private func snapshot() -> @Sendable () -> LibraryFile {
         { [watchlist, favoriteChannels, progress, watched, history, preferredVariants,
            preferredChannelVariants, storedLastChannelGroupID, dismissed] in
             LibraryFile(
                 watchlist: watchlist,
                 favoriteChannels: favoriteChannels,
-                progress: progress.values.sorted { $0.contentID < $1.contentID },
-                watched: watched.sorted(),
+                progress: Array(progress.values),
+                watched: Array(watched),
                 history: history,
+                // These two stay sorted: `apply` keeps a capped prefix in file order, so an
+                // unsorted write would make which entries survive nondeterministic. They are
+                // small user-driven picks — sorting costs nothing next to `progress`/`watched`.
                 preferredVariants: preferredVariants.map { .init(key: $0.key.rawValue, contentID: $0.value) }.sorted { $0.key < $1.key },
                 preferredChannelVariants: preferredChannelVariants.map { .init(key: $0.key, contentID: $0.value) }.sorted { $0.key < $1.key },
                 lastChannelGroupID: storedLastChannelGroupID,
@@ -487,15 +606,24 @@ public final class LibraryStore {
         }
     }
 
+    /// A hand-edited or corrupt `library.json` must not grow the in-memory state without bound:
+    /// every collection is capped here (and again on mutation).
     private func apply(_ file: LibraryFile) {
-        watchlist = file.watchlist
-        favoriteChannels = file.favoriteChannels
+        watchlist = Array(file.watchlist.prefix(Self.maxWatchlist))
+        favoriteChannels = Array(file.favoriteChannels.prefix(Self.maxFavoriteChannels))
         progress = Dictionary(file.progress.map { ($0.contentID, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
         pruneProgressIfNeeded()
         watched = Set(file.watched)
+        pruneWatchedIfNeeded()
         history = Array(file.history.prefix(Self.maxHistory))
-        preferredVariants = Dictionary(file.preferredVariants.map { (TitleID(rawValue: $0.key), $0.contentID) }, uniquingKeysWith: { a, _ in a })
-        preferredChannelVariants = Dictionary(file.preferredChannelVariants.map { ($0.key, $0.contentID) }, uniquingKeysWith: { a, _ in a })
+        preferredVariants = Dictionary(
+            file.preferredVariants.prefix(Self.maxPreferredEntries).map { (TitleID(rawValue: $0.key), $0.contentID) },
+            uniquingKeysWith: { a, _ in a }
+        )
+        preferredChannelVariants = Dictionary(
+            file.preferredChannelVariants.prefix(Self.maxPreferredEntries).map { ($0.key, $0.contentID) },
+            uniquingKeysWith: { a, _ in a }
+        )
         storedLastChannelGroupID = file.lastChannelGroupID
         dismissed = Array(file.dismissed.prefix(Self.maxDismissed))
     }

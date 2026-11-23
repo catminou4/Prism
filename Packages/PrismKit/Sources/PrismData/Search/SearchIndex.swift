@@ -50,6 +50,9 @@ public final class SearchIndex: Sendable {
     /// Unique words in bytewise order, flattened; `wordOffsets.count == wordCount + 1`.
     let wordBytes: [UInt8]
     let wordOffsets: [Int32]
+    /// Per-word 64-bit signature of contained byte values (mod 64): the substring fallback
+    /// skips words that cannot contain the token's first byte without calling `memmem`.
+    let wordMasks: [UInt64]
     /// Entries containing each word (by rank), flattened; `postingOffsets.count == wordCount + 1`.
     let postings: [Int32]
     let postingOffsets: [Int32]
@@ -66,6 +69,7 @@ public final class SearchIndex: Sendable {
         nameBytes = []; nameOffsets = [0]
         entryWords = []; entryWordOffsets = [0]
         wordBytes = []; wordOffsets = [0]
+        wordMasks = []
         postings = []; postingOffsets = [0]
     }
 
@@ -73,7 +77,7 @@ public final class SearchIndex: Sendable {
         channels: [ChannelGroup], movies: [MediaTitle], series: [MediaTitle],
         baseScores: [UInt64],
         nameBytes: [UInt8], nameOffsets: [Int32], entryWords: [Int32], entryWordOffsets: [Int32],
-        wordBytes: [UInt8], wordOffsets: [Int32], postings: [Int32], postingOffsets: [Int32]
+        wordBytes: [UInt8], wordOffsets: [Int32], wordMasks: [UInt64], postings: [Int32], postingOffsets: [Int32]
     ) {
         self.channels = channels
         self.movies = movies
@@ -87,6 +91,7 @@ public final class SearchIndex: Sendable {
         self.entryWordOffsets = entryWordOffsets
         self.wordBytes = wordBytes
         self.wordOffsets = wordOffsets
+        self.wordMasks = wordMasks
         self.postings = postings
         self.postingOffsets = postingOffsets
     }
@@ -115,6 +120,7 @@ public final class SearchIndex: Sendable {
 
     @concurrent
     public static func build(from catalog: Catalog, recommendations: Recommendations = .empty) async -> SearchIndex {
+        let buildStart = ContinuousClock.now
         let channels = catalog.channels, movies = catalog.movies, series = catalog.series
         let total = channels.count + movies.count + series.count
         guard total > 0, !Task.isCancelled else { return .empty }
@@ -160,6 +166,8 @@ public final class SearchIndex: Sendable {
             return result.sorted { $0.start < $1.start }
         }
         guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search describe+fold chunks (parallel)", since: buildStart)
+        let mergeStart = ContinuousClock.now
         let baseScores = chunks.flatMap(\.baseScores)
 
         // Names, global word ids (only chunk-unique words hit the shared dictionary).
@@ -199,6 +207,8 @@ public final class SearchIndex: Sendable {
                 entryWordOffsets.append(cursor)
             }
         }
+        BuildProfile.mark("search word-id merge", since: mergeStart)
+        let sortStart = ContinuousClock.now
 
         // Flatten unique words by id, then sort ids bytewise.
         var idBytes: [UInt8] = []
@@ -230,6 +240,8 @@ public final class SearchIndex: Sendable {
         }
         let entryWords = entryWordIDs.map { rankOfID[Int($0)] }
         guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search unique-word sort+rank", since: sortStart)
+        let postingsStart = ContinuousClock.now
 
         // Posting lists (counting sort by rank; entries stay ascending inside each list).
         var counts = [Int32](repeating: 0, count: order.count + 1)
@@ -254,12 +266,24 @@ public final class SearchIndex: Sendable {
             }
         }
 
+        // Per-word byte-class signature for the substring fallback.
+        var wordMasks = [UInt64](repeating: 0, count: order.count)
+        for rank in 0..<order.count {
+            let w0 = Int(wordOffsets[rank]), w1 = Int(wordOffsets[rank + 1])
+            var mask: UInt64 = 0
+            for position in w0..<w1 {
+                mask |= UInt64(1) << (wordBytes[position] & 63)
+            }
+            wordMasks[rank] = mask
+        }
+        BuildProfile.mark("search postings+masks", since: postingsStart)
+
         return SearchIndex(
             channels: channels, movies: movies, series: series,
             baseScores: baseScores,
             nameBytes: nameBytes, nameOffsets: nameOffsets,
             entryWords: entryWords, entryWordOffsets: entryWordOffsets,
-            wordBytes: wordBytes, wordOffsets: wordOffsets,
+            wordBytes: wordBytes, wordOffsets: wordOffsets, wordMasks: wordMasks,
             postings: postings, postingOffsets: postingOffsets
         )
     }
@@ -329,7 +353,7 @@ public final class SearchIndex: Sendable {
             normalizedQuery.append(contentsOf: token)
         }
 
-        var top = [TopK](repeating: TopK(limit: limit), count: 3)
+        var top = [TopK(limit: limit), TopK(limit: limit), TopK(limit: limit)]
         withRaw { raw in
             let found = prefixSearch(raw, tokens: tokens, query: normalizedQuery, top: &top)
             if !found { substringSearch(raw, tokens: tokens, top: &top) }
@@ -371,6 +395,7 @@ public final class SearchIndex: Sendable {
         let entryWordOffsets: UnsafeBufferPointer<Int32>
         let wordBytes: UnsafeBufferPointer<UInt8>
         let wordOffsets: UnsafeBufferPointer<Int32>
+        let wordMasks: UnsafeBufferPointer<UInt64>
         let postings: UnsafeBufferPointer<Int32>
         let postingOffsets: UnsafeBufferPointer<Int32>
         var wordCount: Int { wordOffsets.count - 1 }
@@ -385,14 +410,15 @@ public final class SearchIndex: Sendable {
         entryWordOffsets.withUnsafeBufferPointer { entryWordOffsets in
         wordBytes.withUnsafeBufferPointer { wordBytes in
         wordOffsets.withUnsafeBufferPointer { wordOffsets in
+        wordMasks.withUnsafeBufferPointer { wordMasks in
         postings.withUnsafeBufferPointer { postings in
         postingOffsets.withUnsafeBufferPointer { postingOffsets in
             body(Raw(
                 baseScores: baseScores, nameBytes: nameBytes, nameOffsets: nameOffsets,
                 entryWords: entryWords, entryWordOffsets: entryWordOffsets, wordBytes: wordBytes,
-                wordOffsets: wordOffsets, postings: postings, postingOffsets: postingOffsets
+                wordOffsets: wordOffsets, wordMasks: wordMasks, postings: postings, postingOffsets: postingOffsets
             ))
-        }}}}}}}}}
+        }}}}}}}}}}
     }
 
     /// Returns `false` when no entry prefix-matches every token.
@@ -404,14 +430,21 @@ public final class SearchIndex: Sendable {
             if range.lower >= range.upper { return false }
             ranges.append((Int32(range.lower), Int32(range.upper)))
         }
-        // Drive with the token that has the smallest posting volume.
+        // Drive with the token that has the smallest posting volume; check the remaining
+        // tokens rarest-first so non-matching candidates bail out after the fewest scans.
         var driver = 0
         var smallest = Int.max
+        var volumes = [Int](repeating: 0, count: ranges.count)
         for (index, range) in ranges.enumerated() {
             let volume = Int(raw.postingOffsets[Int(range.upper)] - raw.postingOffsets[Int(range.lower)])
+            volumes[index] = volume
             if volume < smallest { smallest = volume; driver = index }
         }
-        let others = ranges.enumerated().filter { $0.offset != driver }.map(\.element)
+        let others = ranges.enumerated()
+            .filter { $0.offset != driver }
+            .map { (volume: volumes[$0.offset], range: $0.element) }
+            .sorted { $0.volume < $1.volume }
+            .map(\.range)
         let driverRange = ranges[driver]
         let needsDedupe = driverRange.upper - driverRange.lower > 1
 
@@ -420,6 +453,9 @@ public final class SearchIndex: Sendable {
         defer { seen.deallocate() }
 
         var found = false
+        // Single-token queries (the common typing path) have no `others` to satisfy:
+        // skip the per-entry word scan entirely.
+        let needsWordCheck = !others.isEmpty
         query.withUnsafeBufferPointer { q in
             for rank in Int(driverRange.lower)..<Int(driverRange.upper) {
                 for position in Int(raw.postingOffsets[rank])..<Int(raw.postingOffsets[rank + 1]) {
@@ -428,21 +464,26 @@ public final class SearchIndex: Sendable {
                         if seen[entry] != 0 { continue }
                         seen[entry] = 1
                     }
-                    let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
-                    var matchesAll = true
-                    for range in others {
-                        var hit = false
-                        for w in w0..<w1 {
-                            let r = raw.entryWords[w]
-                            if r >= range.lower && r < range.upper { hit = true; break }
+                    if needsWordCheck {
+                        let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
+                        var matchesAll = true
+                        for range in others {
+                            var hit = false
+                            for w in w0..<w1 {
+                                let r = raw.entryWords[w]
+                                if r >= range.lower && r < range.upper { hit = true; break }
+                            }
+                            if !hit { matchesAll = false; break }
                         }
-                        if !hit { matchesAll = false; break }
+                        guard matchesAll else { continue }
                     }
-                    guard matchesAll else { continue }
                     found = true
                     let n0 = Int(raw.nameOffsets[entry]), n1 = Int(raw.nameOffsets[entry + 1])
                     var tier: UInt64 = 1
-                    if n1 - n0 >= q.count, compareBytes(raw.nameBytes, n0, q.count, q, 0, q.count) == 0 {
+                    // First-byte prefilter: nearly every candidate fails the name-prefix
+                    // check on byte 0, so `memcmp` only runs on the few survivors.
+                    if n1 - n0 >= q.count, raw.nameBytes[n0] == q[0],
+                       compareBytes(raw.nameBytes, n0, q.count, q, 0, q.count) == 0 {
                         tier = n1 - n0 == q.count ? 3 : 2
                     }
                     let score = tier << 60 | raw.baseScores[entry]
@@ -467,7 +508,13 @@ public final class SearchIndex: Sendable {
             maps.append(map)
             var volume = 0
             token.withUnsafeBufferPointer { t in
+                // Necessary condition for containment: the word's byte-class mask must cover
+                // every byte class the token uses, so words missing any class are skipped
+                // outright without calling `memmem`.
+                var needed: UInt64 = 0
+                for byte in t { needed |= UInt64(1) << (byte & 63) }
                 for rank in 0..<wordCount {
+                    guard raw.wordMasks[rank] & needed == needed else { continue }
                     let w0 = Int(raw.wordOffsets[rank]), w1 = Int(raw.wordOffsets[rank + 1])
                     if containsBytes(raw.wordBytes, w0, w1 - w0, t) {
                         map[rank] = 1
@@ -485,11 +532,17 @@ public final class SearchIndex: Sendable {
         seen.initialize(repeating: 0)
         defer { seen.deallocate() }
         let driverMap = maps[driver]
+        // Single-token queries have no other token to satisfy.
+        let needsWordCheck = maps.count > 1
         for rank in 0..<wordCount where driverMap[rank] != 0 {
             for position in Int(raw.postingOffsets[rank])..<Int(raw.postingOffsets[rank + 1]) {
                 let entry = Int(raw.postings[position])
                 if seen[entry] != 0 { continue }
                 seen[entry] = 1
+                guard needsWordCheck else {
+                    top[kind(of: entry)].offer(score: raw.baseScores[entry], entry: Int32(entry))
+                    continue
+                }
                 let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
                 var matchesAll = true
                 for (index, map) in maps.enumerated() where index != driver {

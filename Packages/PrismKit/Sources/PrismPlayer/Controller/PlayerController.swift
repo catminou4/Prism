@@ -71,6 +71,10 @@ public final class PlayerController {
     public private(set) var subtitleStyle: SubtitleStyle
     /// Programme airing on the live channel (progress in the scrubber, top title).
     public var liveProgramme: LiveProgramme?
+    /// Whether the "Épisode suivant" card should be on screen: last 30 s of a VOD item
+    /// (or the ended state). Published as a Bool so the up-next host doesn't subscribe
+    /// to the 4 Hz clock for a card that is hidden almost all of the time.
+    public private(set) var upNextVisible = false
 
     public let preferences: PlayerPreferences
     /// AVPlayer of the current engine, for the AirPlay route picker (nil with VLC).
@@ -164,7 +168,9 @@ public final class PlayerController {
     @ObservationIgnored let loadTimeout: Duration
     @ObservationIgnored let reconnectPolicy: ReconnectPolicy
     /// Stall threshold for VOD before the current attempt is reopened at the same position.
-    @ObservationIgnored let vodStallThreshold: TimeInterval = 20
+    /// Matches the live threshold: on flaky IPTV a frozen clock reads as dead air long
+    /// before 20 s, and a false positive only costs a reopen-at-position.
+    @ObservationIgnored let vodStallThreshold: TimeInterval = 8
 
     // MARK: - Init
 
@@ -221,7 +227,7 @@ public final class PlayerController {
 
     /// Channel zapping / next episode: keeps the last frame until the new stream renders.
     public func replace(with newItem: PlaybackItem, programme: LiveProgramme? = nil) {
-        reportProgress(force: true)
+        reportProgress()
         item = newItem
         liveProgramme = programme
         duration = nil
@@ -233,19 +239,31 @@ public final class PlayerController {
         selectedAudioID = nil
         selectedSubtitleID = nil
         techInfo = .empty
+        videoSize = nil
         if newItem.isLive { setRateValue(1) }
         begin(startPosition: newItem.startPosition)
     }
 
     /// Stops playback and releases the engines (window closed).
     public func stop() {
-        reportProgress(force: true)
+        reportProgress()
         saveVolume()
         cancelTasks()
         playRequested = false
         tearDownEngines()
         isSwitchingStream = false
         statusMessage = nil
+        // Clear stream-derived state so a later start() doesn't show the previous
+        // item's duration/tracks/tech info while the new one loads.
+        // (`currentTime` is kept: it is the resume position for `start()`.)
+        duration = nil
+        bufferedTime = 0
+        timeshiftWindow = nil
+        audioTracks = []
+        subtitleTracks = []
+        selectedAudioID = nil
+        selectedSubtitleID = nil
+        techInfo = .empty
         setPhase(.idle)
     }
 
@@ -322,12 +340,7 @@ public final class PlayerController {
         routingPlayer = newEngine.routingPlayer
         supportsAspectRatioOverride = newEngine.supportsAspectRatioOverride
 
-        let timeout = loadTimeout
-        loadTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            guard !Task.isCancelled else { return }
-            self?.handleLoadTimeout(generation: generation)
-        }
+        restartLoadTimeout()
         newEngine.load(
             url: attempt.url, headers: item.httpHeaders, startPosition: startPosition, isLive: item.isLive)
         // An engine can fail synchronously in load(), after which it has already been replaced.
@@ -346,9 +359,22 @@ public final class PlayerController {
         beginAttempt(at: next, startPosition: startPosition)
     }
 
+    /// (Re)arms the attempt load timeout for the current engine generation.
+    private func restartLoadTimeout() {
+        loadTimeoutTask?.cancel()
+        let generation = engineGeneration
+        let timeout = loadTimeout
+        loadTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.handleLoadTimeout(generation: generation)
+        }
+    }
+
     private func handleLoadTimeout(generation: Int) {
-        guard generation == engineGeneration, !attemptRendered else { return }
-        if attemptReady, !playRequested { return }
+        // A paused attempt is not failing: don't burn through the plan while the
+        // user is away. Playback events (.ready/.failed/stall) still drive it.
+        guard generation == engineGeneration, !attemptRendered, playRequested else { return }
         handleFailure("Le flux ne répond pas (délai dépassé).")
     }
 
@@ -384,8 +410,22 @@ public final class PlayerController {
             try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled else { return }
             self.reconnectTask = nil
+            // First retries stay on the same URL (transient stalls recover fast),
+            // then hop to the next fallback: a stream dead mid-playback would
+            // otherwise retest the same URL until the policy gives up.
+            var index = self.planIndex
+            if self.reconnectCount >= 2, self.plan.count > 1, let current = self.currentAttempt {
+                for offset in 1..<self.plan.count {
+                    let candidate = (self.planIndex + offset) % self.plan.count
+                    if self.plan[candidate].url != current.url {
+                        index = candidate
+                        break
+                    }
+                }
+            }
+            self.planIndex = index
             let position: TimeInterval? = self.item.isLive ? nil : self.currentTime
-            self.beginAttempt(at: self.planIndex, startPosition: position)
+            self.beginAttempt(at: index, startPosition: position)
         }
     }
 
@@ -407,9 +447,12 @@ public final class PlayerController {
         switch event {
         case .ready(let engineDuration):
             attemptReady = true
-            if !item.isLive, let engineDuration, engineDuration > 0 { duration = engineDuration }
+            if !item.isLive, let engineDuration, engineDuration > 0, duration != engineDuration {
+                duration = engineDuration
+            }
             if !playRequested { loadTimeoutTask?.cancel() }
             refreshTracks()
+            refreshUpNextVisibility()
         case .time(let current, let buffered):
             handleTime(current: current, buffered: buffered)
         case .state(let state):
@@ -423,9 +466,9 @@ public final class PlayerController {
         case .tracksChanged:
             refreshTracks()
         case .videoSize(let size):
-            videoSize = size
+            if videoSize != size { videoSize = size }
         case .pictureInPicture(let active):
-            isPictureInPictureActive = active
+            if isPictureInPictureActive != active { isPictureInPictureActive = active }
         }
     }
 
@@ -452,7 +495,18 @@ public final class PlayerController {
             let window = engine.seekableRange.flatMap {
                 $0.upperBound - $0.lowerBound >= minimumWindow ? $0 : nil
             }
-            if window != timeshiftWindow { timeshiftWindow = window }
+            // A continuously growing DVR window would otherwise rewrite `timeshiftWindow`
+            // at the engine's poll rate (~4 Hz) — every write re-evaluates PlayerView and
+            // the scrubber. Sub-second drift is invisible on the timeline: publish only
+            // on ≥0.5 s bound movement (≈1 Hz worst case while the window slides).
+            let changed: Bool
+            switch (timeshiftWindow, window) {
+            case (nil, nil): changed = false
+            case let (old?, new?):
+                changed = abs(old.lowerBound - new.lowerBound) > 0.5 || abs(old.upperBound - new.upperBound) > 0.5
+            default: changed = true
+            }
+            if changed { timeshiftWindow = window }
         }
         if phase == .playing, let since = playingSince, now - since >= reconnectPolicy.stableAfter,
             reconnectCount > 0
@@ -463,6 +517,7 @@ public final class PlayerController {
            let duration, progressThrottle.shouldReport(at: now) {
             onProgress?(currentTime, duration)
         }
+        refreshUpNextVisibility()
     }
 
     private func handleState(_ state: EnginePlaybackState) {
@@ -473,6 +528,11 @@ public final class PlayerController {
             guard playRequested else { return }
             if playingSince == nil { playingSince = uptime() }
             stopStallWatch()
+            // The stream recovered during a reconnect backoff: cancel the pending
+            // teardown instead of bouncing a healthy player.
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            isReconnecting = false
             if !isSwitchingStream { statusMessage = nil }
             setPhase(.playing)
         case .paused, .buffering:
@@ -504,9 +564,10 @@ public final class PlayerController {
             scheduleReconnect()
             return
         }
+        guard phase != .ended else { return }  // duplicate .ended must not re-fire onEnded
         if let duration { currentTime = duration }
         playRequested = false
-        reportProgress(force: true)
+        reportProgress()
         setPhase(.ended)
         showControls()
         onEnded?()
@@ -568,6 +629,7 @@ public final class PlayerController {
         attemptRendered = false
         isPictureInPictureActive = false
         routingPlayer = nil
+        videoSize = nil
     }
 
     private func cancelTasks() {
@@ -587,11 +649,17 @@ public final class PlayerController {
 
     private func refreshTracks() {
         guard let engine else { return }
-        audioTracks = engine.audioTracks
-        subtitleTracks = engine.subtitleTracks
+        // `.ready` can fire twice on VLC (the duration arrives late): only publish
+        // real changes so menus and pickers don't re-render on identical arrays.
+        let audio = engine.audioTracks
+        if audioTracks != audio { audioTracks = audio }
+        let subtitles = engine.subtitleTracks
+        if subtitleTracks != subtitles { subtitleTracks = subtitles }
         applyAutoSelectionIfNeeded()
-        selectedAudioID = engine.selectedAudioID
-        selectedSubtitleID = engine.selectedSubtitleID
+        let audioID = engine.selectedAudioID
+        if selectedAudioID != audioID { selectedAudioID = audioID }
+        let subtitleID = engine.selectedSubtitleID
+        if selectedSubtitleID != subtitleID { selectedSubtitleID = subtitleID }
     }
 
     private func applyAutoSelectionIfNeeded() {
@@ -629,9 +697,19 @@ public final class PlayerController {
             return
         case .ended:
             playRequested = true
-            seek(to: 0)
+            // Rewind before resuming: playing while a seek is in flight races the
+            // engine. beginSeek resumes playback on completion while playRequested
+            // holds; fall back to playing directly when seeking isn't possible.
+            if !beginSeek(target: 0) {
+                engine?.play()
+                if attemptRendered { setPhase(.playing) }
+            }
+            return
         default:
             playRequested = true
+            // Resuming a paused attempt that never rendered needs its load timeout
+            // back: it may have been consumed while the user was away.
+            if !attemptRendered { restartLoadTimeout() }
         }
         engine?.play()
         if attemptRendered, phase == .paused || phase == .ended { setPhase(.playing) }
@@ -641,8 +719,8 @@ public final class PlayerController {
         playRequested = false
         stopStallWatch()
         engine?.pause()
-        if phase == .playing || phase == .buffering { setPhase(.paused) }
-        reportProgress(force: true)
+        if phase == .playing || phase == .buffering || phase == .loading { setPhase(.paused) }
+        reportProgress()
     }
 
     public func togglePlayPause() {
@@ -651,18 +729,32 @@ public final class PlayerController {
     }
 
     public func seek(to seconds: TimeInterval) {
-        guard canSeek, let engine else { return }
-        let target = clampedSeekTarget(seconds)
+        // NaN/∞ would poison `currentTime` (every comparison downstream goes false).
+        guard seconds.isFinite else { return }
+        _ = beginSeek(target: clampedSeekTarget(seconds))
+    }
+
+    /// Starts an engine seek tracked by `seekTask` (which keeps `currentTime` and
+    /// progress reports frozen until the engine lands). Returns false when seeking
+    /// isn't possible right now. On completion, playback resumes if `playRequested`
+    /// still holds — this replays from the start after `.ended` without racing the
+    /// seek, and stays a no-op for seeks issued while paused.
+    @discardableResult
+    private func beginSeek(target: TimeInterval) -> Bool {
+        guard canSeek, let engine else { return false }
         currentTime = target
+        refreshUpNextVisibility()
         if phase == .ended { setPhase(.paused) }
-        reportProgress(force: true)
+        reportProgress()
         seekTask?.cancel()
         seekTask = Task { [weak self] in
             guard !Task.isCancelled else { return }
             await engine.seek(to: target)
-            guard !Task.isCancelled else { return }
-            self?.seekTask = nil
+            guard !Task.isCancelled, let self else { return }
+            self.seekTask = nil
+            if self.playRequested { self.engine?.play() }
         }
+        return true
     }
 
     /// ±10 s skip with on-screen feedback (no-op for live without DVR).
@@ -884,6 +976,23 @@ public final class PlayerController {
         let playing = playRequested && (newPhase == .playing || newPhase == .buffering)
         autoHide.setPlaying(playing, at: uptime())
         applyControlsVisibility()
+        refreshUpNextVisibility()
+    }
+
+    /// Mirrors `PlayerUpNextHost`'s visibility rule: the "Épisode suivant" card owns
+    /// the last 30 s of a VOD item (or the ended state). Recomputed wherever its
+    /// inputs change — `currentTime` ticks, phase transitions, seeks, duration/ready.
+    private func refreshUpNextVisibility() {
+        let visible: Bool
+        if item.isLive {
+            visible = false
+        } else if let duration, duration > 60 {
+            let remaining = max(0, duration - currentTime)
+            visible = remaining <= 30 && (remaining > 0 || phase == .ended)
+        } else {
+            visible = false
+        }
+        if upNextVisible != visible { upNextVisible = visible }
     }
 
     // MARK: - Feedback & progress
@@ -899,7 +1008,9 @@ public final class PlayerController {
         }
     }
 
-    private func reportProgress(force: Bool) {
+    /// Immediate progress report for pause/seek/stop/end/replace — bypasses the
+    /// 20 s `ProgressThrottle` and re-arms it so the next periodic tick waits a full interval.
+    private func reportProgress() {
         guard !item.isLive, let duration, duration > 0, attemptReady || currentTime > 0 else { return }
         progressThrottle.recordForced(at: uptime())
         onProgress?(currentTime, duration)
@@ -1009,6 +1120,7 @@ extension PlayerController {
             controller.feedbackCounter += 1
             controller.feedback = PlayerFeedback(id: controller.feedbackCounter, kind: feedback)
         }
+        controller.refreshUpNextVisibility()
         return controller
     }
 }

@@ -10,7 +10,12 @@ struct LibraryShell: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var navigation = NavigationModel()
     @State private var sports = SportsPresentation()
+    /// Sections kept mounted, least-recently-used first. Each owns a full page
+    /// stack: beyond `maxMountedSections` the oldest is unmounted (its routes stay
+    /// in `NavigationModel`, only scroll/view state is lost) so buried pages stop
+    /// observing `AppModel` — progress ticks, feed refreshes…
     @State private var visited: [SidebarItem] = [.home]
+    private static let maxMountedSections = 6
     @State private var visibility = NavigationSplitViewVisibility.all
     @State private var isAddingSource = false
 
@@ -60,7 +65,12 @@ struct LibraryShell: View {
             }
         }
         .onChange(of: navigation.selection) { _, selection in
-            if !visited.contains(selection) { visited.append(selection) }
+            // Ordre = récence (le plus récent en dernier) pour l'éviction LRU.
+            visited.removeAll { $0 == selection }
+            visited.append(selection)
+            if visited.count > Self.maxMountedSections {
+                visited.removeFirst(visited.count - Self.maxMountedSections)
+            }
         }
         .onChange(of: app.sources.map(\.id)) { old, new in
             for id in Set(old).subtracting(new) {
@@ -80,22 +90,41 @@ struct LibraryShell: View {
         })
     }
 
+    /// `List(selection:)` ne re-notifie pas toujours la valeur identique : un clic
+    /// sur la section déjà affichée doit quand même remonter sa pile à la racine
+    /// (comportement Apple TV). Le garde-fou sur `lastSelectionChange` évite de
+    /// vider la pile d'une section qu'on vient de choisir — la sélection et le
+    /// geste `onEnded` arrivent quasi ensemble, la sélection gagnant la course.
+    private func popToRootOnRetap(_ item: SidebarItem) -> some Gesture {
+        TapGesture().onEnded {
+            guard navigation.selection == item,
+                  Date.now.timeIntervalSince(navigation.lastSelectionChange) > 0.5
+            else { return }
+            navigation.popToRoot()
+        }
+    }
+
     private var sidebar: some View {
         List(selection: sidebarSelection) {
             Section {
                 ForEach(Self.mainItems, id: \.item) { entry in
-                    Label(entry.title, systemImage: entry.symbol).tag(entry.item)
+                    Label(entry.title, systemImage: entry.symbol)
+                        .tag(entry.item)
+                        .simultaneousGesture(popToRootOnRetap(entry.item))
                 }
             }
             Section("Bibliothèque") {
                 ForEach(Self.libraryItems, id: \.item) { entry in
-                    Label(entry.title, systemImage: entry.symbol).tag(entry.item)
+                    Label(entry.title, systemImage: entry.symbol)
+                        .tag(entry.item)
+                        .simultaneousGesture(popToRootOnRetap(entry.item))
                 }
             }
             Section("Sources") {
                 ForEach(app.sources) { source in
                     SourceSidebarRow(source: source)
                         .tag(SidebarItem.source(source.id))
+                        .simultaneousGesture(popToRootOnRetap(.source(source.id)))
                         .contextMenu {
                             Button(source.isEnabled ? "Désactiver" : "Activer") {
                                 app.setEnabled(!source.isEnabled, for: source.id)

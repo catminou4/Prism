@@ -43,18 +43,47 @@ public struct PageEntry: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Pages pushed inside one section's stack, as an observable cell.
+///
+/// One cell per section (like `SourceImportState`): a push/pop writes only that
+/// section's `pages`, so the other mounted `PageStack`s don't re-evaluate.
+@MainActor
+@Observable
+final class SectionPath {
+    var pages: [PageEntry] = []
+}
+
 /// Sidebar selection + one independent page stack per section (each keeps its scroll position).
 @MainActor
 @Observable
 public final class NavigationModel {
     public private(set) var selection: SidebarItem = .home
-    public private(set) var stacks: [SidebarItem: [PageEntry]] = [:]
+    /// One cell per section that ever pushed a page; membership changes are rare.
+    private var paths: [SidebarItem: SectionPath] = [:]
+    /// Quand la section affichée a changé pour la dernière fois. `List(selection:)`
+    /// ne re-notifie pas toujours la valeur identique : un clic sur la ligne déjà
+    /// active doit déclencher `popToRoot`, sans confondre avec la bascule qui
+    /// vient d'avoir lieu (le geste et la sélection arrivent quasi ensemble).
+    public private(set) var lastSelectionChange = Date.distantPast
 
     public init(selection: SidebarItem = .home) {
         self.selection = selection
     }
 
-    public var path: [PageEntry] { stacks[selection] ?? [] }
+    /// Pushed pages of `section` (empty at its root). Reading this subscribes only
+    /// to that section's cell — pushes in other sections don't re-evaluate the page.
+    public func pages(in section: SidebarItem) -> [PageEntry] {
+        paths[section]?.pages ?? []
+    }
+
+    private func pathState(for section: SidebarItem) -> SectionPath {
+        if let state = paths[section] { return state }
+        let state = SectionPath()
+        paths[section] = state
+        return state
+    }
+
+    public var path: [PageEntry] { pages(in: selection) }
     public var canGoBack: Bool { !path.isEmpty }
 
     /// Selecting the current section again pops it to its root (Apple TV behaviour).
@@ -62,48 +91,50 @@ public final class NavigationModel {
         if item == selection {
             popToRoot()
         } else {
-            selection = item
+            setSelection(item)
         }
+    }
+
+    private func setSelection(_ item: SidebarItem) {
+        guard item != selection else { return }
+        selection = item
+        lastSelectionChange = .now
     }
 
     public func push(_ route: Route) {
         if path.last?.route == route { return }
         withAnimation(PrismMotion.standard) {
-            stacks[selection, default: []].append(PageEntry(route))
+            pathState(for: selection).pages.append(PageEntry(route))
         }
     }
 
     public func pop() {
         guard canGoBack else { return }
         withAnimation(PrismMotion.standard) {
-            _ = stacks[selection]?.popLast()
+            _ = pathState(for: selection).pages.popLast()
         }
     }
 
     public func popToRoot() {
         guard canGoBack else { return }
         withAnimation(PrismMotion.standard) {
-            stacks[selection] = []
+            pathState(for: selection).pages = []
         }
     }
 
     /// Switches section and pushes a route (e.g. a search result opening a title).
     public func open(_ route: Route, in item: SidebarItem? = nil) {
-        if let item, item != selection { selection = item }
+        if let item { setSelection(item) }
         push(route)
     }
 
     /// Drops pages that reference a removed source.
     public func removeRoutes(for source: SourceID) {
-        for key in stacks.keys {
-            stacks[key]?.removeAll { $0.route == .source(source) }
+        for state in paths.values {
+            state.pages.removeAll { $0.route == .source(source) }
         }
-        if selection == .source(source) { selection = .home }
+        if selection == .source(source) { setSelection(.home) }
     }
 }
 
-extension EnvironmentValues {
-    /// `false` for pages hidden below the top of a page stack or in an unselected section:
-    /// use it to pause timers (hero carousel), video previews and polling.
-    @Entry public var isPageActive: Bool = true
-}
+// `isPageActive` lives in PrismDesign (EnvironmentValues) so cards can read it.

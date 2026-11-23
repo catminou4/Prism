@@ -56,12 +56,20 @@ public final class AppModel {
     public private(set) var recommendations = Recommendations.empty
     public private(set) var homeAudioLanguages = HomeAudioLanguage.defaults
     public private(set) var sportsSettingsRevision = 0
-    /// In-flight imports/refreshes, by source.
-    public private(set) var imports: [SourceID: ImportProgress] = [:]
+    /// In-flight imports/refreshes, by source: one observable cell per source.
+    /// The dictionary only changes when a cell is created (kept for the session),
+    /// so "is importing" readers are not invalidated by the ~8/s progress ticks —
+    /// only views reading `importProgress(for:)` subscribe to a source's stream.
+    private var importStates: [SourceID: SourceImportState] = [:]
     /// Last refresh error per source (French, user-facing).
     public private(set) var errors: [SourceID: String] = [:]
     public private(set) var accounts: [SourceID: XtreamAccount] = [:]
+    /// `true` while at least one EPG refresh runs (was a plain flag that flipped
+    /// back early when a second refresh overlapped).
     public private(set) var isRefreshingGuide = false
+    /// Grouped-item counts per source, computed once per catalogue publish
+    /// (`countsBySource`) — replaces the per-page O(catalogue) `Catalog.counts(for:)`.
+    public private(set) var sourceCounts: [SourceID: ImportCounts] = [:]
     public private(set) var isMetadataEnabled = false
     /// Signals behind the curated shelves; rebuilt in the background after each catalogue.
     @ObservationIgnored public private(set) var curationIndex = CurationIndex.empty
@@ -91,7 +99,20 @@ public final class AppModel {
     @ObservationIgnored private var rebuildGeneration = 0
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceCountsTask: Task<Void, Never>?
+    /// `catalogRevision` that produced the current `sourceCounts`, `nil` while stale.
+    @ObservationIgnored private var sourceCountsRevision: Int?
     @ObservationIgnored private var didBootstrap = false
+    /// Guide refreshes in flight, one per source: concurrent requests for the same
+    /// source share the task instead of downloading the XMLTV twice.
+    @ObservationIgnored private var guideTasks: [SourceID: Task<Int, Never>] = [:]
+    /// Number of EPG refreshes running (drives `isRefreshingGuide`).
+    @ObservationIgnored private var activeGuideRefreshes = 0
+    /// Bounded import concurrency: catalogue refreshes fetch + decode whole playlists,
+    /// so `refreshAll`/bootstrap/import must not fan out unboundedly.
+    @ObservationIgnored private var importSlots = 0
+    @ObservationIgnored private var importSlotWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    private static let maxConcurrentImports = 3
 
     private enum Keys {
         static let hideAdult = "prism.hideAdultContent"
@@ -149,11 +170,23 @@ public final class AppModel {
 
     // MARK: Lookups
 
+    /// Sources currently importing, with their latest progress — same shape as the
+    /// former `imports` dictionary, kept for tests/tools. Views should prefer
+    /// `isImporting(_:)` / `importProgress(for:)`: reading this computed property
+    /// subscribes to every source's progress stream.
+    public var imports: [SourceID: ImportProgress] {
+        importStates.compactMapValues(\.progress)
+    }
+
     public func source(_ id: SourceID) -> Source? { sources.first { $0.id == id } }
     public func password(for id: SourceID) -> String? { credentials.password(for: id) }
     public func account(for id: SourceID) -> XtreamAccount? { accounts[id] }
-    public func isImporting(_ id: SourceID) -> Bool { imports[id] != nil }
-    public var isImportingAnything: Bool { !imports.isEmpty }
+    public func isImporting(_ id: SourceID) -> Bool { importStates[id]?.isActive == true }
+    /// Throttled progress of one source's import (the detail page's `ProgressView`).
+    /// Subscribes only to that source's cell: other sources' ticks don't re-evaluate
+    /// the reader. `nil` once the import ends (`progress` is cleared with `isActive`).
+    public func importProgress(for id: SourceID) -> ImportProgress? { importStates[id]?.progress }
+    public var isImportingAnything: Bool { importStates.values.contains { $0.isActive } }
     public var hasCompletedOnboarding: Bool { UserDefaults.standard.bool(forKey: Keys.onboardingDone) }
 
     /// Provider categories come from the full source, including categories filtered from the library.
@@ -278,17 +311,28 @@ public final class AppModel {
         didBootstrap = true
         sources = sourceStore.load()
         isMetadataEnabled = await metadataRepository.isEnabled
+        // Le decode des caches démarre dès que `sources` est connu : il ne dépend ni de
+        // `library.json` ni des métadonnées, et chaque ms compte avant `.ready`.
+        async let cached = catalogRepository.cachedCatalogs(for: sources)
+        // `library.json` is decoded off the main actor since `init`: await it on every
+        // path (onboarding included) so no caller can mutate the store while the disk
+        // snapshot is still in flight — a pre-load mutation would otherwise discard it.
+        await library.awaitDiskLoad()
         guard !sources.isEmpty else {
             phase = .onboarding
             return
         }
-        let cached = await catalogRepository.cachedCatalogs(for: sources)
-        for catalog in cached {
+        for catalog in await cached {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
         }
+        // The library decode was already awaited above; `rebuildCatalog` → `publish` →
+        // `reconcileTitles` therefore sees the real collections, not empty ones.
         await rebuildCatalog()
         phase = .ready
+        // Le guide n'est pas nécessaire à `.ready` : le démarrer ici l'empêche de
+        // disputer les cœurs avec le decode catalogue pendant la fenêtre critique
+        // (~250 ms mesurées), au prix d'un guide disponible ~1 s plus tard.
         guide = await epgRepository.cachedGuide(for: sources)
 
         let now = Date.now
@@ -325,21 +369,21 @@ public final class AppModel {
         let stream = AsyncThrowingStream<ImportProgress, any Error>(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task { @MainActor in
                 do {
-                    guard self.imports[source.id] == nil else { throw SourceImportBusy() }
+                    guard !self.isImporting(source.id) else { throw SourceImportBusy() }
                     try Task.checkCancellation()
                     if let password {
                         try self.credentials.setPassword(password, for: source.id)
                     }
                     if isNew { self.pendingSources.insert(source.id) }
                     self.upsert(source)
-                    try await self.performImport(source.id) { continuation.yield($0) }
+                    try await self.performImport(source.id, waitForSearch: true) { continuation.yield($0) }
                     continuation.finish()
                 } catch {
-                    if isNew, self.sourceCatalogs[source.id] == nil, self.imports[source.id] == nil,
+                    if isNew, self.sourceCatalogs[source.id] == nil, !self.isImporting(source.id),
                        self.source(source.id) != nil {
                         self.remove(source.id)
                     } else if !isNew, !(error is CancellationError), !(error is SourceImportBusy) {
-                        self.errors[source.id] = error.localizedDescription
+                        self.errors[source.id] = UserFacingError.message(for: error)
                     }
                     continuation.finish(throwing: error)
                 }
@@ -354,14 +398,17 @@ public final class AppModel {
         importSource(DemoContent.makeSource(), password: nil)
     }
 
-    /// Refreshes one source in the background (progress visible through `imports`).
+    /// Refreshes one source in the background (progress visible through `importProgress(for:)`).
     public func refresh(_ id: SourceID) async {
-        guard imports[id] == nil else { return }
+        guard !isImporting(id) else { return }
         do {
             try await performImport(id) { _ in }
         } catch is CancellationError {
+        } catch is SourceImportBusy {
+            // Another import grabbed the slot first: silent no-op, like the
+            // early `isImporting` guard above.
         } catch {
-            errors[id] = error.localizedDescription
+            errors[id] = UserFacingError.message(for: error)
         }
     }
 
@@ -376,12 +423,12 @@ public final class AppModel {
     /// Updates a source's settings. Connection changes trigger a refresh.
     @discardableResult
     public func update(_ source: Source, password: String? = nil) -> Bool {
-        guard imports[source.id] == nil else { return false }
+        guard !isImporting(source.id) else { return false }
         if let password {
             do {
                 try credentials.setPassword(password, for: source.id)
             } catch {
-                errors[source.id] = error.localizedDescription
+                errors[source.id] = UserFacingError.message(for: error)
                 return false
             }
         }
@@ -420,7 +467,7 @@ public final class AppModel {
     }
 
     public func remove(_ id: SourceID) {
-        guard imports[id] == nil else { return }
+        guard !isImporting(id) else { return }
         pendingSources.remove(id)
         sources.removeAll { $0.id == id }
         if hiddenCategoriesBySource.removeValue(forKey: id.rawValue) != nil { persistHiddenCategories() }
@@ -429,11 +476,14 @@ public final class AppModel {
         sourceCatalogs[id] = nil
         accounts[id] = nil
         errors[id] = nil
-        imports[id] = nil
+        importStates[id] = nil
         if sources.isEmpty, phase == .ready { restartOnboarding() }
         Task {
-            await catalogRepository.forget(id)
-            await epgRepository.forget(id)
+            // Purges disque sur deux actors distincts : elles se chevauchent.
+            async let catalogForgotten = catalogRepository.forget(id)
+            async let guideForgotten = epgRepository.forget(id)
+            await catalogForgotten
+            await guideForgotten
             guide = await epgRepository.currentGuide(for: sources)
             await rebuild()
         }
@@ -443,8 +493,9 @@ public final class AppModel {
         sources.move(fromOffsets: offsets, toOffset: destination)
         persistSources()
         Task {
-            guide = await epgRepository.currentGuide(for: sources)
+            async let updatedGuide = epgRepository.currentGuide(for: sources)
             await rebuild()
+            guide = await updatedGuide
         }
     }
 
@@ -481,21 +532,45 @@ public final class AppModel {
                 staleSources.append(source.id)
             }
         }
-        for id in staleSources { await refreshGuide(for: id) }
+        // Le téléchargement XMLTV domine : les chevaucher par paquets de
+        // `maxConcurrentImports` (comme les imports) au lieu de les sérialiser —
+        // le bootstrap n'attend plus la somme des guides mais ~le plus lent.
+        // `refreshGuide(for:)` déduplique déjà les sources et `currentGuide`
+        // republie une fusion valide à chaque fin, quel que soit l'ordre.
+        for start in stride(from: 0, to: staleSources.count, by: Self.maxConcurrentImports) {
+            let chunk = staleSources[start..<min(start + Self.maxConcurrentImports, staleSources.count)]
+            await withTaskGroup(of: Void.self) { group in
+                for id in chunk {
+                    group.addTask { _ = await self.refreshGuide(for: id) }
+                }
+            }
+        }
     }
 
     @discardableResult
     public func refreshGuide(for id: SourceID) async -> Int {
         guard let source = source(id), source.isEnabled else { return 0 }
-        isRefreshingGuide = true
-        defer { isRefreshingGuide = false }
-        do {
-            let sourceGuide = try await epgRepository.refresh(source, playlistEPGURLs: catalogRepository.playlistEPGURLs(for: id))
-            guide = await epgRepository.currentGuide(for: sources)
-            return sourceGuide.programCount
-        } catch {
-            return 0
+        // Une seule requête EPG par source à la fois : les appels concurrents
+        // (bouton « Actualiser », fin d'import, bootstrap) partagent la tâche.
+        if let task = guideTasks[id] { return await task.value }
+        let task = Task { @MainActor in
+            defer {
+                guideTasks[id] = nil
+                activeGuideRefreshes -= 1
+                isRefreshingGuide = activeGuideRefreshes > 0
+            }
+            do {
+                let sourceGuide = try await epgRepository.refresh(source, playlistEPGURLs: catalogRepository.playlistEPGURLs(for: id))
+                guide = await epgRepository.currentGuide(for: sources)
+                return sourceGuide.programCount
+            } catch {
+                return 0
+            }
         }
+        guideTasks[id] = task
+        activeGuideRefreshes += 1
+        isRefreshingGuide = true
+        return await task.value
     }
 
     // MARK: Private
@@ -519,13 +594,46 @@ public final class AppModel {
         UserDefaults.standard.set(hiddenCategoriesBySource, forKey: Keys.hiddenCategories)
     }
 
-    private func performImport(_ id: SourceID, report: (ImportProgress) -> Void) async throws {
+    private func performImport(_ id: SourceID, waitForSearch: Bool = false, report: (ImportProgress) -> Void) async throws {
+        guard source(id) != nil else { return }
+        // Au plus `maxConcurrentImports` imports lourds (fetch + décodage) en
+        // parallèle, que ce soit via `refreshAll`, le bootstrap ou l'onboarding.
+        try await withImportSlot {
+            // Une source supprimée ou déjà importée pendant l'attente du slot
+            // ne doit pas repartir : `isActive` n'est posé qu'une fois le slot acquis.
+            guard !isImporting(id) else { throw SourceImportBusy() }
+            try await performImportHeld(id, waitForSearch: waitForSearch, report: report)
+        }
+    }
+
+    /// The observable cell tracking `id`'s import, created on first use and kept
+    /// afterwards so progress observers stay attached to the same instance.
+    private func importState(for id: SourceID) -> SourceImportState {
+        if let state = importStates[id] { return state }
+        let state = SourceImportState()
+        importStates[id] = state
+        return state
+    }
+
+    private func performImportHeld(_ id: SourceID, waitForSearch: Bool, report: (ImportProgress) -> Void) async throws {
+        try Task.checkCancellation()
         guard let source = source(id) else { return }
         errors[id] = nil
-        imports[id] = ImportProgress(stage: .connecting, fraction: 0)
-        defer { imports[id] = nil }
+        let state = importState(for: id)
+        state.isActive = true
+        state.progress = ImportProgress(stage: .connecting, fraction: 0)
+        defer {
+            state.isActive = false
+            state.progress = nil
+        }
 
         var finished: ImportProgress?
+        // `state.progress` n'est lu que par la fiche de la source : chaque écriture
+        // ne réévalue plus les badges latéraux ni les autres fiches. On n'écrit
+        // qu'au changement de pourcent ou au plus ~8×/s. Le flux `report` (fiche
+        // d'import) continue de recevoir chaque étape.
+        var lastProgressWrite = Date.distantPast
+        var lastProgressPercent = -1
         for try await progress in catalogRepository.refresh(source) {
             try Task.checkCancellation()
             if progress.stage == .finished {
@@ -533,7 +641,13 @@ public final class AppModel {
             } else {
                 var playlistProgress = progress
                 playlistProgress.fraction *= 0.91
-                imports[id] = playlistProgress
+                let percent = Int((playlistProgress.fraction * 100).rounded())
+                let now = Date.now
+                if percent != lastProgressPercent || now.timeIntervalSince(lastProgressWrite) >= 0.12 {
+                    state.progress = playlistProgress
+                    lastProgressPercent = percent
+                    lastProgressWrite = now
+                }
                 report(playlistProgress)
             }
         }
@@ -552,13 +666,15 @@ public final class AppModel {
 
         var counts = finished.counts
         let guideStart = ImportProgress(stage: .guide(0), counts: counts, fraction: 0.92)
-        imports[id] = guideStart
+        state.progress = guideStart
         report(guideStart)
         counts.programs = await refreshGuide(for: id)
         let guideDone = ImportProgress(stage: .guide(counts.programs), counts: counts, fraction: 0.98)
-        imports[id] = guideDone
+        state.progress = guideDone
         report(guideDone)
-        await waitForCurrentCatalog(includingSearch: true)
+        // Explicit adds finish with the current catalogue searchable. Background refreshes
+        // can leave the indexes building after publishing the updated catalogue.
+        await waitForCurrentCatalog(includingSearch: waitForSearch)
         try Task.checkCancellation()
         report(ImportProgress(stage: .finished, counts: counts, fraction: 1, catalog: catalog, epgURLs: finished.epgURLs))
     }
@@ -570,6 +686,11 @@ public final class AppModel {
 
     /// Publish the merged catalog as soon as browsing is possible. Search indexes that snapshot separately.
     private func rebuildCatalog(includingSearch: Bool = false) async {
+        // Every publish path funnels here (bootstrap, imports, removals, onboarding
+        // restart, preference rebuilds): make sure the async `library.json` decode
+        // landed first so `reconcileTitles` and any early mutation see real state.
+        // Idempotent — instant once the load task has completed.
+        await library.awaitDiskLoad()
         rebuildGeneration &+= 1
         catalogTask?.cancel()
         searchTask?.cancel()
@@ -611,6 +732,42 @@ public final class AppModel {
         }
         searchTask?.cancel()
         searchTask = nil
+        // Comptages par source pour les fiches Sources : un seul passage sur le
+        // catalogue, mais seulement quand une fiche de source est ouverte
+        // (`prepareSourceCounts`) — plus de scan à chaque publication pour un
+        // écran que l'utilisateur ne visite pas toujours.
+        sourceCountsTask?.cancel()
+        sourceCountsTask = nil
+        sourceCountsRevision = nil
+    }
+
+    /// One pass over the catalogue: how many grouped items offer a variant per
+    /// source (same semantics as `Catalog.counts(for:)`, for every source at once).
+    @concurrent private static func countsBySource(in catalog: Catalog) async -> [SourceID: ImportCounts] {
+        var channels: [SourceID: Int] = [:]
+        var movies: [SourceID: Int] = [:]
+        var series: [SourceID: Int] = [:]
+        for group in catalog.channels {
+            for source in Set(group.variants.map(\.sourceID)) {
+                channels[source, default: 0] += 1
+            }
+        }
+        for title in catalog.movies {
+            for source in Set(title.variants.map(\.sourceID)) {
+                movies[source, default: 0] += 1
+            }
+        }
+        for title in catalog.series {
+            for source in Set(title.variants.map(\.sourceID)) {
+                series[source, default: 0] += 1
+            }
+        }
+        var result: [SourceID: ImportCounts] = [:]
+        for id in Set(channels.keys).union(movies.keys).union(series.keys) {
+            result[id] = ImportCounts(channels: channels[id] ?? 0, movies: movies[id] ?? 0,
+                                      series: series[id] ?? 0)
+        }
+        return result
     }
 
     /// Warm the index when Search opens or when a caller explicitly awaits a searchable catalogue.
@@ -624,6 +781,60 @@ public final class AppModel {
             guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
             self.searchIndex = index
             self.searchTask = nil
+        }
+    }
+
+    /// Warm the per-source grouped counts when a source page opens — their only
+    /// reader (`SourceDetailView`). One background pass per catalog publish;
+    /// `sourceCounts` keeps the previous snapshot until the new one lands.
+    func prepareSourceCounts() {
+        guard sourceCountsTask == nil, sourceCountsRevision != catalogRevision else { return }
+        let catalog = self.catalog
+        let revision = catalogRevision
+        sourceCountsTask = Task(priority: .utility) { [weak self] in
+            let counts = await Self.countsBySource(in: catalog)
+            guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
+            self.sourceCounts = counts
+            self.sourceCountsRevision = revision
+            self.sourceCountsTask = nil
+        }
+    }
+
+    /// Runs `body` holding one of `maxConcurrentImports` slots; extra callers wait
+    /// FIFO. Cancellation while waiting resumes with `false` so no waiter is stuck.
+    private func withImportSlot<T>(_ body: () async throws -> T) async throws -> T {
+        guard await acquireImportSlot() else { throw CancellationError() }
+        defer { releaseImportSlot() }
+        return try await body()
+    }
+
+    private func acquireImportSlot() async -> Bool {
+        if importSlots < Self.maxConcurrentImports {
+            importSlots += 1
+            return true
+        }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                importSlotWaiters.append((id, continuation))
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let index = self.importSlotWaiters.firstIndex(where: { $0.id == id })
+                else { return }
+                self.importSlotWaiters.remove(at: index).continuation.resume(returning: false)
+            }
+        }
+    }
+
+    private func releaseImportSlot() {
+        // The slot transfers straight to the next waiter instead of being freed.
+        if let next = importSlotWaiters.first {
+            importSlotWaiters.removeFirst()
+            next.continuation.resume(returning: true)
+        } else {
+            importSlots -= 1
         }
     }
 
@@ -642,6 +853,42 @@ public final class AppModel {
     }
 }
 
+/// Live import state of one source, held by `AppModel.importStates`.
+///
+/// Splitting progress out of a shared dictionary is what narrows observation:
+/// `isActive` flips only when an import starts or ends, while `progress` ticks
+/// (~8/s) invalidate just the views that read it — the source's own detail page.
+@MainActor
+@Observable
+final class SourceImportState {
+    /// `true` between import start and the deferred cleanup (the `.finished` report included).
+    var isActive = false
+    /// Latest throttled progress while active; cleared together with `isActive`.
+    var progress: ImportProgress?
+}
+
 private struct SourceImportBusy: LocalizedError {
     var errorDescription: String? { "Cette source est déjà en cours d’importation." }
+}
+
+/// French, user-facing error messages for `AppModel.errors` and the source sheet.
+/// `AddSourceView.displayError` delegates here so both surfaces share the same wording
+/// (raw `localizedDescription` can leak English URLError/CocoaError text).
+enum UserFacingError {
+    static func message(for error: any Error) -> String {
+        if error is KeychainError { return error.localizedDescription }
+        if let error = error as? SourceError {
+            if case .network = error {
+                return "Connexion à la source impossible. Vérifiez l’adresse et réessayez."
+            }
+            return error.localizedDescription
+        }
+        if let error = error as? XtreamError {
+            if case .network = error {
+                return "Connexion au serveur impossible. Vérifiez l’adresse et réessayez."
+            }
+            return error.localizedDescription
+        }
+        return "L’importation a échoué. Vérifiez les informations de la source et réessayez."
+    }
 }

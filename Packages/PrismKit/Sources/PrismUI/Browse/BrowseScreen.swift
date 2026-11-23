@@ -53,7 +53,6 @@ struct BrowseScreen: View {
                     if let kind { providerShelves(kind) }
                 }
                 .padding(.bottom, 48)
-                .environment(\.prismScrollActivity, motion.scrollActivity)
                 // A new composition (first load, languages, a day later) cross-fades row by row
                 // instead of popping.
                 .animation(reduceMotion ? nil : PrismMotion.entrance, value: feed.shelves.map(\.id))
@@ -64,11 +63,7 @@ struct BrowseScreen: View {
             } action: { _, atTop in
                 motion.isAtTop = atTop
             }
-            .onScrollPhaseChange { _, phase in
-                if motion.scrollActivity.isScrolling != phase.isScrolling {
-                    motion.scrollActivity.isScrolling = phase.isScrolling
-                }
-            }
+            .prismScrollPhase { motion.isScrolling = $0 }
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
                 BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
@@ -144,7 +139,7 @@ private struct HomeLibraryShelves: View {
 }
 
 @Observable private final class BrowseScrollActivity {
-    let scrollActivity = ScrollActivity()
+    var isScrolling = false
     var isAtTop = true
     var heroIndex = 0
 }
@@ -189,11 +184,11 @@ private struct BrowseHero: View {
     let motion: BrowseScrollActivity
 
     var body: some View {
-        let canAnimate = isActive && isVisible && !motion.scrollActivity.isScrolling
+        let canAnimate = isActive && isVisible && !motion.isScrolling
         let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
             items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
-            height: height, index: $selected, isInteractive: isActive
+            height: height, index: $selected, isInteractive: isActive, extendsUnderSidebar: true
         ) { highlight in
             HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
         }
@@ -437,7 +432,10 @@ private struct HighlightPage: View {
                 }
                 HStack(spacing: PrismMetrics.heroButtonSpacing) {
                     if let quickPlay {
-                        let progress = app.library.latestProgress(forTitle: title.id)
+                        // `latestProgress` lit `library.progress` : on ne s'y
+                        // abonne que quand la page est réellement visible, sinon
+                        // chaque tick de lecture réévaluerait le héros caché.
+                        let progress = isActive ? app.library.latestProgress(forTitle: title.id) : nil
                         let resumable = progress.map { !$0.isFinished && $0.position >= 5 } ?? false
                         PrimaryCapsuleButton(
                             resumable ? "Reprendre" : "Lecture", systemImage: "play.fill",

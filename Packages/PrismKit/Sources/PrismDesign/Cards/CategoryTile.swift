@@ -16,6 +16,7 @@ public struct CategoryTile: View {
     private let imageURL: URL?
     private let seed: String
     private let tint: Color?
+    private let fallbackTint: Color
     private let aspect: Aspect
     private let width: CGFloat?
     private let action: (() -> Void)?
@@ -27,6 +28,7 @@ public struct CategoryTile: View {
         self.imageURL = imageURL
         self.seed = seed ?? title
         self.tint = tint
+        fallbackTint = tint ?? PrismTint.forSeed(seed ?? title).color
         self.aspect = aspect
         self.width = width
         self.action = action
@@ -35,8 +37,8 @@ public struct CategoryTile: View {
     public var body: some View {
         let w = width ?? shelfWidth ?? PrismMetrics.categoryTileWidth
         let size = CGSize(width: w, height: (w / aspect.ratio).rounded())
-        let wash = tint ?? sampledTint ?? PrismTint.forSeed(seed).color
-        CardContainer(accessibilityLabel: Text(title), action: action, menu: EmptyView()) { _ in
+        let wash = tint ?? sampledTint ?? fallbackTint
+        CardContainer(accessibilityLabel: Text(title), action: action, menu: { EmptyView() }) { _ in
             ArtworkSurface(radius: PrismMetrics.tileRadius) {
                 ZStack(alignment: .bottomLeading) {
                     if imageURL != nil {
@@ -46,9 +48,8 @@ public struct CategoryTile: View {
                             startPoint: .top, endPoint: .bottom
                         )
                     } else {
-                        let base = tint ?? PrismTint.forSeed(seed).color
                         LinearGradient(
-                            colors: [base, base.mix(with: Color(red: 0.45, green: 0.2, blue: 0.9), by: 0.6), Color(red: 0.72, green: 0.04, blue: 0.38)],
+                            colors: [fallbackTint, fallbackTint.mix(with: Color(red: 0.45, green: 0.2, blue: 0.9), by: 0.6), Color(red: 0.72, green: 0.04, blue: 0.38)],
                             startPoint: .top, endPoint: .bottom
                         )
                     }

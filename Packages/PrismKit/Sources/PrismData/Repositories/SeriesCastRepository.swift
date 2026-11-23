@@ -20,6 +20,13 @@ public actor SeriesCastRepository {
     private let client: HTTPClient
     private let host: String
     private var cache: [Lookup: Cached] = [:]
+    /// Concurrent lookups of the same (title, year) share one request pair.
+    private var inFlight: [Lookup: CastRequest] = [:]
+
+    private struct CastRequest {
+        let id = UUID()
+        let task: Task<SeriesCast?, Never>
+    }
 
     public init(session: URLSession = PrismURLSession.shared) {
         self.init(session: session, host: "api.tvmaze.com")
@@ -39,8 +46,21 @@ public actor SeriesCastRepository {
         guard !lookup.name.isEmpty else { return nil }
         if let hit = cache[lookup], hit.expiresAt > .now { return hit.cast }
 
+        let request: CastRequest
+        if let pending = inFlight[lookup] {
+            request = pending
+        } else {
+            request = CastRequest(task: Task { await self.fetchAndStore(title: name, lookup: lookup) })
+            inFlight[lookup] = request
+        }
+        let cast = await request.task.value
+        if inFlight[lookup]?.id == request.id { inFlight[lookup] = nil }
+        return cast
+    }
+
+    private func fetchAndStore(title: String, lookup: Lookup) async -> SeriesCast? {
         do {
-            let cast = try await fetch(title: name, lookup: lookup)
+            let cast = try await fetch(title: title, lookup: lookup)
             guard !Task.isCancelled else { return nil }
             if cache.count >= 128 {
                 cache = cache.filter { $0.value.expiresAt > .now }

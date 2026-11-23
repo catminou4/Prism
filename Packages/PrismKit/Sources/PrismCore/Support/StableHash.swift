@@ -16,7 +16,11 @@ public enum StableHash {
     /// FNV-1a 64 rendered as 16 lowercase hex characters.
     public static func hex(_ string: String) -> String {
         let value = fnv1a64(string)
-        let digits = String(value, radix: 16)
-        return digits.count >= 16 ? digits : String(repeating: "0", count: 16 - digits.count) + digits
+        var bytes = [UInt8](repeating: 0x30, count: 16) // '0'
+        for i in 0..<16 {
+            let nibble = Int((value >> UInt64((15 - i) * 4)) & 0xF)
+            bytes[i] = nibble < 10 ? UInt8(0x30 + nibble) : UInt8(0x57 + nibble) // 'a' + nibble - 10
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }

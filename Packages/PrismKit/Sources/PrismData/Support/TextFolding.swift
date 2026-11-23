@@ -28,14 +28,15 @@ enum TextFolding {
         "’": "'", "‘": "'", "ʼ": "'", "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-", "…": "...",
     ]
 
-    /// Splits folded text into words (ASCII alphanumerics and any non-ASCII byte are word characters).
+    /// Splits folded text into words: letters, combining marks and numbers in any script are
+    /// word characters; punctuation and symbols (guillemets, CJK punctuation, emoji) are not.
     static func words(ofFolded folded: String) -> [[UInt8]] {
         var result: [[UInt8]] = []
         var current: [UInt8] = []
         current.reserveCapacity(16)
-        for byte in folded.utf8 {
-            if isWordByte(byte) {
-                current.append(byte)
+        for scalar in folded.unicodeScalars {
+            if isWordScalar(scalar) {
+                current.append(contentsOf: scalar.utf8)
             } else if !current.isEmpty {
                 result.append(current)
                 current.removeAll(keepingCapacity: true)
@@ -47,20 +48,47 @@ enum TextFolding {
 
     /// Visits normalized words using a caller-owned buffer. ASCII names are split and lowercased
     /// together, without allocating a folded String or an array of words for each name.
+    /// Non-ASCII names go through scalar classification so punctuation never glues to words.
     static func forEachWord(in text: String, buffer: inout [UInt8], _ visit: ([UInt8]) -> Void) {
         let bytes = text.utf8
-        let content = bytes.allSatisfy { $0 < 0x80 } ? bytes : fold(text).utf8
-        for byte in content {
-            if isWordByte(byte) {
-                buffer.append((0x41...0x5A).contains(byte) ? byte &+ 0x20 : byte)
-            } else if !buffer.isEmpty {
-                visit(buffer)
-                buffer.removeAll(keepingCapacity: true)
+        if bytes.allSatisfy({ $0 < 0x80 }) {
+            for byte in bytes {
+                if isWordByte(byte) {
+                    buffer.append((0x41...0x5A).contains(byte) ? byte &+ 0x20 : byte)
+                } else if !buffer.isEmpty {
+                    visit(buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                }
+            }
+        } else {
+            // `fold` already lowercases; only word scalars are appended, as UTF-8.
+            for scalar in fold(text).unicodeScalars {
+                if isWordScalar(scalar) {
+                    buffer.append(contentsOf: scalar.utf8)
+                } else if !buffer.isEmpty {
+                    visit(buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                }
             }
         }
         if !buffer.isEmpty {
             visit(buffer)
             buffer.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// Letters (all cases), combining marks and numbers count as word characters; punctuation,
+    /// symbols and separators do not. UTF-8 bytes alone cannot tell them apart, so non-ASCII
+    /// text is classified one scalar at a time.
+    @inline(__always)
+    static func isWordScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+             .nonspacingMark, .spacingMark, .enclosingMark,
+             .decimalNumber, .letterNumber, .otherNumber:
+            return true
+        default:
+            return false
         }
     }
 

@@ -58,11 +58,14 @@ nonisolated struct PlaybackEdition: Hashable, Sendable {
 
         let declared = Set(tags.compactMap { Self.languageCodes[$0] })
         let codes = (declared.isEmpty ? categoryLanguages : declared).sorted()
-        let locale = Locale(identifier: "fr-FR")
+        let locale = Self.displayLocale
         let names = codes.compactMap { locale.localizedString(forLanguageCode: $0) }
         key = codes.isEmpty ? "unknown" : codes.joined(separator: "+").uppercased()
         title = names.isEmpty ? "Langue non renseignée" : names.joined(separator: " / ").capitalized(with: locale)
     }
+
+    /// Editions are rebuilt on every detail-page evaluation; the locale is immutable and shared.
+    private static let displayLocale = Locale(identifier: "fr-FR")
 
     // Language labels describe stream tags. Country tags such as US, CA or BE
     // alone do not establish which audio tracks the player will find.

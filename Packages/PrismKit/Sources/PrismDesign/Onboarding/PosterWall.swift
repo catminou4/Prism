@@ -30,9 +30,11 @@ nonisolated extension Array where Element == PosterWallTile {
 ///
 /// A single `TimelineView` offset moves a static, rasterised grid (`drawingGroup`) along its
 /// columns; the grid re-renders only when a whole row has scrolled by, so the animation is
-/// a pure transform (120 Hz friendly). Pauses under Reduce Motion.
+/// a pure transform (120 Hz friendly). Pauses under Reduce Motion, while the window is
+/// occluded or the app inactive — the drift clock freezes in place, so resuming never jumps
+/// and never pays a re-raster while hidden.
 public struct PosterWall: View {
-    private let tiles: [PosterWallTile]
+    private let tileStorage: PosterWallTileStorage
     private let tileWidth: CGFloat
     private let spacing: CGFloat
     private let angle: Angle
@@ -40,9 +42,11 @@ public struct PosterWall: View {
     private let vignette: Double
     private let isAnimating: Bool
     private let startTime: Double
+    @Environment(\.appearsActive) private var appearsActive
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var size: CGSize = .zero
-    @State private var epoch = Date()
+    @State private var isWindowVisible = true
+    @State private var clock: DriftClock
 
     /// - Parameters:
     ///   - speed: Drift speed in points per second.
@@ -58,7 +62,8 @@ public struct PosterWall: View {
         isAnimating: Bool = true,
         startTime: Double = 0
     ) {
-        self.tiles = tiles.isEmpty ? .procedural(count: 30) : tiles
+        let resolvedTiles = tiles.isEmpty ? [PosterWallTile].procedural(count: 30) : tiles
+        tileStorage = PosterWallTileStorage(resolvedTiles)
         self.tileWidth = tileWidth
         self.spacing = spacing
         self.angle = angle
@@ -66,46 +71,63 @@ public struct PosterWall: View {
         self.vignette = vignette
         self.isAnimating = isAnimating
         self.startTime = startTime
+        _clock = State(initialValue: DriftClock(travel: CGFloat(startTime) * speed))
     }
 
     private var pitch: CGSize {
         CGSize(width: tileWidth + spacing, height: tileWidth / PrismMetrics.posterAspectRatio + spacing)
     }
 
-    /// Grid dimensions covering the rotated viewport.
+    /// Grid dimensions covering the rotated viewport. Only the width margin is slimmed:
+    /// drift and stagger are vertical, so extra columns were pure raster cost, while the
+    /// row count must keep its headroom or the bottom edge shows during the row shift.
     private var gridSize: (columns: Int, rows: Int) {
         let radians = abs(angle.radians)
         let coverWidth = size.width * cos(radians) + size.height * sin(radians)
         let coverHeight = size.width * sin(radians) + size.height * cos(radians)
-        let columns = Int((coverWidth * 1.25) / pitch.width) + 2
+        let columns = Int((coverWidth * 1.05) / pitch.width) + 2
         let rows = Int((coverHeight * 1.2) / pitch.height) + 3
         return (columns, rows)
     }
 
+    /// True while the wall may drift: animating, in a visible window, app active, no Reduce Motion.
+    private var isPaused: Bool { !isAnimating || reduceMotion || !appearsActive || !isWindowVisible }
+
     public var body: some View {
-        let paused = !isAnimating || reduceMotion
-        TimelineView(.animation(minimumInterval: nil, paused: paused)) { context in
-            let elapsed = startTime + (paused ? 0 : context.date.timeIntervalSince(epoch))
-            let travel = CGFloat(elapsed) * speed
-            let rowShift = Int(floor(travel / pitch.height))
-            let fraction = travel - CGFloat(rowShift) * pitch.height
-            let grid = gridSize
-            PosterWallGrid(
-                tiles: tiles, columns: grid.columns, rows: grid.rows, rowShift: rowShift,
-                tileWidth: tileWidth, spacing: spacing
-            )
-            .equatable()
-            .offset(y: -fraction)
-            .frame(width: size.width, height: size.height)
-            .rotation3DEffect(.degrees(12), axis: (x: 0.2, y: 1, z: 0), perspective: 0.5)
-            .rotationEffect(angle)
+        let paused = isPaused
+        // The drift is slow (a few points per second): 60 Hz is plenty and halves the
+        // per-frame timeline work on ProMotion displays.
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: paused)) { context in
+            driftingWall(at: context.date)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
         .overlay { vignetteOverlay.allowsHitTesting(false) }
         .clipped()
+        .background {
+            WindowOcclusionReader(isVisible: $isWindowVisible)
+        }
         .background(.black)
         .accessibilityHidden(true)
+    }
+
+    /// Grid content for one timeline tick. Kept out of the `TimelineView` builder so the
+    /// clock mutation stays a plain statement instead of a builder expression.
+    private func driftingWall(at date: Date) -> some View {
+        if !isPaused { clock.advance(to: date, speed: speed) }
+        let travel = clock.travel
+        let rowShift = Int(floor(travel / pitch.height))
+        let fraction = travel - CGFloat(rowShift) * pitch.height
+        let grid = gridSize
+        return PosterWallGrid(
+            tileStorage: tileStorage, columns: grid.columns, rows: grid.rows, rowShift: rowShift,
+            tileWidth: tileWidth, spacing: spacing
+        )
+        .equatable()
+        .offset(y: -fraction)
+        .frame(width: size.width, height: size.height)
+        .rotation3DEffect(.degrees(12), axis: (x: 0.2, y: 1, z: 0), perspective: 0.5)
+        .rotationEffect(angle)
     }
 
     private var vignetteOverlay: some View {
@@ -117,9 +139,36 @@ public struct PosterWall: View {
     }
 }
 
+/// Drift accumulator for `PosterWall`. Advancing only while unpaused freezes the wall
+/// exactly in place — pausing costs no re-raster and resuming never jumps; long gaps
+/// (occlusion, hitches) are clamped to one frame so the wall cannot leap forward.
+private final class DriftClock {
+    var travel: CGFloat
+    private var lastDate: Date?
+
+    init(travel: CGFloat) {
+        self.travel = travel
+    }
+
+    func advance(to date: Date, speed: CGFloat) {
+        if let lastDate {
+            let delta = date.timeIntervalSince(lastDate)
+            travel += CGFloat(min(max(delta, 0), 0.1)) * speed
+        }
+        lastDate = date
+    }
+}
+
+/// Reference box for a `PosterWall`'s tile list: the grid struct is rebuilt every timeline
+/// tick and `Equatable` compares it — identity is O(1) where comparing ~60 tiles per frame was not.
+private final class PosterWallTileStorage {
+    let tiles: [PosterWallTile]
+    init(_ tiles: [PosterWallTile]) { self.tiles = tiles }
+}
+
 /// Static grid; equatable so it only re-renders (and re-rasterises) when a row scrolls by.
 private struct PosterWallGrid: View, Equatable {
-    let tiles: [PosterWallTile]
+    let tileStorage: PosterWallTileStorage
     let columns: Int
     let rows: Int
     let rowShift: Int
@@ -127,8 +176,11 @@ private struct PosterWallGrid: View, Equatable {
     let spacing: CGFloat
 
     nonisolated static func == (lhs: PosterWallGrid, rhs: PosterWallGrid) -> Bool {
-        lhs.rowShift == rhs.rowShift && lhs.columns == rhs.columns && lhs.rows == rhs.rows
-            && lhs.tileWidth == rhs.tileWidth && lhs.tiles == rhs.tiles
+        guard lhs.rowShift == rhs.rowShift, lhs.columns == rhs.columns, lhs.rows == rhs.rows,
+              lhs.tileWidth == rhs.tileWidth, lhs.spacing == rhs.spacing else { return false }
+        // Same wall → same storage → O(1). A recreated `PosterWall` gets a fresh storage:
+        // fall back to the value compare so equal tiles still skip the re-raster.
+        return lhs.tileStorage === rhs.tileStorage || lhs.tileStorage.tiles == rhs.tileStorage.tiles
     }
 
     var body: some View {
@@ -152,6 +204,7 @@ private struct PosterWallGrid: View, Equatable {
 
     /// Deterministic tile for an absolute grid position (rows wrap through the tile list).
     private func tile(column: Int, row: Int) -> PosterWallTile {
+        let tiles = tileStorage.tiles
         let count = tiles.count
         let index = ((column * 7 + row * 3) % count + count) % count
         return tiles[index]

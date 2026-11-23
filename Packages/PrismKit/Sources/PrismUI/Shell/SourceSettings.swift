@@ -8,7 +8,9 @@ import PrismPlayer
 struct SourceDetailView: View {
     @Environment(AppModel.self) private var app
     let sourceID: SourceID
-    @State private var counts = ImportCounts()
+    /// Comptages calculés une fois par publication de catalogue dans `AppModel`
+    /// (`countsBySource`) — plus de 3 scans O(catalogue) à chaque visite de page.
+    private var counts: ImportCounts { app.sourceCounts[sourceID] ?? ImportCounts() }
     @State private var editing = false
     @State private var filteringCategories = false
     @State private var removing = false
@@ -39,7 +41,10 @@ struct SourceDetailView: View {
                             if let account = app.account(for: sourceID), let date = account.expiresAt {
                                 LabeledContent("Expiration de l’abonnement") { Text(date, format: .dateTime.day().month(.wide).year()) }
                             }
-                            if let progress = app.imports[sourceID] {
+                            // `importProgress(for:)` ne souscrit qu'à la cellule de
+                            // cette source : les ticks des autres imports ne
+                            // réévaluent pas cette fiche.
+                            if let progress = app.importProgress(for: sourceID) {
                                 ProgressView(value: progress.fraction)
                                     .accessibilityLabel("Actualisation de la source")
                             }
@@ -72,7 +77,11 @@ struct SourceDetailView: View {
                 }
                 .padding(.vertical, 24)
             }
-            .task(id: app.catalogRevision) { counts = await Self.counts(for: sourceID, in: app.catalog) }
+            .prismScrollPhase()
+            // Les comptages par source sont calculés à la demande (une passe
+            // @concurrent sur tout le catalogue) : cette fiche est leur seule
+            // lectrice, on les prépare à l'ouverture et après chaque republication.
+            .task(id: app.catalogRevision) { app.prepareSourceCounts() }
             .sheet(isPresented: $editing) { EditSourceSheet(source: source) }
             .sheet(isPresented: $filteringCategories) {
                 SourceCategorySheet(
@@ -96,11 +105,6 @@ struct SourceDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .accessibilityElement(children: .combine)
-    }
-
-    @concurrent
-    private static func counts(for id: SourceID, in catalog: Catalog) async -> ImportCounts {
-        catalog.counts(for: id)
     }
 }
 

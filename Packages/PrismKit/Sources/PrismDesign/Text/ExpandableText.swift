@@ -24,6 +24,7 @@ public struct ExpandableText: View {
     @State private var isExpanded = false
     @State private var lineHeight: CGFloat = 16
     @State private var pillWidth: CGFloat = 50
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// - Parameters:
     ///   - text: Full description.
@@ -74,7 +75,11 @@ public struct ExpandableText: View {
             }
             .background(alignment: .topLeading) { truncationProbe }
             .background(alignment: .topLeading) { lineProbe }
-            .animation(PrismMotion.standard, value: isExpanded)
+            // Only inline expansion re-lays the text out; popover mode has nothing to animate.
+            .animation(
+                expansion == .inline ? PrismMotion.respecting(reduceMotion, PrismMotion.standard) : nil,
+                value: isExpanded
+            )
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(plainText))
             .accessibilityAction(named: Text("Afficher plus")) { isExpanded = true }

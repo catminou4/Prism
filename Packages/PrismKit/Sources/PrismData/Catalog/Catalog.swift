@@ -32,6 +32,10 @@ public struct Catalog: Sendable {
         var categories: [String: PrismCore.Category] = [:]
         var hasTaggedEditions = false
         var categoryLanguages: [String: Set<String>] = [:]
+        /// Declared language labels per variant content id, resolved once at build time:
+        /// audio lookups sit on hot curation paths and would otherwise interpolate category
+        /// prefixes on every call.
+        var providerLanguages: [ContentID: Set<String>] = [:]
         /// Category group id → (kind, index in the kind's category array).
         var categoryGroups: [String: GroupRef] = [:]
         /// Raw category id → category group id.
@@ -88,7 +92,10 @@ public struct Catalog: Sendable {
     }
 
     /// Declared language labels from this edition's provider category (ISO 639-1).
+    /// Catalog variants resolve through the build-time cache; foreign variants fall back to
+    /// the same category computation as before.
     public func providerLanguages(for variant: MediaVariant) -> Set<String> {
+        if let cached = indexes.providerLanguages[variant.id] { return cached }
         guard !indexes.categoryLanguages.isEmpty else { return [] }
         let category: (id: String?, kind: MediaKind) = switch variant {
         case .movie(let movie): (movie.categoryID, .movie)

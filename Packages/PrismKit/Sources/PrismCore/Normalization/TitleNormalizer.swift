@@ -102,9 +102,10 @@ struct PackedKey: Hashable, Sendable {
     func hash(into hasher: inout Hasher) {
         hasher.combine(a)
         hasher.combine(b)
+        hasher.combine(count)
     }
 
-    static func == (lhs: PackedKey, rhs: PackedKey) -> Bool { lhs.a == rhs.a && lhs.b == rhs.b }
+    static func == (lhs: PackedKey, rhs: PackedKey) -> Bool { lhs.a == rhs.a && lhs.b == rhs.b && lhs.count == rhs.count }
 }
 
 struct NameTableEntry: Sendable {
@@ -182,7 +183,9 @@ enum NameTables {
     static let seasonWords: Set<PackedKey> = Set(["SAISON", "SEASON", "TEMPORADA", "STAFFEL", "STAGIONE", "SEIZOEN", "SEZON"].map(PackedKey.init))
     static let episodeWords: Set<PackedKey> = Set(["EPISODE", "EPISODES", "EPISODIO", "EP", "EPS", "E", "FOLGE", "AFLEVERING", "CAPITULO"].map(PackedKey.init))
 
-    static let currentYear: Int = Calendar(identifier: .gregorian).component(.year, from: Date())
+    /// Recomputed on access: a frozen value would mislabel the year-boundary `upper` bound
+    /// (`currentYear + 2`) for the whole process lifetime.
+    static var currentYear: Int { Calendar(identifier: .gregorian).component(.year, from: Date()) }
 }
 
 // MARK: - Lexer + pipeline
@@ -1077,6 +1080,10 @@ enum NameFolding {
     }
 
     static func key(_ text: String) -> String {
+        fold(text)
+    }
+
+    private static func fold(_ text: String) -> String {
         var b = KeyBuilder(out: [])
         b.out.reserveCapacity(text.utf8.count + 4)
         for c in text.unicodeScalars {
@@ -1167,6 +1174,10 @@ enum NameFolding {
 
     /// Scans an already folded key word by word (no substring allocations).
     static func isAdult(key: String, strict: Bool) -> Bool {
+        scan(key: key, strict: strict)
+    }
+
+    private static func scan(key: String, strict: Bool) -> Bool {
         var word = PackedKey()
         var overflow = false
         var previous = PackedKey()

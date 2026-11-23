@@ -6,27 +6,59 @@ import SwiftUI
 
 struct TitleDetailView: View {
     @Environment(AppModel.self) private var app
+    @State private var memo = DetailPageMemo()
     let titleID: TitleID
 
     var body: some View {
         if let title = app.catalog.title(titleID) {
-            let editions = title.variants.compactMap { variant -> TitleEdition? in
-                guard let source = app.source(variant.sourceID), source.isEnabled else { return nil }
-                return TitleEdition(variant: variant, source: source, categoryLanguages: app.catalog.providerLanguages(for: variant))
-            }
-            TitleDetailContent(title: displayTitle(title), editions: editions)
+            let content = memo.content(for: title, app: app)
+            TitleDetailContent(title: content.title, editions: content.editions)
                 .id(title.id)
         } else {
             ContentUnavailableView("Titre indisponible", systemImage: "film", description: Text("Ce titre ne figure plus dans vos sources actives."))
         }
     }
+}
 
-    private func displayTitle(_ title: MediaTitle) -> MediaTitle {
+/// The detail page's per-evaluation work that ignores playback state: the display
+/// title (editorial copy + the audio-language scan over the variants) and the
+/// enabled `[TitleEdition]` list (`PlaybackEdition` tag folding per variant).
+/// Navigation re-evaluates every mounted page's body in a section, so both are
+/// rebuilt only when their inputs actually change.
+@MainActor
+private final class DetailPageMemo {
+    private struct Key: Equatable {
+        let titleID: TitleID
+        let catalogRevision: Int
+        let languages: Set<HomeAudioLanguage>
+        let sources: [Source]
+    }
+
+    private var key: Key?
+    private var displayTitle: MediaTitle?
+    private var editions: [TitleEdition] = []
+
+    func content(for title: MediaTitle, app: AppModel) -> (title: MediaTitle, editions: [TitleEdition]) {
+        let key = Key(
+            titleID: title.id, catalogRevision: app.catalogRevision,
+            languages: app.homeAudioLanguages, sources: app.sources
+        )
+        if key == self.key, let displayTitle { return (displayTitle, editions) }
+
         var display = app.recommendations.named(title)
         if let name = app.recommendations.localizedName(for: title, in: app.catalog, languages: app.homeAudioLanguages) {
             display.title = name
         }
-        return display
+        // `app.source(_:)` is a linear scan; editions look variants up once each.
+        let sourcesByID = Dictionary(app.sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let editions = title.variants.compactMap { variant -> TitleEdition? in
+            guard let source = sourcesByID[variant.sourceID], source.isEnabled else { return nil }
+            return TitleEdition(variant: variant, source: source, categoryLanguages: app.catalog.providerLanguages(for: variant))
+        }
+        self.key = key
+        self.displayTitle = display
+        self.editions = editions
+        return (display, editions)
     }
 }
 
@@ -60,6 +92,8 @@ private struct TitleDetailContent: View {
 
     private let margin = PrismMetrics.contentMargin
     private let landscapeCardWidth: CGFloat = 256
+    /// Shared by every evaluation: `Calendar(identifier:)` resolves locale/timezone each time.
+    private static let gregorian = Calendar(identifier: .gregorian)
 
     private var preferredID: ContentID? { app.library.preferredVariant(for: title.id) }
     private var preferredEditionID: ContentID? { browseEditionID ?? preferredID }
@@ -93,7 +127,7 @@ private struct TitleDetailContent: View {
     private var year: Int? {
         let providerDate = movieDetail?.releaseDate ?? inventory?.detail.releaseDate
         return enriched?.releaseYear ?? title.year
-            ?? providerDate.map { Calendar(identifier: .gregorian).component(.year, from: $0) }
+            ?? providerDate.map { Self.gregorian.component(.year, from: $0) }
     }
     private var minutes: Int? {
         enriched?.runtimeMinutes
@@ -104,9 +138,21 @@ private struct TitleDetailContent: View {
             ?? inventory?.seasons.first
     }
     private var heroEpisode: Episode? {
-        guard let inventory else { return nil }
+        // Hidden pages skip every library read so playback ticks (~5 s) do not
+        // re-evaluate them; reads resume when the page becomes active again.
+        guard isPageActive, let inventory else { return nil }
         let library = app.library
-        let latest = inventory.latestProgress(in: library.progress)
+        // The store memoizes the per-title latest progress: when it belongs to
+        // this edition it is also the edition's latest (the common case while
+        // playing). Otherwise fall back to the per-edition scan, which also
+        // covers progress entries whose titleID was never recorded.
+        let latest: PlaybackProgress?
+        if let titleLatest = library.latestProgress(forTitle: title.id),
+           inventory.contains(titleLatest.contentID) {
+            latest = titleLatest
+        } else {
+            latest = inventory.latestProgress(in: library.progress)
+        }
         return inventory.nextEpisode(after: latest, isWatched: library.isWatched)
     }
     private var seasonLookup: SeasonLookup {
@@ -174,6 +220,7 @@ private struct TitleDetailContent: View {
                 isAtTop = atTop
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .prismScrollPhase()
             .background(alignment: .top) {
                 if isAtTop {
                     HeroOverscrollBackground(backdropURLs: backdrops, fallbackPosterURLs: posters, seed: title.id.rawValue)
@@ -229,7 +276,7 @@ private struct TitleDetailContent: View {
         let episode = heroEpisode
         let edition = title.kind == .series ? inventory?.edition ?? activeEdition : activeEdition
         let option = edition.flatMap { TitlePlaybackOption(edition: $0, episode: episode) }
-        let progress = option.flatMap { resumeProgress(for: $0) }
+        let progress = isPageActive ? option.flatMap { resumeProgress(for: $0) } : nil
         let resuming = progress != nil
         let facts = [
             title.kind == .series ? "Série" : "Film",
@@ -248,7 +295,9 @@ private struct TitleDetailContent: View {
             quality: movieDetail?.tech?.quality.badge ?? edition?.variant.quality.badge, playLabel: label,
             progress: resuming ? progress?.fraction : nil,
             canPlay: title.kind == .series ? episode != nil : activeEdition != nil,
-            isInWatchlist: app.library.isInWatchlist(title.id),
+            // Hidden pages skip library reads (see `heroEpisode`): the watchlist scan is
+            // O(#watchlist) and would subscribe this subtree to unrelated watchlist edits.
+            isInWatchlist: isPageActive && app.library.isInWatchlist(title.id),
             edition: edition, editionCount: editions.count,
             play: { choosePlayback(episode: episode) },
             toggleWatchlist: { app.library.toggleWatchlist(title.id) },
@@ -266,7 +315,8 @@ private struct TitleDetailContent: View {
             if let season = displayedSeason {
                 let lookup = seasonLookup
                 let metadata = seasonMetadata.flatMap { $0.matches(lookup) ? $0.episodes : nil }
-                Shelf(title: nil, items: season.episodes, sizing: .fixed(landscapeCardWidth), spacing: 18, margin: margin) { episode in
+                Shelf(title: nil, items: season.episodes, sizing: .fixed(landscapeCardWidth), spacing: 18, margin: margin,
+                      posterArtwork: isPageActive ? \.stillURL : nil) { episode in
                     episodeCard(episode, metadata: metadata?[episode.number])
                 }
                 .id(season.id)
@@ -362,8 +412,10 @@ private struct TitleDetailContent: View {
     }
 
     private func episodeCard(_ episode: Episode, metadata: TMDBEpisodeInfo?) -> some View {
-        let progress = app.library.progress(for: episode.id)
-        let watched = app.library.isWatched(episode.id)
+        // Skip library reads while the page is hidden: they would subscribe this
+        // subtree to every playback tick for an invisible page.
+        let progress = isPageActive ? app.library.progress(for: episode.id) : nil
+        let watched = isPageActive ? app.library.isWatched(episode.id) : false
         return DetailEpisodeTile(
             episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched
         ) {
@@ -477,7 +529,8 @@ private struct TitleDetailContent: View {
     }
 
     private var similarTitles: some View {
-        Shelf(title: "À voir aussi", items: related, spacing: 16, margin: margin) { item in
+        Shelf(title: "À voir aussi", items: related, spacing: 16, margin: margin,
+              posterArtwork: isPageActive ? \.posterURL : nil) { item in
             PosterCard(
                 imageURL: item.posterURL, seed: item.id.rawValue, title: item.title,
                 subtitle: item.year.map(String.init), showsTitle: true
@@ -509,7 +562,8 @@ private struct TitleDetailContent: View {
                 }
             }
             .padding(.horizontal, margin)
-            Shelf(title: nil, items: cast, sizing: .fixed(96), spacing: 18, margin: margin) { person in
+            Shelf(title: nil, items: cast, sizing: .fixed(96), spacing: 18, margin: margin,
+                  posterArtwork: isPageActive ? \.profileURL : nil) { person in
                 PersonCircle(name: person.name, role: person.role, imageURL: person.profileURL, diameter: 83)
             }
         }

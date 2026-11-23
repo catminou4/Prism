@@ -63,4 +63,39 @@ import Testing
         engine.videoGravity = .stretch
         engine.videoGravity = .fit
     }
+
+    /// `layout()` fires per frame during a window drag: geometry applies must coalesce
+    /// into at most one per throttle interval plus a single trailing update.
+    @Test func resizeGeometryAppliesAreCoalesced() async throws {
+        let engine = VLCEngine(configuration: EngineConfiguration(), geometryInterval: .milliseconds(40))
+        defer { engine.stop() }
+        let view = engine.videoView
+        view.frame = NSRect(x: 0, y: 0, width: 640, height: 360)
+        view.layout()
+        #expect(engine.geometryApplyCount == 1)
+
+        // A burst of resize ticks inside the throttle window: no extra applies yet.
+        for i in 1..<40 {
+            view.frame = NSRect(x: 0, y: 0, width: 640 + i, height: 360)
+            view.layout()
+        }
+        #expect(engine.geometryApplyCount == 1)
+
+        // One trailing apply lands once the interval since the last apply elapses —
+        // poll with a deadline rather than a fixed sleep so a stalled main actor
+        // can't turn the margin into a flake.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while engine.geometryApplyCount < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(engine.geometryApplyCount == 2)
+
+        // Let the throttle interval fully elapse so the next resize applies
+        // immediately (the trailing apply just reset `lastGeometryApply`).
+        try await Task.sleep(for: .milliseconds(60))
+        view.frame = NSRect(x: 0, y: 0, width: 700, height: 360)
+        view.layout()
+        #expect(engine.geometryApplyCount == 3)
+        engine.stop()
+    }
 }

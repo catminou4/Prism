@@ -55,6 +55,9 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     private var lastPresentationSize: CGSize = .zero
     private var videoCodec: String?
     private var audioCodec: String?
+    /// `seekableTimeRanges` bridges an NSArray per call and the controller polls it
+    /// at ~4 Hz for live streams; ~1 s of staleness is invisible on a DVR window.
+    private var seekableRangeCache: (range: ClosedRange<TimeInterval>?, at: ContinuousClock.Instant)?
 
     private var pipController: AVPictureInPictureController?
     private var pipObservation: NSKeyValueObservation?
@@ -87,18 +90,35 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
 
         var options: [String: Any] = [:]
         var extraHeaders = headers
-        if let uaKey = headers.keys.first(where: { $0.caseInsensitiveCompare("User-Agent") == .orderedSame }),
-            let userAgent = headers[uaKey], !userAgent.isEmpty
-        {
+        // UA → dedicated public key, applied to every request the asset makes.
+        let agentKeys = headers.keys.filter {
+            $0.caseInsensitiveCompare("User-Agent") == .orderedSame
+        }
+        if let userAgent = agentKeys.lazy.compactMap({ headers[$0] }).first(where: { !$0.isEmpty }) {
             options[AVURLAssetHTTPUserAgentKey] = userAgent
-            extraHeaders.removeValue(forKey: uaKey)
+        }
+        for key in agentKeys { extraHeaders.removeValue(forKey: key) }
+        // Cookies → public cookies key, documented to reach every HLS request
+        // (variant playlists, segments, keys) even on other hosts — the
+        // undocumented header-fields key below is not guaranteed to.
+        let cookiePairs = extraHeaders.filter {
+            $0.key.caseInsensitiveCompare("Cookie") == .orderedSame
+        }
+        if !cookiePairs.isEmpty {
+            let cookies = cookiePairs.flatMap { Self.httpCookies(from: $0.value, url: url) }
+            if !cookies.isEmpty {
+                options[AVURLAssetHTTPCookiesKey] = cookies
+                for (key, _) in cookiePairs { extraHeaders.removeValue(forKey: key) }
+            }
         }
         if !extraHeaders.isEmpty {
             options["AVURLAssetHTTPHeaderFieldsKey"] = extraHeaders
         }
         let asset = AVURLAsset(url: url, options: options)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = isLive ? 3 : 0
+        // Live HLS segments run 4–10 s: 3 s of buffer underruns at every bitrate
+        // spike. ~2 segments of headroom keeps the live edge smooth (+latency).
+        item.preferredForwardBufferDuration = isLive ? 15 : 0
         item.textStyleRules = Self.textStyleRules(for: subtitleStyle)
         player.automaticallyWaitsToMinimizeStalling = !isLive
         currentItem = item
@@ -120,7 +140,10 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     func seek(to seconds: TimeInterval) async {
         guard currentItem != nil, seconds.isFinite else { return }
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-        let tolerance = isLive ? CMTime(seconds: 2, preferredTimescale: 600) : .zero
+        // Exact seeks decode forward from the previous keyframe (IPTV GOPs run
+        // 5–10 s): a small tolerance lets AVPlayer land on a nearby sync sample —
+        // imperceptible for skipping/scrubbing, far less decode work.
+        let tolerance = CMTime(seconds: isLive ? 2 : 1.5, preferredTimescale: 600)
         _ = await player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance)
     }
 
@@ -169,11 +192,18 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     }
 
     var seekableRange: ClosedRange<TimeInterval>? {
-        guard let range = currentItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
-        let start = range.start.seconds
-        let end = range.end.seconds
-        guard start.isFinite, end.isFinite, end > start else { return nil }
-        return start...end
+        let now = ContinuousClock.now
+        if let cache = seekableRangeCache, now - cache.at < .seconds(1) { return cache.range }
+        let range: ClosedRange<TimeInterval>?
+        if let value = currentItem?.seekableTimeRanges.last?.timeRangeValue {
+            let start = value.start.seconds
+            let end = value.end.seconds
+            range = start.isFinite && end.isFinite && end > start ? start...end : nil
+        } else {
+            range = nil
+        }
+        seekableRangeCache = (range, now)
+        return range
     }
 
     // MARK: - Tracks
@@ -532,6 +562,7 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
         videoCodec = nil
         audioCodec = nil
         lastPresentationSize = .zero
+        seekableRangeCache = nil
         currentItem = nil
     }
 
@@ -553,6 +584,28 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     }
 
     // MARK: - Helpers
+
+    /// Parses a `Cookie` header (`a=1; b=2`) into host cookies for the asset URL.
+    static func httpCookies(from header: String, url: URL) -> [HTTPCookie] {
+        guard let host = url.host()?.lowercased(), !host.isEmpty else { return [] }
+        var cookies: [HTTPCookie] = []
+        for pair in header.split(separator: ";") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let name = parts[0].trimmingCharacters(in: .whitespaces)
+            var value = parts[1].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            guard !name.isEmpty,
+                let cookie = HTTPCookie(properties: [
+                    .name: name, .value: value, .domain: host, .path: "/",
+                ])
+            else { continue }
+            cookies.append(cookie)
+        }
+        return cookies
+    }
 
     static func message(for error: (any Error)?) -> String {
         guard let error = error as NSError? else { return "Ce flux ne peut pas être lu." }

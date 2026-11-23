@@ -16,7 +16,19 @@ nonisolated final class ImageDiskCache: Sendable {
         var isScanning = false
         var isTrimming = false
         /// Files whose date was refreshed this session (LRU touch happens once per launch).
+        /// Capped: at 100k+ images the set would otherwise grow to several MB per session.
         var touched: Set<String> = []
+    }
+
+    /// Once `touched` exceeds this, it is cleared wholesale — entries are only an optimisation
+    /// (one `setAttributes` per file per launch), never a correctness requirement.
+    private static let touchedLimit = 50_000
+
+    /// Returns whether `key` was not already touched since the last clear.
+    @discardableResult
+    private static func noteTouched(_ state: inout Usage, _ key: String) -> Bool {
+        if state.touched.count > touchedLimit { state.touched.removeAll(keepingCapacity: true) }
+        return state.touched.insert(key).inserted
     }
 
     private let usage = Mutex(Usage())
@@ -47,16 +59,32 @@ nonisolated final class ImageDiskCache: Sendable {
         directory.appending(path: String(key.prefix(2)), directoryHint: .isDirectory).appending(path: key, directoryHint: .notDirectory)
     }
 
+    /// Existence probe for the warm path — no read, no LRU touch (a probe is not a use).
+    func contains(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(forKey: Self.key(for: url)).path)
+    }
+
     func data(for url: URL) -> Data? {
         let key = Self.key(for: url)
         let file = fileURL(forKey: key)
-        // Artwork files are small: a plain read beats mapping them.
-        guard let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
+        guard let data = Self.read(file), !data.isEmpty else { return nil }
         // LRU touch, once per launch: the date only has to order files across sessions.
-        if usage.withLock({ $0.touched.insert(key).inserted }) {
+        let isNew = usage.withLock { state in Self.noteTouched(&state, key) }
+        if isNew {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
         }
         return data
+    }
+
+    /// `.mappedIfSafe` keeps the bytes in the shared page cache instead of a fresh malloc'd
+    /// copy per read — the same artwork is decoded at several sizes per launch, and a hero
+    /// backdrop can be several MB. The `Data` bridges the mapping zero-copy (verified);
+    /// filesystems that refuse mapping fall back to a plain read.
+    private static func read(_ file: URL) -> Data? {
+        if let mapped = try? NSData(contentsOf: file, options: [.mappedIfSafe]) {
+            return mapped as Data
+        }
+        return try? Data(contentsOf: file)
     }
 
     func store(_ data: Data, for url: URL) {
@@ -68,7 +96,7 @@ nonisolated final class ImageDiskCache: Sendable {
         }
         enum Next { case none, scan, trim }
         let next: Next = usage.withLock { state in
-            state.touched.insert(key)
+            Self.noteTouched(&state, key)
             guard let bytes = state.bytes else {
                 state.pending += data.count
                 guard !state.isScanning else { return .none }
