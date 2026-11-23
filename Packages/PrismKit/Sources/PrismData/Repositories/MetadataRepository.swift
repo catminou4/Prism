@@ -20,6 +20,11 @@ public actor MetadataRepository {
     private var clientKey: String?
     private var memory = BoundedCache<String, CacheEntry>(limit: MetadataRepository.memoryLimit)
     private var inFlight: [String: Task<Lookup, Never>] = [:]
+    /// Keys whose last lookup failed (network / HTTP error), until when they are not retried.
+    /// A hero or detail page re-appearing while TMDB is unreachable otherwise re-ran the whole
+    /// search → details chain (with HTTP retries) on every appearance.
+    private var failedUntil: [String: Date] = [:]
+    public static let failureCooldown: TimeInterval = 60
     private var episodeMemory = BoundedCache<String, EpisodeEntry>(limit: MetadataRepository.memoryLimit)
     private var trendMemory: [MediaKind: TrendCache] = [:]
     private var trendTasks: [MediaKind: TrendRequest] = [:]
@@ -81,6 +86,7 @@ public actor MetadataRepository {
         episodeMemory.removeAll()
         for task in inFlight.values { task.cancel() }
         inFlight.removeAll()
+        failedUntil.removeAll()
         clearTrends()
     }
 
@@ -97,6 +103,10 @@ public actor MetadataRepository {
             return entry.metadata
         }
         if let running = inFlight[key] { return await running.value.metadata }
+        if let until = failedUntil[key] {
+            if until > .now { return nil }
+            failedUntil[key] = nil
+        }
 
         let kind = title.kind, name = title.title, year = title.year
         let task = Task<Lookup, Never> {
@@ -116,7 +126,10 @@ public actor MetadataRepository {
         case .notFound:
             await store(CacheEntry(metadata: nil, savedAt: .now), key: key)
         case .failed:
-            break
+            if !task.isCancelled, !Task.isCancelled {
+                if failedUntil.count >= 1_024 { failedUntil = failedUntil.filter { $0.value > .now } }
+                failedUntil[key] = .now.addingTimeInterval(Self.failureCooldown)
+            }
         }
         return lookup.metadata
     }
@@ -196,6 +209,7 @@ public actor MetadataRepository {
         if clientKey != key {
             memory.removeAll()
             episodeMemory.removeAll()
+            failedUntil.removeAll()
             clearTrends()
         }
         let created = TMDBClient(credential: key, language: language, session: session)

@@ -403,6 +403,18 @@ struct RepositoryTests {
         #expect(await repository.weeklyTrending(for: .movie) == chart)
         #expect(StubURLProtocol.requestCount(host: host) == afterMiss + 1, "one weekly chart request")
 
+        // TMDB unreachable: the failed lookup is not cached, but it is not retried on every
+        // appearance either during the cooldown.
+        StubURLProtocol.register(host: host) { _ in .text("", status: 503) }
+        let ronin = MediaTitle(id: TitleID(kind: .movie, normalizedTitle: "ronin", year: 1998), kind: .movie, title: "Ronin", year: 1998, variants: [])
+        #expect(await repository.metadata(for: ronin) == nil)
+        let afterFailure = StubURLProtocol.requestCount(host: host)
+        #expect(afterFailure > 0)
+        for _ in 0..<4 { #expect(await repository.metadata(for: ronin) == nil) }
+        #expect(StubURLProtocol.requestCount(host: host) == afterFailure, "failure cooldown")
+        #expect(!FileManager.default.fileExists(atPath: directories.metadataCacheDirectory
+            .appending(path: "v2-title-\(ronin.id.rawValue).json").path), "failures are never persisted")
+
         try credentials.setSecret(nil, named: CredentialKeys.tmdb)
         await repository.reload()
         #expect(await repository.isEnabled == false)
