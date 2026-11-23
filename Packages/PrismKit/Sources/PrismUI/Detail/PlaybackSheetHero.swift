@@ -3,8 +3,8 @@ import PrismCore
 import PrismDesign
 import SwiftUI
 
-/// What the immersive playback sheet shows above the edition picker: artwork, eyebrow,
-/// title (or logo), facts line and synopsis — for a film or for one episode.
+/// What the playback sheet shows in its hero (artwork, eyebrow, title or logo, facts, synopsis)
+/// and in its `Informations` column — for a film or for one episode.
 struct PlaybackSheetHero {
     var eyebrow: String
     var name: String
@@ -13,52 +13,72 @@ struct PlaybackSheetHero {
     var rating: String?
     var runtimeSeconds: Int?
     var synopsisCandidates: [String?]
-    /// Landscape artwork, best first; the poster is the blurred last resort.
+    /// Landscape artwork, best first; the poster is the portrait fallback.
     var landscapes: [URL]
     var poster: URL?
     var seed: String
+    var info: [InfoRow]
 
     private static let locale = Locale(identifier: "fr-FR")
 
-    static func episode(_ episode: Episode, metadata: TMDBEpisodeInfo?, backdrop: URL?, poster: URL?) -> Self {
+    static func episode(
+        _ episode: Episode, series: String, metadata: TMDBEpisodeInfo?, backdrop: URL?, poster: URL?
+    ) -> Self {
         let names = [metadata?.title, episode.title]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
         let seconds = metadata?.runtimeMinutes.flatMap { $0 > 0 ? $0 * 60 : nil }
             ?? episode.durationSeconds.flatMap { $0 > 0 ? $0 : nil }
+        let duration = seconds.map { "\(max(1, $0 / 60)) min" }
         let date = episode.airDate.map {
             $0.formatted(.dateTime.day().month(.wide).year().locale(locale))
         }
+        let rating = formattedRating([metadata?.voteAverage, episode.rating])
+        let position = episode.season > 0
+            ? "Saison \(episode.season) · Épisode \(episode.number)"
+            : "Épisode spécial \(episode.number)"
         return Self(
-            eyebrow: episode.season > 0
-                ? "Saison \(episode.season) · Épisode \(episode.number)"
-                : "Épisode spécial \(episode.number)",
+            eyebrow: position,
             name: names.first { !$0.isEmpty } ?? "Épisode \(episode.number)",
-            details: [seconds.map { "\(max(1, $0 / 60)) min" }, date].compactMap { $0 },
-            rating: formattedRating([metadata?.voteAverage, episode.rating]),
+            details: [duration, date].compactMap { $0 },
+            rating: rating,
             runtimeSeconds: seconds,
             synopsisCandidates: [metadata?.overview, episode.plot],
             landscapes: [metadata?.stillURL, episode.stillURL, backdrop].compactMap { $0 },
             poster: poster,
-            seed: episode.id.rawValue
+            seed: episode.id.rawValue,
+            info: rows([
+                ("Série", series), ("Épisode", position), ("Durée", duration), ("Diffusion", date),
+                ("Note", rating.map { "\($0) / 10" }),
+            ])
         )
     }
 
     static func title(
-        _ title: MediaTitle, facts: [String], plot: String?, rating: Double?, runtimeMinutes: Int?,
-        backdrop: URL?, poster: URL?, logo: URL?
+        _ title: MediaTitle, year: Int?, genre: String?, runtimeMinutes: Int?, certification: String?,
+        plot: String?, rating: Double?, backdrop: URL?, poster: URL?, logo: URL?
     ) -> Self {
-        Self(
+        let duration = runtimeMinutes.flatMap { $0 > 0 ? "\($0) min" : nil }
+        let rating = formattedRating([rating])
+        return Self(
             eyebrow: title.kind == .series ? "Série" : "Film",
             name: title.title,
             logo: logo,
-            details: facts,
-            rating: formattedRating([rating]),
+            details: [year.map(String.init), genre, duration, certification].compactMap { $0 },
+            rating: rating,
             runtimeSeconds: runtimeMinutes.flatMap { $0 > 0 ? $0 * 60 : nil },
             synopsisCandidates: [plot, title.plot],
             landscapes: [backdrop].compactMap { $0 },
             poster: poster ?? title.posterURL,
-            seed: title.id.rawValue
+            seed: title.id.rawValue,
+            info: rows([
+                ("Sortie", year.map(String.init)), ("Genre", genre), ("Durée", duration),
+                ("Classification", certification), ("Note", rating.map { "\($0) / 10" }),
+            ])
         )
+    }
+
+    private static func rows(_ pairs: [(String, String?)]) -> [InfoRow] {
+        pairs.compactMap { label, value in value.map { InfoRow(label, $0) } }
     }
 
     private static func formattedRating(_ candidates: [Double?]) -> String? {
@@ -67,74 +87,10 @@ struct PlaybackSheetHero {
     }
 }
 
-/// Full-bleed artwork over an ambient, blurred copy of the same image — the sheet's
-/// background. Falls back through the landscape candidates, then a blurred poster, then a gradient.
-struct PlaybackSheetBackdrop: View {
-    let hero: PlaybackSheetHero
-    let size: CGSize
-    let heroHeight: CGFloat
-
-    @State private var failed: Set<URL> = []
-
-    var body: some View {
-        let landscape = hero.landscapes.first { !failed.contains($0) }
-        let poster = hero.poster.flatMap { failed.contains($0) ? nil : $0 }
-        let ambient = landscape ?? poster
-        let heroSize = CGSize(width: size.width, height: heroHeight)
-        ZStack(alignment: .top) {
-            Color(white: 0.05)
-            if let ambient {
-                RemoteImage(url: ambient, size: size, placeholderSeed: hero.seed, blurRadius: 60, showsPlaceholder: false)
-                    .opacity(0.55)
-                    .id(ambient)
-            }
-            // Darken the ambient wash so the edition tiles stay legible on any artwork.
-            LinearGradient(colors: [.black.opacity(0.35), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
-
-            Group {
-                if let landscape {
-                    RemoteImage(url: landscape, size: heroSize, placeholderSeed: hero.seed, showsPlaceholder: false,
-                                onLoadFailure: { failed.insert(landscape) })
-                        .id(landscape)
-                } else if let poster {
-                    RemoteImage(url: poster, size: heroSize, placeholderSeed: hero.seed, blurRadius: 24,
-                                showsPlaceholder: false, onLoadFailure: { failed.insert(poster) })
-                        .id(poster)
-                } else {
-                    PlaceholderArtwork(seed: hero.seed, style: .none)
-                }
-            }
-            .frame(width: heroSize.width, height: heroSize.height)
-            .clipped()
-            .overlay {
-                // Legibility scrims: leading + bottom for the text block, top for the toolbar.
-                LinearGradient(
-                    stops: [.init(color: .black.opacity(0.8), location: 0), .init(color: .black.opacity(0.45), location: 0.4),
-                            .init(color: .black.opacity(0), location: 0.72)],
-                    startPoint: .leading, endPoint: .trailing
-                )
-                LinearGradient(
-                    stops: [.init(color: .clear, location: 0.35), .init(color: .black.opacity(0.65), location: 1)],
-                    startPoint: .top, endPoint: .bottom
-                )
-                LinearGradient(colors: [.black.opacity(0.45), .clear], startPoint: .top, endPoint: .init(x: 0.5, y: 0.25))
-            }
-            .mask {
-                LinearGradient(
-                    stops: [.init(color: .white, location: 0), .init(color: .white, location: 0.55), .init(color: .clear, location: 1)],
-                    startPoint: .top, endPoint: .bottom
-                )
-            }
-        }
-        .frame(width: size.width, height: size.height)
-        .clipped()
-        .accessibilityHidden(true)
-    }
-}
-
-/// One playable edition in the playback sheet: language, optional source/duplicate line, tech badges.
+/// One playable edition in the playback sheet: language, optional source/duplicate line,
+/// tech labels. Sits on the page background, so it follows the system appearance.
 struct PlaybackEditionTile: View {
-    static let size = CGSize(width: 212, height: 100)
+    static let size = CGSize(width: 220, height: 104)
 
     let option: TitlePlaybackOption
     let selected: Bool
@@ -152,7 +108,7 @@ struct PlaybackEditionTile: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private var badges: [String] {
+    private var labels: [String] {
         option.label.components(separatedBy: " · ").filter { !$0.isEmpty }
     }
 
@@ -162,42 +118,42 @@ struct PlaybackEditionTile: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(option.titleEdition.edition.title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     Spacer(minLength: 0)
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(selected ? Color.white : Color.white.opacity(0.32))
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
                         .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
                         .accessibilityHidden(true)
                 }
                 if let subtitle {
                     Text(subtitle)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .padding(.top, 3)
                 }
                 Spacer(minLength: 4)
                 HStack(spacing: 4) {
-                    ForEach(badges.indices, id: \.self) { index in
-                        MediaBadge(automatic: badges[index])
+                    ForEach(labels.indices, id: \.self) { index in
+                        TechLabel(text: labels[index])
                     }
                 }
-                .foregroundStyle(.white.opacity(selected ? 0.9 : 0.7))
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 15)
+            .padding(.vertical, 13)
             .frame(width: Self.size.width, height: Self.size.height, alignment: .topLeading)
-            .background(Color.white.opacity(selected ? 0.20 : hovered ? 0.12 : 0.07), in: shape)
+            .background(fill, in: shape)
             .overlay {
-                shape.strokeBorder(stroke, lineWidth: selected || focused ? 1.5 : 1)
+                shape.strokeBorder(stroke, lineWidth: selected || focused ? 2 : 1)
                     .allowsHitTesting(false)
             }
             .contentShape(shape)
             .scaleEffect(reduceMotion ? 1 : (hovered ? 1.03 : 1))
+            .shadow(color: .black.opacity(hovered && !reduceMotion ? 0.12 : 0), radius: 12, y: 6)
         }
         .buttonStyle(PressableButtonStyle())
         .focusEffectDisabled()
@@ -213,8 +169,38 @@ struct PlaybackEditionTile: View {
         .help(option.titleEdition.variant.rawName)
     }
 
+    private var fill: Color {
+        if selected { return .accentColor.opacity(0.10) }
+        return hovered ? .primary.opacity(0.09) : PrismColors.panelFill
+    }
+
     private var stroke: Color {
-        if focused { return .accentColor }
-        return selected ? .white.opacity(0.85) : .white.opacity(0.08)
+        if selected || focused { return .accentColor }
+        return .primary.opacity(0.06)
+    }
+}
+
+/// `MediaBadge` metrics in adaptive colours: picture-quality labels filled, others outlined.
+private struct TechLabel: View {
+    let text: String
+
+    var body: some View {
+        let filled = MediaBadge.isQualityLabel(text)
+        let shape = RoundedRectangle(cornerRadius: PrismMetrics.badgeRadius, style: .continuous)
+        Text(text.uppercased())
+            .font(PrismFont.badge)
+            .tracking(0.2)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, PrismMetrics.badgeHorizontalPadding + 0.5)
+            .frame(height: PrismMetrics.badgeHeight + 2)
+            .foregroundStyle(filled ? AnyShapeStyle(PrismColors.pageBackground) : AnyShapeStyle(.secondary))
+            .background {
+                if filled {
+                    shape.fill(.secondary)
+                } else {
+                    shape.strokeBorder(.secondary, lineWidth: 1)
+                }
+            }
     }
 }

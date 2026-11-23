@@ -12,13 +12,15 @@ struct TitlePlaybackSelection: Identifiable {
     let preferred: ContentID?
 }
 
-/// Immersive Apple TV–style playback sheet for a film or an episode: full-bleed artwork,
-/// title, facts, synopsis and play actions, then the language / edition picker as tiles.
+/// Apple TV–style playback sheet for a film or an episode, laid out like the detail page:
+/// an always-dark hero (artwork, title, facts, synopsis, play actions), then — on the page
+/// background, following the system appearance — the language / edition tiles and info columns.
 struct TitlePlaybackSheet: View {
     @Environment(\.dismiss) private var dismiss
     let title: MediaTitle
     let selection: TitlePlaybackSelection
     let hero: PlaybackSheetHero
+    let containerSize: CGSize
     let repository: DetailRepository
     let resumePosition: (TitlePlaybackOption) -> TimeInterval?
     let onPlay: (TitlePlaybackOption, TimeInterval?) -> Void
@@ -33,14 +35,21 @@ struct TitlePlaybackSheet: View {
     @State private var synopsis: String?
     @FocusState private var focusedOption: ContentID?
 
-    private static let size = CGSize(width: 1040, height: 652)
-    private static let heroHeight: CGFloat = 446
-    private static let margin: CGFloat = 40
+    private static let margin = PrismMetrics.contentMargin
+
+    /// Large but still a sheet: inset from the detail page it covers.
+    private static func size(for container: CGSize) -> CGSize {
+        CGSize(
+            width: min(1360, max(1000, container.width - 120)).rounded(),
+            height: min(920, max(600, container.height - 110)).rounded()
+        )
+    }
 
     init(
         title: MediaTitle,
         selection: TitlePlaybackSelection,
         hero: PlaybackSheetHero,
+        containerSize: CGSize,
         repository: DetailRepository,
         resumePosition: @escaping (TitlePlaybackOption) -> TimeInterval?,
         onPlay: @escaping (TitlePlaybackOption, TimeInterval?) -> Void
@@ -48,6 +57,7 @@ struct TitlePlaybackSheet: View {
         self.title = title
         self.selection = selection
         self.hero = hero
+        self.containerSize = containerSize
         self.repository = repository
         self.resumePosition = resumePosition
         self.onPlay = onPlay
@@ -60,19 +70,30 @@ struct TitlePlaybackSheet: View {
         let selected = visible.first { $0.id == selectedID }
             ?? visible.first { $0.id == selection.preferred }
             ?? visible.first
-        VStack(alignment: .leading, spacing: 0) {
-            heroInfo(selected: selected)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                .frame(height: Self.heroHeight)
-            editionPicker(section, selected: selected)
-                .padding(.top, 2)
-            Spacer(minLength: 0)
+        let size = Self.size(for: containerSize)
+        let heroHeight = min(620, max(420, (size.height * 0.6).rounded()))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                heroSection(selected: selected, size: CGSize(width: size.width, height: heroHeight))
+                VStack(alignment: .leading, spacing: 34) {
+                    editionPicker(section, selected: selected)
+                    if let selected { informationColumns(selected) }
+                }
+                .padding(.top, 6)
+                .padding(.bottom, 44)
+            }
         }
-        .frame(width: Self.size.width, height: Self.size.height)
-        .background { PlaybackSheetBackdrop(hero: hero, size: Self.size, heroHeight: Self.heroHeight) }
-        .overlay(alignment: .top) { toolbar }
-        .environment(\.colorScheme, .dark)
-        .presentationBackground(.black)
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(width: size.width, height: size.height)
+        .background(PrismColors.pageBackground)
+        .overlay(alignment: .topTrailing) {
+            GlassCircleButton(systemName: "xmark", style: .dark, accessibilityLabel: "Fermer", action: cancel)
+                .keyboardShortcut(.cancelAction)
+                .help("Fermer")
+                .environment(\.colorScheme, .dark)
+                .padding(18)
+        }
+        .presentationBackground(PrismColors.pageBackground)
         .task(id: hero.synopsisCandidates) {
             let value = await DetailPresentation.synopsis(hero.synopsisCandidates)
             if !Task.isCancelled { synopsis = value }
@@ -82,26 +103,39 @@ struct TitlePlaybackSheet: View {
 
     // MARK: Hero
 
-    private var toolbar: some View {
-        HStack(spacing: 12) {
+    /// Same construction as the detail masthead: dark artwork + scrims, white text, 30 pt fade
+    /// into the page background.
+    private func heroSection(selected: TitlePlaybackOption?, size: CGSize) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            HeroBackdrop(
+                backdropURLs: hero.landscapes, seed: hero.seed, fallbackPosterURLs: [hero.poster].compactMap { $0 },
+                leadingScrim: 0.75, artSize: size
+            )
+            .allowsHitTesting(false)
+            heroInfo(selected: selected, width: min(620, size.width * 0.55))
+        }
+        .frame(width: size.width, height: size.height)
+        .overlay(alignment: .topLeading) {
             if selection.episode != nil {
                 Text(title.title)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.85))
                     .lineLimit(1)
                     .shadow(color: .black.opacity(0.3), radius: 6, y: 1)
+                    .padding(.leading, Self.margin)
+                    .padding(.top, 26)
             }
-            Spacer(minLength: 0)
-            GlassCircleButton(systemName: "xmark", style: .dark, accessibilityLabel: "Fermer", action: cancel)
-                .keyboardShortcut(.cancelAction)
-                .help("Fermer")
         }
-        .padding(.leading, Self.margin)
-        .padding(.trailing, 18)
-        .padding(.top, 18)
+        .environment(\.colorScheme, .dark)
+        .overlay(alignment: .bottom) {
+            LinearGradient(colors: [.clear, PrismColors.pageBackground], startPoint: .top, endPoint: .bottom)
+                .frame(height: 30)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
     }
 
-    private func heroInfo(selected: TitlePlaybackOption?) -> some View {
+    private func heroInfo(selected: TitlePlaybackOption?, width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(hero.eyebrow.uppercased(with: Locale(identifier: "fr-FR")))
                 .font(.system(size: 11, weight: .semibold))
@@ -112,15 +146,16 @@ struct TitlePlaybackSheet: View {
             metaLine(selected: selected)
                 .padding(.top, 10)
             if let synopsis {
-                ExpandableText(synopsis, lineLimit: 3, font: .system(size: 14), popoverTitle: hero.name, lineSpacing: 3)
+                ExpandableText(synopsis, lineLimit: 3, font: .system(size: 14), moreTitle: "Plus", popoverTitle: hero.name, lineSpacing: 3)
+                    .foregroundStyle(.white.opacity(0.91))
                     .padding(.top, 12)
             }
             actions(selected: selected)
                 .padding(.top, 22)
         }
-        .frame(maxWidth: 600, alignment: .leading)
-        .padding(.horizontal, Self.margin)
-        .padding(.bottom, 24)
+        .frame(width: width, alignment: .leading)
+        .padding(.leading, Self.margin)
+        .padding(.bottom, 44)
     }
 
     @ViewBuilder private var heroTitle: some View {
@@ -205,16 +240,16 @@ struct TitlePlaybackSheet: View {
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 Text("Langue et version")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(.white)
+                    .font(PrismFont.sectionTitle)
+                    .foregroundStyle(.primary)
                     .accessibilityAddTraits(.isHeader)
                 Text(visible.count.formatted())
                     .font(.system(size: 13, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(.secondary)
                     .accessibilityLabel(visible.count == 1 ? "1 édition" : "\(visible.count) éditions")
                 if groups.count == 1, let source = groups.first?.source {
                     sourceLabel(source)
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(.secondary)
                         .padding(.leading, 6)
                 }
                 Spacer(minLength: 12)
@@ -233,11 +268,11 @@ struct TitlePlaybackSheet: View {
                     Text(isLoading ? "Recherche d’une édition disponible…" : "Aucune édition disponible.")
                 }
                 .font(.callout)
-                .foregroundStyle(.white.opacity(0.6))
+                .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .frame(height: PlaybackEditionTile.size.height)
                 .padding(.horizontal, 18)
-                .background(.white.opacity(0.06), in: .rect(cornerRadius: 14))
+                .background(PrismColors.panelFill, in: .rect(cornerRadius: 14))
                 .padding(.horizontal, Self.margin)
                 .padding(.vertical, 6)
             } else {
@@ -258,12 +293,12 @@ struct TitlePlaybackSheet: View {
                                 .id(option.id)
                             }
                         }
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 10)
                     }
                     .contentMargins(.horizontal, Self.margin, for: .scrollContent)
                     .scrollIndicators(.hidden)
                     .scrollEdgeEffectStyle(.soft, for: [.leading, .trailing])
-                    .frame(height: PlaybackEditionTile.size.height + 12)
+                    .frame(height: PlaybackEditionTile.size.height + 20)
                     .onAppear {
                         if let id = selected?.id { proxy.scrollTo(id, anchor: .center) }
                     }
@@ -271,16 +306,19 @@ struct TitlePlaybackSheet: View {
                 .id(language)
             }
 
-            HStack(spacing: 18) {
-                if selected?.titleEdition.edition.key == "MULTI" {
-                    Label("Les pistes audio se choisissent dans le lecteur.", systemImage: "waveform")
+            let multi = selected?.titleEdition.edition.key == "MULTI"
+            if multi || isLoading || !failures.isEmpty {
+                HStack(spacing: 18) {
+                    if multi {
+                        Label("Les pistes audio se choisissent dans le lecteur.", systemImage: "waveform")
+                    }
+                    connectionStatus
                 }
-                connectionStatus
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .frame(height: 18)
+                .padding(.horizontal, Self.margin)
             }
-            .font(.system(size: 12))
-            .foregroundStyle(.white.opacity(0.55))
-            .frame(height: 22)
-            .padding(.horizontal, Self.margin)
         }
     }
 
@@ -341,11 +379,11 @@ struct TitlePlaybackSheet: View {
             }
         }
         .font(.subheadline.weight(active ? .semibold : .medium))
-        .foregroundStyle(active ? Color.black : Color.white.opacity(0.75))
+        .foregroundStyle(active ? AnyShapeStyle(PrismColors.pageBackground) : AnyShapeStyle(.secondary))
         .padding(.horizontal, 12)
         .frame(height: 30)
-        .background(active ? Color.white : .clear, in: .capsule)
-        .prismGlass(.dark, interactive: true)
+        .background(active ? Color.primary : .clear, in: .capsule)
+        .prismGlass(interactive: true)
         .contentShape(.capsule)
     }
 
@@ -393,6 +431,29 @@ struct TitlePlaybackSheet: View {
                 .controlSize(.small)
             }
         }
+    }
+
+    private func informationColumns(_ selected: TitlePlaybackOption) -> some View {
+        let variant = selected.titleEdition.variant
+        let technique = [
+            InfoRow("Langue", selected.titleEdition.edition.title),
+            InfoRow("Qualité", variant.quality.badge ?? ""),
+            InfoRow("Conteneur", selected.container?.uppercased() ?? ""),
+            InfoRow("Plage dynamique", variant.tags.contains("HDR") ? "HDR" : ""),
+        ]
+        let source = [
+            InfoRow("Fournisseur", selected.titleEdition.source.name),
+            InfoRow("Flux", variant.rawName),
+        ]
+        return HStack(alignment: .top, spacing: 40) {
+            InfoColumn(title: "Informations", rows: hero.info)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            InfoColumn(title: "Technique", rows: technique)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            InfoColumn(title: "Source", rows: source)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .padding(.horizontal, Self.margin)
     }
 
     // MARK: Actions

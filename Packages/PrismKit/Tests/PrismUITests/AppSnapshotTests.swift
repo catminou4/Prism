@@ -33,11 +33,12 @@ struct AppSnapshotTests {
                 TitlePlaybackSheet(
                     title: series,
                     selection: TitlePlaybackSelection(options: options, otherEditions: [], episode: episode, preferred: option.id),
-                    hero: .episode(episode, metadata: metadata, backdrop: still, poster: nil),
+                    hero: .episode(episode, series: series.title, metadata: metadata, backdrop: still, poster: nil),
+                    containerSize: CGSize(width: 1480, height: 1010),
                     repository: app.detailRepository,
                     resumePosition: { _ in scheme == .dark ? 180 : nil }, onPlay: { _, _ in }
                 ),
-                label: "episode-editions-\(suffix)", size: CGSize(width: 1040, height: 652), scheme: scheme
+                label: "episode-editions-\(suffix)", size: CGSize(width: 1360, height: 900), scheme: scheme
             )
         }
     }
@@ -54,14 +55,15 @@ struct AppSnapshotTests {
                 title: movie,
                 selection: TitlePlaybackSelection(options: options, otherEditions: [], episode: nil, preferred: options.first?.id),
                 hero: .title(
-                    movie, facts: ["2023", "Thriller", "112 min", "12+"],
+                    movie, year: 2023, genre: "Thriller", runtimeMinutes: 112, certification: "12+",
                     plot: "Un ancien pilote accepte une dernière mission : traverser la frontière avec une cargaison dont il ignore tout.",
-                    rating: 7.4, runtimeMinutes: 112, backdrop: backdrop, poster: nil, logo: nil
+                    rating: 7.4, backdrop: backdrop, poster: nil, logo: nil
                 ),
+                containerSize: CGSize(width: 1120, height: 760),
                 repository: app.detailRepository,
                 resumePosition: { _ in nil }, onPlay: { _, _ in }
             ),
-            label: "movie-editions", size: CGSize(width: 1040, height: 652)
+            label: "movie-editions-light", size: CGSize(width: 1000, height: 650), scheme: .light
         )
     }
 

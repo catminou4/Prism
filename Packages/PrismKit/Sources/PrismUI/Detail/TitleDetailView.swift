@@ -91,6 +91,8 @@ private struct TitleDetailContent: View {
     @State private var retryCount = 0
     @State private var browseEditionID: ContentID?
     @State private var playbackSelection: TitlePlaybackSelection?
+    /// Sizes the playback sheet relative to the page it covers.
+    @State private var viewportSize = CGSize(width: 1280, height: 860)
 
     private let margin = PrismMetrics.contentMargin
     private let landscapeCardWidth: CGFloat = 256
@@ -251,6 +253,7 @@ private struct TitleDetailContent: View {
             guard lookup.active else { return }
             await loadEnrichment(for: lookup)
         }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { viewportSize = $0 }
         .task(id: tvmazeLookup) { [lookup = tvmazeLookup] in
             guard let lookup else { return }
             let cast = await SeriesCastRepository.shared.cast(title: lookup.title, year: lookup.year)
@@ -279,6 +282,7 @@ private struct TitleDetailContent: View {
                 title: title,
                 selection: selection,
                 hero: playbackHero(for: selection.episode),
+                containerSize: viewportSize,
                 repository: app.detailRepository,
                 resumePosition: { position(for: $0, equivalentEpisode: selection.episode) },
                 onPlay: { option, position in play(option, from: position) }
@@ -298,15 +302,16 @@ private struct TitleDetailContent: View {
     private func playbackHero(for episode: Episode?) -> PlaybackSheetHero {
         guard let episode else {
             return .title(
-                title, facts: titleFacts, plot: plot, rating: enriched?.voteAverage,
-                runtimeMinutes: title.kind == .movie ? minutes : nil,
+                title, year: year, genre: genres.first.map(DetailPresentation.genreLabel),
+                runtimeMinutes: title.kind == .movie ? minutes : nil, certification: enriched?.certification,
+                plot: plot, rating: enriched?.voteAverage,
                 backdrop: backdrops.first, poster: posters.first, logo: enriched?.images.logoURL
             )
         }
         let metadata = seasonMetadata.flatMap { metadata in
             metadata.matches(seasonLookup) && metadata.season == episode.season ? metadata.episodes[episode.number] : nil
         }
-        return .episode(episode, metadata: metadata, backdrop: backdrops.first, poster: posters.first)
+        return .episode(episode, series: title.title, metadata: metadata, backdrop: backdrops.first, poster: posters.first)
     }
 
     private func masthead(viewportHeight: CGFloat) -> some View {
