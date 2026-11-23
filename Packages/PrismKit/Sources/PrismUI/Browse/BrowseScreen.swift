@@ -68,8 +68,10 @@ struct BrowseScreen: View {
             .scrollEdgeEffectHidden(kind == nil, for: .top)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
-                BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
-                    .frame(height: heroHeight)
+                if reduceMotion {
+                    BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
+                        .frame(height: heroHeight)
+                }
             }
             .ignoresSafeArea(.container, edges: feed.highlights.isEmpty ? [] : .top)
         }
@@ -193,6 +195,19 @@ private struct BrowseHero: View {
             height: height, index: $selected, isInteractive: isActive && isVisible
         ) { highlight in
             HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
+        }
+        .background {
+            if let title = currentTitle {
+                HeroBackdrop(
+                    backdropURLs: app.heroArtwork.backdropURLs(for: title), seed: title.id.rawValue,
+                    fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
+                    leadingScrim: 0.72, artSize: artworkSize
+                )
+                .frame(width: artworkSize.width, height: height)
+                .heroOverscrollZoom(exposedOnly: true)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
         }
         .background(alignment: .leading) {
             if isActive, isVisible, let title = currentTitle {
@@ -408,6 +423,7 @@ private struct HighlightPage: View {
                     fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
                     leadingScrim: 0.72, artSize: size
                 )
+                .heroOverscrollZoom()
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
