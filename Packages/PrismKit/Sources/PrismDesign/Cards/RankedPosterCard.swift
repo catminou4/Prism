@@ -40,7 +40,16 @@ public struct RankedPosterCard<MenuContent: View>: View {
         let size = CGSize(width: w, height: (w / PrismMetrics.posterAspectRatio).rounded())
         CardContainer(accessibilityLabel: accessibilityText, action: action, menu: menu) { _ in
             ArtworkSurface(radius: PrismMetrics.posterRadius) {
-                RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: title)
+                Group {
+                    if let imageURL {
+                        RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: title)
+                    } else {
+                        // Same tree as RemoteImage's nil-URL path, minus the loader node
+                        // and the no-op clip (the placeholder fills its frame exactly).
+                        PlaceholderArtwork(seed: seed, title: title)
+                            .frame(width: size.width, height: size.height)
+                    }
+                }
                     .overlay(alignment: .top) {
                         LinearGradient(colors: [.black.opacity(0.28), .clear], startPoint: .top, endPoint: .bottom)
                             .frame(height: size.height * 0.3)

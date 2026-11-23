@@ -75,6 +75,10 @@ public actor ImagePipeline {
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
     private var failedRequests: [URL: ContinuousClock.Instant] = [:]
+    /// Decode-level failures (bytes arrived, thumbnail rejected/undecodable). Deterministic
+    /// per key, so a card remounting during a scroll doesn't pay the decode cost again.
+    /// Time-boxed like `failedRequests`: cached bytes can be replaced by a later fetch.
+    private var failedDecodes: [Key: ContinuousClock.Instant] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
     private var warmQueue: [ArtworkURL.Resolved] = []
@@ -119,6 +123,7 @@ public actor ImagePipeline {
     func image(for key: Key, blurredFrom source: Key? = nil) async -> CGImage? {
         guard !Task.isCancelled else { return nil }
         if let hit = memory.image(for: key) { return hit }
+        if isCoolingDown(key, in: &failedDecodes) { return nil }
 
         let entry: InFlight<CGImage?>
         if let existing = inFlight[key] {
@@ -222,6 +227,7 @@ public actor ImagePipeline {
         disk.removeAll()
         averageColors.removeAll()
         failedRequests.removeAll()
+        failedDecodes.removeAll()
     }
 
     // MARK: Internals
@@ -252,13 +258,16 @@ public actor ImagePipeline {
         let blur = CGFloat(key.blur)
         let target = key.target
         return Task.detached(priority: .userInitiated) {
+            var reachedDecode = false
             let image: CGImage?
             if blur > 0, let source {
                 guard let sharp = await self.image(for: source) else { return nil }
+                reachedDecode = true
                 image = await decoder.decode {
                     return ImageDecoder.blurred(sharp, radius: blur * 0.25, target: target)
                 }
             } else if key.url.isFileURL {
+                reachedDecode = true
                 image = await decoder.decode {
                     let thumbnail = ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
                     return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
@@ -266,12 +275,19 @@ public actor ImagePipeline {
             } else if let data = await self.sharedData(
                 for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
             ) {
+                reachedDecode = true
                 image = await decoder.decode {
                     let thumbnail = ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
                     return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
                 }
             } else {
                 image = nil
+            }
+            // The decode queue only yields nil without running the work when the task was
+            // cancelled — a live task plus a nil means the bytes were fine but the thumbnail
+            // was rejected or undecodable, which repeats identically on every remount.
+            if reachedDecode, image == nil, !Task.isCancelled {
+                await self.noteDecodeFailure(key)
             }
             if let image, !Task.isCancelled {
                 memory.insert(image, for: key)
@@ -294,7 +310,7 @@ public actor ImagePipeline {
         if let existing = dataInFlight[url] {
             entry = existing
         } else {
-            guard !isCoolingDown(url) else { return nil }
+            guard !isCoolingDown(url, in: &failedRequests) else { return nil }
             let disk = disk, session = session
             entry = InFlight(task: Task.detached(priority: .userInitiated) {
                 await Self.encodedData(for: request, disk: disk, session: session)
@@ -312,22 +328,40 @@ public actor ImagePipeline {
         return data
     }
 
+    /// `true` while `key` is inside its failure cooldown; drops the entry once it expires.
+    private func isCoolingDown<K: Hashable>(_ key: K, in table: inout [K: ContinuousClock.Instant]) -> Bool {
+        guard let expiry = table[key] else { return false }
+        if expiry > ContinuousClock.now { return true }
+        table[key] = nil
+        return false
+    }
+
+    /// Records a failure for `key`, bounded like the request table: expired entries go first,
+    /// then the soonest-to-expire ones if the table is still full.
+    private func noteFailure<K: Hashable>(_ table: inout [K: ContinuousClock.Instant], _ key: K) {
+        if table.count >= 2_048 {
+            let now = ContinuousClock.now
+            table = table.filter { $0.value > now }
+            if table.count >= 2_048 {
+                // Evict the entries closest to expiry: they are the least valuable.
+                for (k, _) in table.sorted(by: { $0.value < $1.value }).prefix(128) {
+                    table[k] = nil
+                }
+            }
+        }
+        table[key] = ContinuousClock.now.advanced(by: .seconds(120))
+    }
+
+    private func noteDecodeFailure(_ key: Key) {
+        noteFailure(&failedDecodes, key)
+    }
+
     private func releaseData(_ url: URL, token: ObjectIdentifier, finished: Bool, failed: Bool = false) {
         guard let entry = dataInFlight[url], ObjectIdentifier(entry) == token else { return }
         if finished {
             dataInFlight[url] = nil
             if failed, !entry.task.isCancelled {
-                if failedRequests.count >= 2_048 {
-                    let now = ContinuousClock.now
-                    failedRequests = failedRequests.filter { $0.value > now }
-                    if failedRequests.count >= 2_048 {
-                        // Evict the entries closest to expiry: they are the least valuable.
-                        for (key, _) in failedRequests.sorted(by: { $0.value < $1.value }).prefix(128) {
-                            failedRequests[key] = nil
-                        }
-                    }
-                }
-                failedRequests[url] = ContinuousClock.now.advanced(by: .seconds(120))
+                noteFailure(&failedRequests, url)
             }
             return
         }
@@ -336,13 +370,6 @@ public actor ImagePipeline {
             entry.task.cancel()
             dataInFlight[url] = nil
         }
-    }
-
-    private func isCoolingDown(_ url: URL) -> Bool {
-        guard let expiry = failedRequests[url] else { return false }
-        if expiry > ContinuousClock.now { return true }
-        failedRequests[url] = nil
-        return false
     }
 
     /// Largest encoded payload accepted. Checked on `Content-Length` before the body is read
@@ -397,7 +424,7 @@ public actor ImagePipeline {
         var fresh: [ArtworkURL.Resolved] = []
         for url in urls where !url.isFileURL {
             let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary),
+            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary, in: &failedRequests),
                   warmQueued.insert(request.primary).inserted else { continue }
             fresh.append(request)
         }
@@ -415,7 +442,7 @@ public actor ImagePipeline {
         while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
             let request = warmQueue.removeFirst()
             warmQueued.remove(request.primary)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary) else { continue }
+            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary, in: &failedRequests) else { continue }
             warmRunning += 1
             let disk = disk, session = prefetchSession
             // Registered like any fetch, so an on-screen decode of the same image joins it.

@@ -33,7 +33,9 @@ public enum CatalogBuilder {
 
         // Normalization keys, then grouping — kept in one scope so the per-item key strings
         // are released when grouping finishes instead of living until `build` returns.
+        let groupedStart = ContinuousClock.now
         let (movieGroups, seriesGroups, channelGrouping) = await groupedTitles(ordered: ordered, context: context)
+        BuildProfile.mark("groupedTitles (keys+grouping)", since: groupedStart)
         guard !Task.isCancelled else { return .empty }
         let movies = movieGroups.titles, series = seriesGroups.titles, channels = channelGrouping.groups
 
@@ -47,6 +49,7 @@ public enum CatalogBuilder {
         async let topRatedSeries = ratingRanking(series)
 
         var indexes = Catalog.Indexes()
+        let indexesStart = ContinuousClock.now
         for (index, source) in enabled.enumerated() { indexes.sourceIndex[source.id] = index }
         indexes.categories = context.categories
         indexes.hasTaggedEditions = movieGroups.hasTaggedEditions || seriesGroups.hasTaggedEditions
@@ -56,22 +59,31 @@ public enum CatalogBuilder {
         }
         // Provider-language labels per variant, resolved once: `providerLanguages(for:)` sits on
         // hot audio paths and would otherwise interpolate category prefixes on every call.
+        let providerLangsStart = ContinuousClock.now
         if !indexes.categoryLanguages.isEmpty {
+            let languageMaps = providerLanguageMaps(context: context, categoryLanguages: indexes.categoryLanguages)
             var languages: [ContentID: Set<String>] = [:]
             for title in movies {
-                for variant in title.variants { collectProviderLanguages(variant, categoryLanguages: indexes.categoryLanguages, into: &languages) }
+                for variant in title.variants {
+                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
+                }
             }
             for title in series {
-                for variant in title.variants { collectProviderLanguages(variant, categoryLanguages: indexes.categoryLanguages, into: &languages) }
+                for variant in title.variants {
+                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
+                }
             }
             indexes.providerLanguages = languages
         }
+        BuildProfile.mark("providerLanguages", since: providerLangsStart)
         indexes.movieByTitleID = movieGroups.titleIndex
         indexes.movieByContent = movieGroups.contentIndex
         indexes.seriesByTitleID = seriesGroups.titleIndex
         indexes.seriesByContent = seriesGroups.contentIndex
         indexes.channelByGroupID = channelGrouping.groupIndex
         indexes.channelByContent = channelGrouping.contentIndex
+        BuildProfile.mark("index assembly (sync)", since: indexesStart)
+        let awaitStart = ContinuousClock.now
         let categoryResults = await [liveCategories, movieCategories, seriesCategories]
         for result in categoryResults {
             indexes.categoryToGroup.merge(result.categoryToGroup) { first, _ in first }
@@ -84,12 +96,17 @@ public enum CatalogBuilder {
         indexes.featuredSeries = await featuredSeries
         indexes.topRatedMovies = await topRatedMovies
         indexes.topRatedSeries = await topRatedSeries
+        BuildProfile.mark("categories+rankings (async)", since: awaitStart)
 
-        return Catalog(
+        let result = Catalog(
             sources: enabled, channels: channels, movies: movies, series: series,
             liveCategories: categoryResults[0].groups, movieCategories: categoryResults[1].groups,
             seriesCategories: categoryResults[2].groups, indexes: indexes
         )
+        if let dumpPath = ProcessInfo.processInfo.environment["PRISM_CATALOG_DUMP"] {
+            dumpCatalogForVerification(result, to: dumpPath)
+        }
+        return result
     }
 
     /// Normalization keys (one String per raw item, the expensive part on 150k+ items) followed
@@ -98,23 +115,68 @@ public enum CatalogBuilder {
     private static func groupedTitles(
         ordered: [SourceCatalog], context: Context
     ) async -> (movies: MediaGroups, series: MediaGroups, channels: ChannelGroups) {
-        async let movieKeys = parallelKeys(ordered.map(\.movies)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
-        async let seriesKeys = parallelKeys(ordered.map(\.series)) { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
-        async let channelKeys = parallelKeys(ordered.map(\.channels)) { channelKey($0) }
+        let keysStart = ContinuousClock.now
+        async let movieKeys = parallelKeys(ordered.map(\.movies), label: "keys.movies") { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
+        async let seriesKeys = parallelKeys(ordered.map(\.series), label: "keys.series") { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
+        async let channelKeys = parallelKeys(ordered.map(\.channels), label: "keys.channels") { channelKey($0) }
         let keys = await (movies: movieKeys, series: seriesKeys, channels: channelKeys)
+        BuildProfile.mark("keys (all 3 parallel)", since: keysStart)
         guard !Task.isCancelled else { return (MediaGroups(), MediaGroups(), ChannelGroups()) }
 
         // Grouping: each kind concurrently; title construction is itself chunked in parallel.
+        let groupStart = ContinuousClock.now
         async let movieTitles = groupMedia(kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context)
         async let seriesTitles = groupMedia(kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context)
         async let channelGroups = groupChannels(lists: ordered.map(\.channels), keys: keys.channels, context: context)
-        return await (movieTitles, seriesTitles, channelGroups)
+        let result = await (movieTitles, seriesTitles, channelGroups)
+        BuildProfile.mark("grouping (all 3 parallel)", since: groupStart)
+        return result
+    }
+
+    /// Per source+kind category lookups for `collectProviderLanguages`: canonical category ids
+    /// and native ids each map to the declared language labels, mirroring the syntactic
+    /// canonicalization `Catalog.providerLanguages(for:)` performs per variant.
+    struct ProviderLanguageMaps {
+        /// `"<sourceID>:<kind>:"` prefix used to tell canonical ids from native ones.
+        var prefix: String
+        /// Canonical category id → languages (only consulted for prefixed ids).
+        var canonical: [String: Set<String>]
+        /// Native category id → languages (first registration wins, like `Context.resolvers`).
+        var native: [String: Set<String>]
+    }
+
+    /// Builds the per-(source, kind) language maps once: ~#categories work instead of
+    /// interpolating `"source:kind:"` prefixes for every one of ~250k variants.
+    static func providerLanguageMaps(
+        context: Context, categoryLanguages: [String: Set<String>]
+    ) -> [SourceID: [MediaKind: ProviderLanguageMaps]] {
+        var maps: [SourceID: [MediaKind: ProviderLanguageMaps]] = [:]
+        for catalog in context.catalogs {
+            for kind in [MediaKind.movie, .series] {
+                var canonical: [String: Set<String>] = [:]
+                var native: [String: Set<String>] = [:]
+                for category in catalog.categories where category.kind == kind {
+                    canonical[category.id] = categoryLanguages[category.id] ?? []
+                }
+                for category in catalog.categories where category.kind == kind {
+                    if native[category.nativeID] == nil {
+                        native[category.nativeID] = categoryLanguages[category.id] ?? []
+                    }
+                }
+                maps[catalog.sourceID, default: [:]][kind] = ProviderLanguageMaps(
+                    prefix: "\(catalog.sourceID.rawValue):\(kind.rawValue):",
+                    canonical: canonical, native: native
+                )
+            }
+        }
+        return maps
     }
 
     /// Records the declared language labels of one variant (empty when its category has none),
     /// using the same canonical-category resolution as `Catalog.providerLanguages(for:)`.
     private static func collectProviderLanguages(
-        _ variant: MediaVariant, categoryLanguages: [String: Set<String>], into result: inout [ContentID: Set<String>]
+        _ variant: MediaVariant, languageMaps: [SourceID: [MediaKind: ProviderLanguageMaps]],
+        categoryLanguages: [String: Set<String>], into result: inout [ContentID: Set<String>]
     ) {
         let category: (id: String?, kind: MediaKind) = switch variant {
         case .movie(let movie): (movie.categoryID, .movie)
@@ -124,10 +186,18 @@ public enum CatalogBuilder {
             result[variant.id] = []
             return
         }
-        // Older imports can carry the native category ID instead of the canonical reference.
-        let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
-        let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
-        result[variant.id] = categoryLanguages[canonicalID] ?? []
+        if let maps = languageMaps[variant.sourceID]?[category.kind] {
+            // Same rule as before: a prefixed id is already canonical, anything else is native.
+            result[variant.id] = id.hasPrefix(maps.prefix)
+                ? (maps.canonical[id] ?? [])
+                : (maps.native[id] ?? [])
+        } else {
+            // Defensive fallback (a variant whose source has no catalog entry): keep the
+            // original syntactic canonicalization.
+            let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
+            let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
+            result[variant.id] = categoryLanguages[canonicalID] ?? []
+        }
     }
 
     // MARK: - Context
@@ -213,12 +283,13 @@ public enum CatalogBuilder {
         return raw.isEmpty ? "#" + channel.id.rawValue : raw
     }
 
-    static func parallelKeys<T: Sendable>(_ lists: [[T]], key: @escaping @Sendable (T) -> String) async -> [[String]] {
+    static func parallelKeys<T: Sendable>(_ lists: [[T]], label: String = "", key: @escaping @Sendable (T) -> String) async -> [[String]] {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return lists.map { _ in [] } }
+        let start = ContinuousClock.now
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunk = max(2_048, total / (workers * 2))
-        return await withTaskGroup(of: (Int, Int, [String]).self) { group in
+        let result = await withTaskGroup(of: (Int, Int, [String]).self) { group in
             for (listIndex, list) in lists.enumerated() {
                 var start = 0
                 while start < list.count {
@@ -237,6 +308,8 @@ public enum CatalogBuilder {
             }
             return result
         }
+        BuildProfile.mark(label, since: start)
+        return result
     }
 
     // MARK: - Movies & series
@@ -261,6 +334,9 @@ public enum CatalogBuilder {
         var lower: Int
         var titles: [MediaTitle] = []
         var added: [Double] = []
+        var elapsed: Double = 0
+        var refsProcessed: Int = 0
+        var multiVariant: Int = 0
     }
 
     struct NameIdentity: Hashable, Sendable {
@@ -294,6 +370,8 @@ public enum CatalogBuilder {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return MediaGroups() }
         let categoryKind: MediaKind = kind == .series ? .series : .movie
+        let label = kind == .movie ? "movies" : "series"
+        let phaseStart = ContinuousClock.now
 
         var datedGroups: [NameIdentity: Int] = Dictionary(minimumCapacity: total)
         /// Normalized title → its only dated group, or -1 when several years exist.
@@ -351,31 +429,52 @@ public enum CatalogBuilder {
                 undatedGroups[key] = group
             }
         }
+        BuildProfile.mark("\(label) group-loop", since: phaseStart)
 
         // Build titles in parallel chunks (variant sorting + metadata merge).
         guard !Task.isCancelled else { return MediaGroups() }
+        let mergeStart = ContinuousClock.now
         let namedGroups = mergeEditorialAliases(mediaGroups, datedGroups: datedGroups, kind: kind, lists: lists)
+        BuildProfile.mark("\(label) editorial-aliases", since: mergeStart)
+        let reconcileStart = ContinuousClock.now
         let frozenGroups = hasTMDBIdentity ? await reconcileMediaIdentities(namedGroups, lists: lists) : namedGroups
+        BuildProfile.mark("\(label) reconcile-ids", since: reconcileStart)
         let groupCount = frozenGroups.count
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunk = max(2_048, groupCount / (workers * 2))
         let frozenCategories = resolvedCategories, frozenAdult = adultFlags
+        // Variant ordering hoisted out of the comparator: every item of a catalog shares its
+        // sourceID, so priority is a per-catalog array lookup, and the name byte length is
+        // computed once per item instead of twice per comparison.
+        let catalogPriority = context.catalogs.map { context.priority[$0.sourceID] ?? .max }
+        let nameLengths = lists.map { list in list.map { $0.rawName.utf8.count } }
+        let chunksStart = ContinuousClock.now
         let chunks: [BuiltChunk] = await withTaskGroup(of: BuiltChunk.self) { group in
             var start = 0
             while start < groupCount {
                 let lower = start, upper = min(start + chunk, groupCount)
                 group.addTask {
                     var built = BuiltChunk(lower: lower)
+                    let chunkStart = ContinuousClock.now
                     guard !Task.isCancelled else { return built }
                     built.titles.reserveCapacity(upper - lower)
                     built.added.reserveCapacity(upper - lower)
                     var cleanedGenreLists: [[String]: [String]] = [:]
                     for index in lower..<upper {
                         let offer = frozenGroups[index]
+                        built.refsProcessed += offer.refs.count
+                        if offer.refs.count > 1 { built.multiVariant += 1 }
                         var refs = offer.refs
                         if refs.count > 1 {
                             refs.sort { lhs, rhs in
-                                variantPrecedes(lists[Int(lhs.catalog)][Int(lhs.item)], rhs: lists[Int(rhs.catalog)][Int(rhs.item)], context: context)
+                                let lhsCatalog = Int(lhs.catalog), rhsCatalog = Int(rhs.catalog)
+                                let lhsPriority = catalogPriority[lhsCatalog], rhsPriority = catalogPriority[rhsCatalog]
+                                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                                let lhsItem = lists[lhsCatalog][Int(lhs.item)], rhsItem = lists[rhsCatalog][Int(rhs.item)]
+                                if lhsItem.quality != rhsItem.quality { return lhsItem.quality > rhsItem.quality }
+                                let lhsLength = nameLengths[lhsCatalog][Int(lhs.item)], rhsLength = nameLengths[rhsCatalog][Int(rhs.item)]
+                                if lhsLength != rhsLength { return lhsLength < rhsLength }
+                                return lhsItem.id < rhsItem.id
                             }
                         }
                         let title = makeTitle(
@@ -386,6 +485,8 @@ public enum CatalogBuilder {
                         built.added.append(title.addedAt?.timeIntervalSinceReferenceDate ?? -.infinity)
                         built.titles.append(title)
                     }
+                    let e = ContinuousClock.now - chunkStart
+                    built.elapsed = Double(e.components.seconds) * 1_000 + Double(e.components.attoseconds) / 1e15
                     return built
                 }
                 start = upper
@@ -394,10 +495,19 @@ public enum CatalogBuilder {
             for await part in group { parts.append(part) }
             return parts.sorted { $0.lower < $1.lower }
         }
+        BuildProfile.mark("\(label) makeTitle chunks", since: chunksStart)
+        if BuildProfile.enabled {
+            let refs = chunks.reduce(0) { $0 + $1.refsProcessed }
+            let multi = chunks.reduce(0) { $0 + $1.multiVariant }
+            let times = chunks.map(\.elapsed).sorted(by: >)
+            let slowest = times.prefix(4).map { String(format: "%.0f", $0) }.joined(separator: ",")
+            FileHandle.standardError.write(Data("[profile] \(label) chunks: \(chunks.count) chunks, \(refs) refs, \(multi) multi-variant; slowest ms: \(slowest)\n".utf8))
+        }
         guard !Task.isCancelled else { return MediaGroups() }
         let added = chunks.flatMap(\.added)
 
         // Order: addedAt desc, then normalized title, then year.
+        let sortStart = ContinuousClock.now
         let order = await parallelSortedIndices(count: groupCount) { lhs, rhs in
             let a = added[lhs], b = added[rhs]
             if a != b { return a > b }
@@ -406,7 +516,10 @@ public enum CatalogBuilder {
             if left.name.year != right.name.year { return (left.name.year ?? .min) < (right.name.year ?? .min) }
             return (left.tmdbID ?? 0) < (right.tmdbID ?? 0)
         }
+        BuildProfile.mark("\(label) sort order", since: sortStart)
         guard !Task.isCancelled else { return MediaGroups() }
+
+        let finalStart = ContinuousClock.now
 
         @Sendable func title(at offset: Int) -> MediaTitle {
             chunks[offset / chunk].titles[offset % chunk]
@@ -432,10 +545,12 @@ public enum CatalogBuilder {
             }
             return index
         }()
-        return await MediaGroups(
+        let result = await MediaGroups(
             titles: titles, titleIndex: titleIndex, contentIndex: contentIndex,
             categoryIDs: categories, hasTaggedEditions: hasTaggedEditions
         )
+        BuildProfile.mark("\(label) final indexes", since: finalStart)
+        return result
     }
 
     /// Link known translations only when the exact release year agrees and provider IDs don't conflict.
@@ -489,6 +604,7 @@ public enum CatalogBuilder {
             return reconcileMediaIdentitiesChunk(groups, lists: lists)
         }
         let chunk = (groups.count + workers - 1) / workers
+        let partsStart = ContinuousClock.now
         let parts: [[MediaGroup]] = await withTaskGroup(of: (Int, [MediaGroup]).self) { group in
             for lower in stride(from: 0, to: groups.count, by: chunk) {
                 let upper = min(lower + chunk, groups.count)
@@ -500,6 +616,8 @@ public enum CatalogBuilder {
             for await part in group { collected.append(part) }
             return collected.sorted { $0.0 < $1.0 }.map(\.1)
         }
+        BuildProfile.mark("reconcile chunks (\(groups.count) groups)", since: partsStart)
+        let mergeStart = ContinuousClock.now
         // Ordered merge applying the same identity rules across chunk boundaries.
         var result: [MediaGroup] = []
         result.reserveCapacity(groups.count)
@@ -520,6 +638,7 @@ public enum CatalogBuilder {
                 }
             }
         }
+        BuildProfile.mark("reconcile merge", since: mergeStart)
         return result
     }
 
@@ -552,6 +671,30 @@ public enum CatalogBuilder {
                 continue
             }
 
+            // Most multi-variant groups share zero or one provider id: detect that without
+            // allocating the per-id buckets (only conflicting ids need the full split below).
+            var singleID: Int? = nil
+            var conflicting = false
+            for ref in group.refs {
+                guard let id = lists[Int(ref.catalog)][Int(ref.item)].tmdbID, id > 0 else { continue }
+                if singleID == nil {
+                    singleID = id
+                } else if id != singleID {
+                    conflicting = true
+                    break
+                }
+            }
+            if !conflicting {
+                guard let id = singleID else {
+                    result.append(group)
+                    continue
+                }
+                var linked = group
+                linked.tmdbID = id
+                addIdentified(linked, tmdbID: id)
+                continue
+            }
+
             var identified: [Int: [Ref]] = [:]
             var unidentified: [Ref] = []
             for ref in group.refs {
@@ -562,23 +705,12 @@ public enum CatalogBuilder {
                 }
             }
 
-            switch identified.count {
-            case 0:
-                result.append(group)
-            case 1:
-                if let id = identified.keys.first {
-                    var linked = group
-                    linked.tmdbID = id
-                    addIdentified(linked, tmdbID: id)
-                }
-            default:
-                for id in identified.keys.sorted() {
-                    guard let refs = identified[id] else { continue }
-                    addIdentified(MediaGroup(name: group.name, refs: refs, tmdbID: id, ambiguousName: true), tmdbID: id)
-                }
-                if !unidentified.isEmpty {
-                    result.append(MediaGroup(name: group.name, refs: unidentified, ambiguousName: true))
-                }
+            for id in identified.keys.sorted() {
+                guard let refs = identified[id] else { continue }
+                addIdentified(MediaGroup(name: group.name, refs: refs, tmdbID: id, ambiguousName: true), tmdbID: id)
+            }
+            if !unidentified.isEmpty {
+                result.append(MediaGroup(name: group.name, refs: unidentified, ambiguousName: true))
             }
         }
         return result
@@ -633,15 +765,6 @@ public enum CatalogBuilder {
         return result
     }
 
-    static func variantPrecedes<V: GroupableMedia>(_ lhs: V, rhs: V, context: Context) -> Bool {
-        let pl = context.priority[lhs.sourceID] ?? .max, pr = context.priority[rhs.sourceID] ?? .max
-        if pl != pr { return pl < pr }
-        if lhs.quality != rhs.quality { return lhs.quality > rhs.quality }
-        let ll = lhs.rawName.utf8.count, lr = rhs.rawName.utf8.count
-        if ll != lr { return ll < lr }
-        return lhs.id < rhs.id
-    }
-
     static func makeTitle<V: GroupableMedia>(
         id: TitleID, kind: MediaKind, year: Int?, refs: [Ref], lists: [[V]],
         categories: [[String?]], categorySets: [String: Set<String>], adult: [[Bool]],
@@ -651,11 +774,16 @@ public enum CatalogBuilder {
         if refs.count == 1 {
             let ref = refs[0]
             let rating = first.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+            var cleanedPlot: String? = nil
+            if let raw = first.plot {
+                cleanedPlot = plotProfile(raw).passthrough ? raw : cleanPlot(raw)
+            }
+            let cleanedGenres = cleanGenres(first.genres, cache: &cleanedGenreLists)
             var single = MediaTitle(
                 id: id,
                 kind: kind, title: first.title, year: year ?? first.year, variants: [first.mediaVariant],
-                plot: cleanPlot(first.plot),
-                genres: cleanGenres(first.genres, cache: &cleanedGenreLists), rating: rating, addedAt: first.addedAt,
+                plot: cleanedPlot,
+                genres: cleanedGenres, rating: rating, addedAt: first.addedAt,
                 categoryIDs: categories[Int(ref.catalog)][Int(ref.item)].flatMap { categorySets[$0] } ?? [],
                 isAdult: adult[Int(ref.catalog)][Int(ref.item)]
             )
@@ -693,9 +821,22 @@ public enum CatalogBuilder {
             if resolvedYear == nil { resolvedYear = item.year }
             if poster == nil { poster = item.posterText }
             if backdrop == nil { backdrop = item.backdropText }
-            if let candidate = cleanPlot(item.plot), candidate.utf8.count > plotLength {
-                plot = candidate
-                plotLength = candidate.utf8.count
+            // `cleaned` never lengthens a plot (it only trims and drops text), so a variant
+            // whose raw plot can't beat the current best cleaned length is skipped without
+            // paying for synopsis normalization — the common case is duplicate plots.
+            // `plotProfile` additionally detects plots `cleaned` would return unchanged,
+            // skipping the regex/NLP path for clean provider prose entirely.
+            if let rawPlot = item.plot {
+                let profile = plotProfile(rawPlot)
+                if profile.bytes > plotLength {
+                    if profile.passthrough {
+                        plot = rawPlot
+                        plotLength = profile.bytes
+                    } else if let candidate = cleanPlot(rawPlot), candidate.utf8.count > plotLength {
+                        plot = candidate
+                        plotLength = candidate.utf8.count
+                    }
+                }
             }
             for genre in cleanGenres(item.genres, cache: &cleanedGenreLists) {
                 if seenGenres.insert(TextFolding.fold(genre)).inserted { genres.append(genre) }
@@ -735,6 +876,83 @@ public enum CatalogBuilder {
         ProviderSynopsis.cleaned(plot)
     }
 
+    /// Decodes the UTF-8 scalar starting at `i` (which must be a lead byte). Input is a valid
+    /// Swift string, so continuation bytes need no validation.
+    private static func decodeUTF8Scalar(_ p: UnsafePointer<UInt8>, _ i: Int, _ end: Int) -> UInt32? {
+        let b0 = p[i]
+        if b0 < 0x80 { return UInt32(b0) }
+        let length = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4)
+        guard i + length <= end else { return nil }
+        var value = UInt32(b0) & (length == 2 ? 0x1F : (length == 3 ? 0x0F : 0x07))
+        for j in 1..<length { value = (value << 6) | (UInt32(p[i + j]) & 0x3F) }
+        return value
+    }
+
+    /// Byte offset where the last UTF-8 scalar of `p[0..<end]` starts (scans back over the
+    /// ≤3 continuation bytes that may precede it).
+    private static func lastScalarOffset(_ p: UnsafePointer<UInt8>, _ end: Int) -> Int? {
+        var i = end - 1
+        var steps = 0
+        while i > 0 && steps < 3 && (p[i] & 0xC0) == 0x80 {
+            i -= 1
+            steps += 1
+        }
+        return (p[i] & 0xC0) != 0x80 ? i : nil
+    }
+
+    /// Whether `ProviderSynopsis.cleaned` would return `p[0..<bytes]` unchanged. See
+    /// `plotProfile` for the exact equivalence argument.
+    private static func plotIsPassthrough(_ p: UnsafePointer<UInt8>, _ bytes: Int) -> Bool {
+        var previousWasSpace = false
+        var i = 0
+        while i < bytes {
+            let b = p[i]
+            if b == 0x20 {
+                if previousWasSpace { return false }
+                previousWasSpace = true
+            } else {
+                previousWasSpace = false
+                if b >= 0x09 && b <= 0x0D { return false }
+                if b == 0xC2, i + 1 < bytes, p[i + 1] == 0x85 { return false }
+                if b == 0xE2, i + 2 < bytes, p[i + 1] == 0x80, p[i + 2] == 0xA8 || p[i + 2] == 0xA9 {
+                    return false
+                }
+            }
+            i += 1
+        }
+        // `cleaned` also trims when the first or last scalar is whitespace; decode just those two.
+        guard let firstScalar = decodeUTF8Scalar(p, 0, bytes),
+              let lastOffset = lastScalarOffset(p, bytes),
+              let lastScalar = decodeUTF8Scalar(p, lastOffset, bytes),
+              let first = Unicode.Scalar(firstScalar), let last = Unicode.Scalar(lastScalar)
+        else { return false }
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        return !whitespace.contains(first) && !whitespace.contains(last)
+    }
+
+    /// One pass over the plot's UTF-8 answering both the byte length used by the
+    /// longest-cleaned-plot selection and whether `ProviderSynopsis.cleaned` would return the
+    /// text unchanged — letting callers skip the regex/NLP path for clean provider prose.
+    ///
+    /// `cleaned` returns its input unchanged exactly when the text is non-empty, has no
+    /// whitespace at either edge (`CharacterSet.whitespacesAndNewlines`), and
+    /// `needsNormalization` finds none of {double space, 0x09–0x0D, 0x85, 0x2028, 0x2029}.
+    /// Those scalars are matched on raw UTF-8: the encoding is self-synchronizing, so `0x20`,
+    /// `0x09`–`0x0D` can only be the ASCII scalars themselves and `C2 85`, `E2 80 A8`,
+    /// `E2 80 A9` only encode U+0085, U+2028, U+2029 — never bytes inside another character.
+    static func plotProfile(_ text: String) -> (bytes: Int, passthrough: Bool) {
+        guard let result = text.utf8.withContiguousStorageIfAvailable({ buffer in
+            let bytes = buffer.count
+            let passthrough = bytes > 0
+                && buffer.baseAddress.map { plotIsPassthrough($0, bytes) } == true
+            return (bytes, passthrough)
+        }) else {
+            // Non-contiguous storage: stay conservative and let `cleaned` decide.
+            return (text.utf8.count, false)
+        }
+        return result
+    }
+
     static func cleanGenres(_ genres: [String], cache: inout [[String]: [String]]) -> [String] {
         guard !genres.isEmpty else { return [] }
         if let cleaned = cache[genres] { return cleaned }
@@ -770,6 +988,7 @@ public enum CatalogBuilder {
     static func groupChannels(lists: [[Channel]], keys: [[String]], context: Context) async -> ChannelGroups {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return ChannelGroups() }
+        let phaseStart = ContinuousClock.now
         var groupIndex: [String: Int] = Dictionary(minimumCapacity: total)
         var groupKeys: [String] = []
         var members: [[Channel]] = []
@@ -799,7 +1018,9 @@ public enum CatalogBuilder {
                 if isAdult { adultFlags[group] = true }
             }
         }
+        BuildProfile.mark("channels group-loop", since: phaseStart)
 
+        let buildStart = ContinuousClock.now
         var groups: [ChannelGroup] = []
         groups.reserveCapacity(groupKeys.count)
         var numbers: [Int?] = []
@@ -838,8 +1059,10 @@ public enum CatalogBuilder {
             channelGroup.$logoURL = variants.lazy.compactMap(\.$logoURL).first
             groups.append(channelGroup)
         }
+        BuildProfile.mark("channels build groups", since: buildStart)
 
         // Sort: number asc (nil last), then name key.
+        let sortStart = ContinuousClock.now
         var order = Array(groups.indices)
         order.sort { lhs, rhs in
             let a = numbers[lhs], b = numbers[rhs]
@@ -850,6 +1073,8 @@ public enum CatalogBuilder {
             }
             return groupKeys[lhs] < groupKeys[rhs]
         }
+        BuildProfile.mark("channels sort", since: sortStart)
+        let indexStart = ContinuousClock.now
         var output = ChannelGroups()
         output.groups = order.map { groups[$0] }
         output.categoryIDs = order.map { categoryIDs[$0] }
@@ -859,6 +1084,7 @@ public enum CatalogBuilder {
             output.groupIndex[groupKeys[group]] = position
             for channel in members[group] { output.contentIndex[channel.id] = position }
         }
+        BuildProfile.mark("channels indexes", since: indexStart)
         return output
     }
 
@@ -871,6 +1097,7 @@ public enum CatalogBuilder {
     }
 
     static func categoryGroups(kind: MediaKind, context: Context, memberCategoryIDs: [Set<String>]) -> CategoryResult {
+        let start = ContinuousClock.now
         var output = CategoryResult()
         var groups: [CategoryGroup] = []
         var groupByKey: [String: Int] = [:]
@@ -930,6 +1157,7 @@ public enum CatalogBuilder {
             result.append(group)
         }
         output.groups = result
+        BuildProfile.mark("categoryGroups.\(kind.rawValue)", since: start)
         return output
     }
 
@@ -1031,4 +1259,62 @@ extension Series: GroupableMedia {
     var mediaVariant: MediaVariant { .series(self) }
     var posterText: String? { $posterURL }
     var backdropText: String? { $backdropURL }
+}
+
+/// PRISM_BUILD_PROFILE=1: wall-clock timings of each catalog-build phase, printed to stderr.
+enum BuildProfile {
+    static let enabled = ProcessInfo.processInfo.environment["PRISM_BUILD_PROFILE"] != nil
+
+    @inline(__always) static func mark(_ label: String, since start: ContinuousClock.Instant) {
+        guard enabled else { return }
+        let elapsed = ContinuousClock.now - start
+        let ms = Double(elapsed.components.seconds) * 1_000 + Double(elapsed.components.attoseconds) / 1e15
+        let line = String(format: "[profile] %@ %8.1f ms\n", label, ms)
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+}
+
+extension CatalogBuilder {
+    /// PRISM_CATALOG_DUMP=<path>: canonical text dump of the assembled catalog for byte-level
+    /// A/B verification of build changes (temporary instrumentation, not for production use).
+    static func dumpCatalogForVerification(_ catalog: Catalog, to path: String) {
+        func esc(_ value: String?) -> String { value.map { String(reflecting: $0) } ?? "∅" }
+        func esc(_ value: String) -> String { String(reflecting: value) }
+        var out = ""
+        out.reserveCapacity(1 << 26)
+        for title in catalog.movies + catalog.series {
+            out += "T\u{1F}\(title.id.rawValue)\u{1F}\(title.kind.rawValue)\u{1F}\(esc(title.title))\u{1F}\(title.year.map(String.init) ?? "∅")"
+            out += "\u{1F}\(esc(title.plot))\u{1F}\(title.genres.sorted().joined(separator: ","))"
+            out += "\u{1F}\(title.rating.map { String($0.bitPattern) } ?? "∅")\u{1F}\(title.addedAt?.timeIntervalSinceReferenceDate.description ?? "∅")"
+            out += "\u{1F}\(title.categoryIDs.sorted().joined(separator: ","))\u{1F}\(title.isAdult)"
+            out += "\u{1F}\(esc(title.posterURL?.absoluteString))\u{1F}\(esc(title.backdropURL?.absoluteString))\n"
+            for variant in title.variants {
+                let categoryID = variant.movie?.categoryID ?? variant.series?.categoryID
+                let tmdbID = variant.movie?.tmdbID ?? variant.series?.tmdbID
+                let plot = variant.movie?.plot ?? variant.series?.plot
+                out += "V\u{1F}\(variant.id.rawValue)\u{1F}\(variant.sourceID.rawValue)\u{1F}\(variant.quality.rawValue)"
+                out += "\u{1F}\(esc(variant.rawName))\u{1F}\(esc(variant.title))\u{1F}\(variant.tags.sorted().joined(separator: ","))"
+                out += "\u{1F}\(esc(categoryID))\u{1F}\(tmdbID.map(String.init) ?? "∅")\u{1F}\(esc(plot))\n"
+            }
+        }
+        for group in catalog.channels {
+            out += "C\u{1F}\(group.id)\u{1F}\(esc(group.name))\u{1F}\(group.number.map(String.init) ?? "∅")\u{1F}\(esc(group.epgID))"
+            out += "\u{1F}\(group.categoryIDs.sorted().joined(separator: ","))\u{1F}\(group.isAdult)\n"
+            for channel in group.variants {
+                out += "W\u{1F}\(channel.id.rawValue)\u{1F}\(channel.sourceID.rawValue)\u{1F}\(esc(channel.nativeID))"
+                out += "\u{1F}\(esc(channel.name))\u{1F}\(esc(channel.rawName))\u{1F}\(channel.number.map(String.init) ?? "∅")"
+                out += "\u{1F}\(esc(channel.categoryID))\u{1F}\(esc(channel.epgID))\n"
+            }
+        }
+        for kind in [MediaKind.live, .movie, .series] {
+            for group in catalog.categoryGroups(kind) {
+                out += "G\u{1F}\(group.id)\u{1F}\(esc(group.name))\u{1F}\(group.categoryIDs.joined(separator: ","))"
+                out += "\u{1F}\(group.itemCount)\u{1F}\(group.isAdult)\u{1F}\(group.sortIndex)\n"
+            }
+        }
+        for (key, languages) in catalog.indexes.providerLanguages.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+            out += "L\u{1F}\(key.rawValue)\u{1F}\(languages.sorted().joined(separator: ","))\n"
+        }
+        try? out.write(toFile: path, atomically: true, encoding: .utf8)
+    }
 }

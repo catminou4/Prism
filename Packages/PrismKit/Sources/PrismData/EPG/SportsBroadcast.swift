@@ -55,10 +55,20 @@ extension EPGGuide {
             if let cached = programsByID[id] {
                 sports = cached
             } else {
-                sports = programs(forEPGID: id, in: interval).compactMap { program in
-                    guard let sport = SportsScheduleMatcher.classify(program, memo: &classified) else { return nil }
-                    return (program, sport)
+                // Scan the channel's sorted list in place: `programs(forEPGID:in:)`
+                // would copy every programme of the 8-day window per channel first.
+                var matched: [(EPGProgram, BroadcastSport)] = []
+                if let list = programsByChannel[id], !list.isEmpty {
+                    var index = EPGGuide.firstIndex(in: list, endingAfter: interval.start)
+                    while index < list.count, list[index].start < interval.end {
+                        let program = list[index]
+                        if let sport = SportsScheduleMatcher.classify(program, memo: &classified) {
+                            matched.append((program, sport))
+                        }
+                        index += 1
+                    }
                 }
+                sports = matched
                 programsByID[id] = sports
             }
             for (program, sport) in sports {

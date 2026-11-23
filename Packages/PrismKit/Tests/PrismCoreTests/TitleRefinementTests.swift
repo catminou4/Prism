@@ -13,6 +13,8 @@ struct TitleRefinementTests {
         ("Black Panther(БГ Аудио)", "Black Panther"),
         ("Narcos SPANISH MULTI SUB", "Narcos"),
         ("Autumn At Apple Hill Hallmark", "Autumn At Apple Hill"),
+        ("The Movie HALLMARK", "The Movie"),
+        ("A Film hallmar\u{212A}", "A Film"),
         ("Une Présentation Spéciale Marvel Television : The Punisher : One Last Kill", "The Punisher : One Last Kill"),
         ("Taylor Swift | The Eras Tour | The End of an Era", "Taylor Swift – The Eras Tour – The End of an Era"),
         ("The Killing (2011-2014)", "The Killing"),
@@ -38,7 +40,7 @@ struct TitleRefinementTests {
         "RIPLEY", "M3GAN 2.0", "FUBAR", "Mission: Impossible – DEAD RECKONING", "Agents of S.H.I.E.L.D.",
         "Les Parfait(s) : Arnaques en Famille", "Star Wars: Episode IV – A New Hope", "Le Bureau des légendes",
         "The Lord of the Rings: The Rings of Power", "Halt and Catch Fire", "Me, Myself & Irene",
-        "Law & Order: SVU", "Hallmark", "Bon Cop, Bad Cop", "فيلم الجواهرجي",
+        "Law & Order: SVU", "Hallmark", "Movie HALLMARK", "Hallmark Movies", "Bon Cop, Bad Cop", "فيلم الجواهرجي",
     ])
     func keeps(title: String) {
         #expect(TitleRefinement.refine(title) == title)

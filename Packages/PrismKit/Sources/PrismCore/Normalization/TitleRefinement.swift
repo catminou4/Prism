@@ -62,7 +62,7 @@ public enum TitleRefinement {
             return true
         }
         if let space = title.lastIndex(of: " "), releaseCodes.contains(String(title[title.index(after: space)...])) { return true }
-        return title.range(of: "hallmark", options: [.caseInsensitive, .backwards, .anchored]) != nil
+        return hallmarkSuffix(title) != nil
     }
 
     // MARK: Prefixes and punctuation
@@ -236,8 +236,40 @@ public enum TitleRefinement {
         return text
     }
 
+    /// Range of a trailing `hallmark`, matched case-insensitively exactly like the NSString
+    /// search it replaces. Catalog loads run this gate on every movie and series title, where
+    /// the bridged search costs microseconds each; the last eight UTF-8 bytes decide it in tens
+    /// of nanoseconds whenever they are ASCII (the common case). Anything else — a non-ASCII
+    /// ending such as `K`, or a title too short to hold the word — falls back to the original
+    /// search (or fails outright when fewer than eight UTF-16 units exist), so Unicode case
+    /// folding is preserved bit for bit.
+    private static let hallmarkUTF8 = Array("hallmark".utf8)
+
+    private static func hallmarkSuffix(_ text: String) -> Range<String.Index>? {
+        let bytes = text.utf8
+        // "hallmark" needs eight UTF-16 code units and UTF-8 never uses fewer bytes than units.
+        guard bytes.count >= hallmarkUTF8.count else { return nil }
+        var byteIndex = bytes.index(bytes.endIndex, offsetBy: -hallmarkUTF8.count)
+        var allASCII = true
+        for _ in hallmarkUTF8 {
+            if bytes[byteIndex] >= 0x80 { allASCII = false; break }
+            byteIndex = bytes.index(after: byteIndex)
+        }
+        guard allASCII else {
+            return text.range(of: "hallmark", options: [.caseInsensitive, .backwards, .anchored])
+        }
+        byteIndex = bytes.index(bytes.endIndex, offsetBy: -hallmarkUTF8.count)
+        for expected in hallmarkUTF8 {
+            var byte = bytes[byteIndex]
+            if byte >= 0x41, byte <= 0x5A { byte += 0x20 }  // ASCII upper → lower
+            guard byte == expected else { return nil }
+            byteIndex = bytes.index(after: byteIndex)
+        }
+        return text.index(text.endIndex, offsetBy: -hallmarkUTF8.count)..<text.endIndex
+    }
+
     private static func stripTrailingBrand(_ text: String) -> String {
-        guard let range = text.range(of: "hallmark", options: [.caseInsensitive, .backwards, .anchored]),
+        guard let range = hallmarkSuffix(text),
               range.lowerBound > text.startIndex, text[text.index(before: range.lowerBound)] == " " else { return text }
         let head = text[..<range.lowerBound].trimmingCharacters(in: .whitespaces)
         return head.split(separator: " ").count >= 2 ? head : text

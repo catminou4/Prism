@@ -84,7 +84,7 @@ struct BoundedCachesTests {
     }
 
     @MainActor
-    @Test func loadedLibraryCollectionsAreCapped() throws {
+    @Test func loadedLibraryCollectionsAreCapped() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
         var file = LibraryFile(
@@ -101,13 +101,14 @@ struct BoundedCachesTests {
         try encoder.encode(file).write(to: directories.libraryFile)
 
         let store = LibraryStore(directories: directories)
+        await store.awaitDiskLoad()
         #expect(store.watchlist.count == LibraryStore.maxWatchlist)
         #expect(store.favoriteChannels.count == LibraryStore.maxFavoriteChannels)
         #expect(store.watched.count == LibraryStore.maxWatched)
     }
 
     @MainActor
-    @Test func loadedLibraryCollectionsKeepDeterministicSubsets() throws {
+    @Test func loadedLibraryCollectionsKeepDeterministicSubsets() async throws {
         // `apply(_:)` caps every collection: arrays keep their file-order prefix,
         // watched keeps the entries with the freshest progress then smallest ids.
         let directories = AppDirectories.temporary()
@@ -144,6 +145,7 @@ struct BoundedCachesTests {
         try encoder.encode(file).write(to: directories.libraryFile)
 
         let store = LibraryStore(directories: directories)
+        await store.awaitDiskLoad()
         #expect(store.watchlist == Array(file.watchlist.prefix(LibraryStore.maxWatchlist)))
         #expect(store.dismissed == Array(file.dismissed.prefix(LibraryStore.maxDismissed)))
         #expect(store.favoriteChannels == Array(file.favoriteChannels.prefix(LibraryStore.maxFavoriteChannels)))

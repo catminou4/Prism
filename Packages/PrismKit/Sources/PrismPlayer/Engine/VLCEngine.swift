@@ -59,16 +59,23 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var volumeValue: Float = 1
     private var mutedValue = false
     private var isStopped = false
+    /// Minimum interval between libvlc geometry applies driven by view resizes.
+    private let geometryInterval: Duration
+    private var lastGeometryApply: ContinuousClock.Instant?
+    private var pendingGeometryApply: Task<Void, Never>?
+    /// Test seam: how many times the libvlc geometry was (re)applied.
+    private(set) var geometryApplyCount = 0
 
-    init(configuration: EngineConfiguration) {
+    init(configuration: EngineConfiguration, geometryInterval: Duration = .milliseconds(100)) {
         self.configuration = configuration
+        self.geometryInterval = geometryInterval
         self.subtitleStyle = configuration.subtitleStyle
         self.player = VLCMediaPlayer()
         super.init()
         player.drawable = drawable
         delegateProxy.owner = self
         player.delegate = delegateProxy
-        drawable.onResize = { [weak self] _ in self?.applyGeometry() }
+        drawable.onResize = { [weak self] _ in self?.scheduleGeometry() }
     }
 
     isolated deinit {
@@ -98,6 +105,9 @@ final class VLCEngine: NSObject, PlaybackEngine {
         codecProbeCount = 0
         bufferingCheck?.cancel()
         bufferingCheck = nil
+        pendingGeometryApply?.cancel()
+        pendingGeometryApply = nil
+        lastGeometryApply = nil
         isStopped = false
 
         let media = VLCMedia(url: url)
@@ -178,6 +188,8 @@ final class VLCEngine: NSObject, PlaybackEngine {
         isStopped = true
         wantsPlay = false
         bufferingCheck?.cancel()
+        pendingGeometryApply?.cancel()
+        pendingGeometryApply = nil
         player.delegate = nil
         delegateProxy.owner = nil
         eventHandler = nil
@@ -249,8 +261,30 @@ final class VLCEngine: NSObject, PlaybackEngine {
 
     // MARK: - Geometry
 
+    /// Coalesces resize-driven geometry updates: `layout()` fires per frame during a
+    /// window drag (up to 120 Hz) and every apply crosses libvlc locks with up to three
+    /// `var_Set` calls. Applies land at most every `geometryInterval`, plus one trailing
+    /// update carrying the latest bounds once the resize settles into the interval.
+    private func scheduleGeometry() {
+        let now = ContinuousClock.now
+        if let last = lastGeometryApply, now - last < geometryInterval {
+            guard pendingGeometryApply == nil else { return }
+            let remaining = geometryInterval - (now - last)
+            pendingGeometryApply = Task { [weak self] in
+                try? await Task.sleep(for: remaining)
+                guard !Task.isCancelled, let self else { return }
+                self.pendingGeometryApply = nil
+                self.applyGeometry()
+            }
+            return
+        }
+        applyGeometry()
+    }
+
     /// fit = source/forced aspect; fill = crop to the view ratio; stretch = force the view ratio.
     private func applyGeometry() {
+        lastGeometryApply = ContinuousClock.now
+        geometryApplyCount += 1
         let size = drawable.bounds.size
         let viewRatio = Self.ratioString(for: size)
         switch videoGravity {

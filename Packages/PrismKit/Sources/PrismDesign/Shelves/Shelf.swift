@@ -198,9 +198,17 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .padding(.top, -Self.liftInset.top)
         .padding(.bottom, -Self.liftInset.bottom)
         .prismCardWidth(itemWidth)
-        .overlay(alignment: .leading) { chevron(.leading) }
-        .overlay(alignment: .trailing) { chevron(.trailing) }
-        .animation(PrismMotion.quickFade, value: scrollAvailability)
+        // One overlay hosts both chevrons so `.animation(value:)` scopes to them alone —
+        // on the row it propagated an animation attribute into every card's subtree each
+        // time a shelf materialized (~8 cards × ~30 nodes of wasted attribute writes).
+        .overlay {
+            HStack(spacing: 0) {
+                chevron(.leading)
+                Spacer(minLength: 0)
+                chevron(.trailing)
+            }
+            .animation(PrismMotion.quickFade, value: scrollAvailability)
+        }
         .onHover { inside in
             guard !isScrollingContent else { return }
             withAnimation(PrismMotion.quickFade) { hovering = inside }

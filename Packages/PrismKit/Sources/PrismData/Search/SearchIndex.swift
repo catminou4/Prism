@@ -345,7 +345,7 @@ public final class SearchIndex: Sendable {
             normalizedQuery.append(contentsOf: token)
         }
 
-        var top = [TopK](repeating: TopK(limit: limit), count: 3)
+        var top = [TopK(limit: limit), TopK(limit: limit), TopK(limit: limit)]
         withRaw { raw in
             let found = prefixSearch(raw, tokens: tokens, query: normalizedQuery, top: &top)
             if !found { substringSearch(raw, tokens: tokens, top: &top) }
@@ -422,14 +422,21 @@ public final class SearchIndex: Sendable {
             if range.lower >= range.upper { return false }
             ranges.append((Int32(range.lower), Int32(range.upper)))
         }
-        // Drive with the token that has the smallest posting volume.
+        // Drive with the token that has the smallest posting volume; check the remaining
+        // tokens rarest-first so non-matching candidates bail out after the fewest scans.
         var driver = 0
         var smallest = Int.max
+        var volumes = [Int](repeating: 0, count: ranges.count)
         for (index, range) in ranges.enumerated() {
             let volume = Int(raw.postingOffsets[Int(range.upper)] - raw.postingOffsets[Int(range.lower)])
+            volumes[index] = volume
             if volume < smallest { smallest = volume; driver = index }
         }
-        let others = ranges.enumerated().filter { $0.offset != driver }.map(\.element)
+        let others = ranges.enumerated()
+            .filter { $0.offset != driver }
+            .map { (volume: volumes[$0.offset], range: $0.element) }
+            .sorted { $0.volume < $1.volume }
+            .map(\.range)
         let driverRange = ranges[driver]
         let needsDedupe = driverRange.upper - driverRange.lower > 1
 
@@ -438,6 +445,9 @@ public final class SearchIndex: Sendable {
         defer { seen.deallocate() }
 
         var found = false
+        // Single-token queries (the common typing path) have no `others` to satisfy:
+        // skip the per-entry word scan entirely.
+        let needsWordCheck = !others.isEmpty
         query.withUnsafeBufferPointer { q in
             for rank in Int(driverRange.lower)..<Int(driverRange.upper) {
                 for position in Int(raw.postingOffsets[rank])..<Int(raw.postingOffsets[rank + 1]) {
@@ -446,21 +456,26 @@ public final class SearchIndex: Sendable {
                         if seen[entry] != 0 { continue }
                         seen[entry] = 1
                     }
-                    let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
-                    var matchesAll = true
-                    for range in others {
-                        var hit = false
-                        for w in w0..<w1 {
-                            let r = raw.entryWords[w]
-                            if r >= range.lower && r < range.upper { hit = true; break }
+                    if needsWordCheck {
+                        let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
+                        var matchesAll = true
+                        for range in others {
+                            var hit = false
+                            for w in w0..<w1 {
+                                let r = raw.entryWords[w]
+                                if r >= range.lower && r < range.upper { hit = true; break }
+                            }
+                            if !hit { matchesAll = false; break }
                         }
-                        if !hit { matchesAll = false; break }
+                        guard matchesAll else { continue }
                     }
-                    guard matchesAll else { continue }
                     found = true
                     let n0 = Int(raw.nameOffsets[entry]), n1 = Int(raw.nameOffsets[entry + 1])
                     var tier: UInt64 = 1
-                    if n1 - n0 >= q.count, compareBytes(raw.nameBytes, n0, q.count, q, 0, q.count) == 0 {
+                    // First-byte prefilter: nearly every candidate fails the name-prefix
+                    // check on byte 0, so `memcmp` only runs on the few survivors.
+                    if n1 - n0 >= q.count, raw.nameBytes[n0] == q[0],
+                       compareBytes(raw.nameBytes, n0, q.count, q, 0, q.count) == 0 {
                         tier = n1 - n0 == q.count ? 3 : 2
                     }
                     let score = tier << 60 | raw.baseScores[entry]
@@ -485,11 +500,13 @@ public final class SearchIndex: Sendable {
             maps.append(map)
             var volume = 0
             token.withUnsafeBufferPointer { t in
-                // First-byte prefilter: a word can only contain the token if it contains the
-                // token's first byte, so words lacking that byte class are skipped outright.
-                let needed = UInt64(1) << (t[0] & 63)
+                // Necessary condition for containment: the word's byte-class mask must cover
+                // every byte class the token uses, so words missing any class are skipped
+                // outright without calling `memmem`.
+                var needed: UInt64 = 0
+                for byte in t { needed |= UInt64(1) << (byte & 63) }
                 for rank in 0..<wordCount {
-                    guard raw.wordMasks[rank] & needed != 0 else { continue }
+                    guard raw.wordMasks[rank] & needed == needed else { continue }
                     let w0 = Int(raw.wordOffsets[rank]), w1 = Int(raw.wordOffsets[rank + 1])
                     if containsBytes(raw.wordBytes, w0, w1 - w0, t) {
                         map[rank] = 1
@@ -507,11 +524,17 @@ public final class SearchIndex: Sendable {
         seen.initialize(repeating: 0)
         defer { seen.deallocate() }
         let driverMap = maps[driver]
+        // Single-token queries have no other token to satisfy.
+        let needsWordCheck = maps.count > 1
         for rank in 0..<wordCount where driverMap[rank] != 0 {
             for position in Int(raw.postingOffsets[rank])..<Int(raw.postingOffsets[rank + 1]) {
                 let entry = Int(raw.postings[position])
                 if seen[entry] != 0 { continue }
                 seen[entry] = 1
+                guard needsWordCheck else {
+                    top[kind(of: entry)].offer(score: raw.baseScores[entry], entry: Int32(entry))
+                    continue
+                }
                 let w0 = Int(raw.entryWordOffsets[entry]), w1 = Int(raw.entryWordOffsets[entry + 1])
                 var matchesAll = true
                 for (index, map) in maps.enumerated() where index != driver {

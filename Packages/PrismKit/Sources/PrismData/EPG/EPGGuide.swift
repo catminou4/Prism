@@ -166,18 +166,36 @@ public struct EPGGuide: Sendable {
     }
 
     private func epgID(named name: String) -> String? {
-        let cleaned = TitleNormalizer.normalize(name).key
-        if let id = nameIndex[cleaned] { return id }
-        return nameIndex[TitleNormalizer.key(name)]
+        // Same lookup order as before (cleaned key, then plain key); `nameKeys`
+        // returns them in that order and skips empties that could never match.
+        for key in Self.nameKeys(name) {
+            if let id = nameIndex[key] { return id }
+        }
+        return nil
     }
 
     /// Sorted by start; drops empty/duplicate programmes and trims overlaps (earlier programme ends
     /// when the next one starts).
+    /// XMLTV feeds emit programmes in time order, so per-channel lists usually arrive already
+    /// sorted: an O(n) check skips the stable re-sort (and its tuple allocations) in the common
+    /// case. An unsorted list takes the exact same stable-sort path as before.
     static func normalize(_ programs: [EPGProgram]) -> [EPGProgram] {
-        let sorted = programs.enumerated().sorted {
-            $0.element.start != $1.element.start ? $0.element.start < $1.element.start : $0.offset < $1.offset
+        var needsSort = false
+        if programs.count > 1 {
+            for index in programs.indices.dropFirst() where programs[index].start < programs[index - 1].start {
+                needsSort = true
+                break
+            }
         }
-        return clean(sorted.map(\.element))
+        let sorted: [EPGProgram]
+        if needsSort {
+            sorted = programs.enumerated().sorted {
+                $0.element.start != $1.element.start ? $0.element.start < $1.element.start : $0.offset < $1.offset
+            }.map(\.element)
+        } else {
+            sorted = programs
+        }
+        return clean(sorted)
     }
 
     /// Stable merge of two lists sorted by start (`first` wins ties).
@@ -224,12 +242,24 @@ public struct EPGGuide: Sendable {
         return low
     }
 
+    /// `TitleNormalizer.normalize` costs ~20× `key` per name, and every guide build or
+    /// merge re-derives the keys of the same channel display names. Memoize the folded
+    /// keys process-wide; past `nameKeysMemoLimit` entries the table resets and re-warms
+    /// (names are sticky per session, so resets are rare).
+    private static let nameKeysMemo = Mutex<[String: [String]]>([:])
+    private static let nameKeysMemoLimit = 262_144
+
     static func nameKeys(_ name: String) -> [String] {
+        if let known = nameKeysMemo.withLock({ $0[name] }) { return known }
         let plain = TitleNormalizer.key(name)
         let cleaned = TitleNormalizer.normalize(name).key
         var keys: [String] = []
         if !cleaned.isEmpty { keys.append(cleaned) }
         if !plain.isEmpty, plain != cleaned { keys.append(plain) }
+        nameKeysMemo.withLock { memo in
+            if memo.count >= nameKeysMemoLimit { memo.removeAll() }
+            memo[name] = keys
+        }
         return keys
     }
 
@@ -245,20 +275,76 @@ public struct EPGGuide: Sendable {
     }
 
     private static func makeNameIndex(programsByChannel: [String: [EPGProgram]], channelsByID: [String: XMLTVChannel]) -> [String: String] {
-        var index: [String: String] = [:]
         // Deterministic: visit channel ids in sorted order, display names before ids.
         let ids = programsByChannel.keys.sorted()
-        for id in ids {
-            guard let channel = channelsByID[id] else { continue }
-            for name in channel.displayNames {
-                for key in nameKeys(name) where index[key] == nil { index[key] = id }
-            }
+        var index = nameIndexPass(ids: ids) { id in
+            channelsByID[id]?.displayNames ?? []
         }
-        for id in ids {
+        // Second pass fills the keys still missing with the stripped channel id.
+        // `index` is pre-seeded so display-name keys keep precedence, exactly like
+        // the serial two-loop version.
+        index = nameIndexPass(ids: ids, into: index) { id in
             let original = channelsByID[id]?.id ?? programsByChannel[id]?.first?.channelID ?? id
-            for key in nameKeys(strippedChannelID(original)) where index[key] == nil { index[key] = id }
+            return [strippedChannelID(original)]
         }
         return index
+    }
+
+    /// One ordered pass of `makeNameIndex`: for each channel id (already sorted), every
+    /// folded key of `names(id)` is claimed by the first channel that produces it.
+    /// Large guides fold ~100k+ names (~20µs each on a cold `nameKeys` memo), so the
+    /// pass runs on contiguous id partitions in parallel; partial indexes merge back
+    /// in partition order, which preserves the serial "smallest id wins" rule exactly.
+    /// `into` seeds keys that must keep precedence over this pass's claims.
+    private static func nameIndexPass(
+        ids: [String],
+        into existing: [String: String] = [:],
+        names: @Sendable (String) -> [String]
+    ) -> [String: String] {
+        guard !ids.isEmpty else { return existing }
+        // Below this size the serial loop beats the partition/merge overhead.
+        guard ids.count >= 8_192 else {
+            var index = existing
+            index.reserveCapacity(existing.count + ids.count * 2)
+            collectNameKeys(ids: ids[...], names: names, into: &index)
+            return index
+        }
+        // ~4k ids per partition, capped at 8 workers: enough parallelism for cold
+        // name folds without tiny slices paying merge overhead.
+        let partitions = min(8, (ids.count + 4_095) / 4_096)
+        let bounds = (0...partitions).map { $0 * ids.count / partitions }
+        let partials = Mutex<[Int: [String: String]]>([:])
+        DispatchQueue.concurrentPerform(iterations: partitions) { partition in
+            var local: [String: String] = [:]
+            local.reserveCapacity(ids.count / partitions * 2)
+            collectNameKeys(ids: ids[bounds[partition]..<bounds[partition + 1]], names: names, into: &local)
+            partials.withLock { $0[partition] = local }
+        }
+        var index = existing
+        index.reserveCapacity(existing.count + ids.count * 2)
+        for partition in 0..<partitions {
+            guard let local = partials.withLock({ $0[partition] }) else { continue }
+            for (key, id) in local where index[key] == nil {
+                index[key] = id
+            }
+        }
+        return index
+    }
+
+    /// Serial core of `nameIndexPass`: claims each folded name key for the first id
+    /// (in iteration order) that produces it.
+    private static func collectNameKeys(
+        ids: ArraySlice<String>,
+        names: @Sendable (String) -> [String],
+        into index: inout [String: String]
+    ) {
+        for id in ids {
+            for name in names(id) {
+                for key in nameKeys(name) where index[key] == nil {
+                    index[key] = id
+                }
+            }
+        }
     }
 }
 

@@ -81,13 +81,15 @@ enum SegmentedArchive {
         }
     }
 
-    /// Expands at most four chunks at a time, then appends them in archive order.
+    /// Expands chunks a few at a time, then appends them in archive order. JSON decoding is
+    /// CPU-bound and single-threaded per chunk, so the batch tracks the core count (capped):
+    /// 39 catalog segments at 4-wide left most cores idle during the ~2 s decode.
     static func decodeChunks<Chunk: Sendable, Result>(
         _ segments: ArraySlice<Segment>, into initial: Result,
         decode: @escaping @Sendable (Segment) -> Chunk?, append: (inout Result, Chunk) -> Void
     ) async -> Result? {
         var result = initial
-        let batchSize = 4
+        let batchSize = min(max(4, ProcessInfo.processInfo.activeProcessorCount), 10)
         for lower in stride(from: segments.startIndex, to: segments.endIndex, by: batchSize) {
             guard !Task.isCancelled else { return nil }
             let batch = segments[lower..<min(lower + batchSize, segments.endIndex)]

@@ -309,6 +309,10 @@ public final class AppModel {
         didBootstrap = true
         sources = sourceStore.load()
         isMetadataEnabled = await metadataRepository.isEnabled
+        // `library.json` is decoded off the main actor since `init`: await it on every
+        // path (onboarding included) so no caller can mutate the store while the disk
+        // snapshot is still in flight — a pre-load mutation would otherwise discard it.
+        await library.awaitDiskLoad()
         guard !sources.isEmpty else {
             phase = .onboarding
             return
@@ -322,6 +326,8 @@ public final class AppModel {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
         }
+        // The library decode was already awaited above; `rebuildCatalog` → `publish` →
+        // `reconcileTitles` therefore sees the real collections, not empty ones.
         await rebuildCatalog()
         phase = .ready
         guide = await cachedGuide
@@ -523,7 +529,19 @@ public final class AppModel {
                 staleSources.append(source.id)
             }
         }
-        for id in staleSources { await refreshGuide(for: id) }
+        // Le téléchargement XMLTV domine : les chevaucher par paquets de
+        // `maxConcurrentImports` (comme les imports) au lieu de les sérialiser —
+        // le bootstrap n'attend plus la somme des guides mais ~le plus lent.
+        // `refreshGuide(for:)` déduplique déjà les sources et `currentGuide`
+        // republie une fusion valide à chaque fin, quel que soit l'ordre.
+        for start in stride(from: 0, to: staleSources.count, by: Self.maxConcurrentImports) {
+            let chunk = staleSources[start..<min(start + Self.maxConcurrentImports, staleSources.count)]
+            await withTaskGroup(of: Void.self) { group in
+                for id in chunk {
+                    group.addTask { _ = await self.refreshGuide(for: id) }
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -668,6 +686,11 @@ public final class AppModel {
 
     /// Publish the merged catalog as soon as browsing is possible. Search indexes that snapshot separately.
     private func rebuildCatalog(includingSearch: Bool = false) async {
+        // Every publish path funnels here (bootstrap, imports, removals, onboarding
+        // restart, preference rebuilds): make sure the async `library.json` decode
+        // landed first so `reconcileTitles` and any early mutation see real state.
+        // Idempotent — instant once the load task has completed.
+        await library.awaitDiskLoad()
         rebuildGeneration &+= 1
         catalogTask?.cancel()
         searchTask?.cancel()

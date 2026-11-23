@@ -85,13 +85,23 @@ public final class LibraryStore {
     @ObservationIgnored private let fileURL: URL?
     @ObservationIgnored private let saveDelay: Duration
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    /// Disk decode started in `init`, finishing off the main actor; `nil` for
+    /// in-memory stores. Tests await it before asserting persisted state.
+    @ObservationIgnored private(set) var loadTask: Task<Void, Never>?
+    /// `true` once a mutator diverged the in-memory state from the file (every
+    /// mutation path goes through `scheduleSave`). Guards the asynchronous disk
+    /// apply: a change landing before the decode finishes wins over `library.json`.
+    @ObservationIgnored private var hasLocalChanges = false
     /// Number of disk writes performed (tests).
     @ObservationIgnored private(set) var saveCount = 0
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private let writer = LibraryWriter()
     @ObservationIgnored private var latestByTitle: [TitleID: PlaybackProgress]?
 
-    /// Loads `library.json` synchronously (small file).
+    /// Loads `library.json` off the main actor (a few MB at the collection caps
+    /// would otherwise decode synchronously inside `AppModel.init`, on the first
+    /// frame's critical path). The launch/onboarding phases never read the
+    /// library, so nothing observes the briefly-empty state.
     public convenience init(directories: AppDirectories, saveDelay: Duration = .milliseconds(1_500)) {
         self.init(fileURL: directories.libraryFile, saveDelay: saveDelay)
     }
@@ -99,18 +109,36 @@ public final class LibraryStore {
     init(fileURL: URL?, saveDelay: Duration) {
         self.fileURL = fileURL
         self.saveDelay = saveDelay
-        if let fileURL, let data = try? Data(contentsOf: fileURL) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let file = try? decoder.decode(LibraryFile.self, from: data) {
-                apply(file)
+        self.loadTask = nil
+        if let fileURL {
+            loadTask = Task { [weak self] in
+                guard let file = await Self.decode(fileURL), let self,
+                      !Task.isCancelled, !self.hasLocalChanges else { return }
+                self.apply(file)
             }
         }
+    }
+
+    /// Reads and decodes `library.json` on a worker: JSON decoding a multi-MB
+    /// file on the main actor stalls first-frame work.
+    nonisolated private static func decode(_ url: URL) async -> LibraryFile? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(LibraryFile.self, from: data)
     }
 
     /// Non-persistent store for previews and tests.
     public static func inMemory() -> LibraryStore {
         LibraryStore(fileURL: nil, saveDelay: .zero)
+    }
+
+    /// Resolves once the background `library.json` decode has been applied — or
+    /// skipped because the store was mutated first. Instant for in-memory stores
+    /// and once the file is loaded; `AppModel.bootstrap` awaits it so the first
+    /// catalogue publish reconciles the real collections, not empty ones.
+    public func awaitDiskLoad() async {
+        await loadTask?.value
     }
 
     // MARK: - Watchlist
@@ -448,9 +476,16 @@ public final class LibraryStore {
 
     /// Writes immediately (call on app termination).
     public func flush() {
+        // A pending disk decode must not land after this write (it would replace
+        // the flushed state in memory); an unchanged store already matches the
+        // file, so quitting without mutations skips the encode entirely — unless
+        // the file vanished or was corrupted externally mid-session.
+        loadTask?.cancel()
+        loadTask = nil
         saveTask?.cancel()
         saveTask = nil
-        guard let fileURL else { return }
+        guard let fileURL,
+              hasLocalChanges || !FileManager.default.fileExists(atPath: fileURL.path) else { return }
         generation += 1
         let makeFile = snapshot()
         writer.writeNow(makeFile(), generation: generation, to: fileURL)
@@ -458,6 +493,7 @@ public final class LibraryStore {
     }
 
     private func scheduleSave() {
+        hasLocalChanges = true
         guard fileURL != nil else { return }
         saveTask?.cancel()
         let delay = saveDelay
@@ -495,15 +531,23 @@ public final class LibraryStore {
         watched = Set(ordered.prefix(Self.maxWatched))
     }
 
+    /// Capture the current collections here. Encoding and the write run off the
+    /// main actor; the large set/dictionary collections are written unsorted —
+    /// `apply(_:)` rebuilds them by key, so file order carries no meaning and
+    /// sorting ~30k ids per save (and synchronously in `flush()`) was wasted work.
+    /// The small preferred-variant maps stay sorted (see below).
     private func snapshot() -> @Sendable () -> LibraryFile {
         { [watchlist, favoriteChannels, progress, watched, history, preferredVariants,
            preferredChannelVariants, storedLastChannelGroupID, dismissed] in
             LibraryFile(
                 watchlist: watchlist,
                 favoriteChannels: favoriteChannels,
-                progress: progress.values.sorted { $0.contentID < $1.contentID },
-                watched: watched.sorted(),
+                progress: Array(progress.values),
+                watched: Array(watched),
                 history: history,
+                // These two stay sorted: `apply` keeps a capped prefix in file order, so an
+                // unsorted write would make which entries survive nondeterministic. They are
+                // small user-driven picks — sorting costs nothing next to `progress`/`watched`.
                 preferredVariants: preferredVariants.map { .init(key: $0.key.rawValue, contentID: $0.value) }.sorted { $0.key < $1.key },
                 preferredChannelVariants: preferredChannelVariants.map { .init(key: $0.key, contentID: $0.value) }.sorted { $0.key < $1.key },
                 lastChannelGroupID: storedLastChannelGroupID,

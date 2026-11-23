@@ -21,10 +21,19 @@ public struct PersonCircle: View {
     public var body: some View {
         CardContainer(accessibilityLabel: accessibilityText, action: action, menu: { EmptyView() }) { _ in
             VStack(spacing: 10) {
-                RemoteImage(
-                    url: imageURL, size: CGSize(width: diameter, height: diameter), placeholderSeed: name,
-                    placeholderTitle: name, placeholderStyle: .monogram
-                )
+                Group {
+                    if let imageURL {
+                        RemoteImage(
+                            url: imageURL, size: CGSize(width: diameter, height: diameter), placeholderSeed: name,
+                            placeholderTitle: name, placeholderStyle: .monogram
+                        )
+                    } else {
+                        // Same tree as RemoteImage's nil-URL path, minus the loader node
+                        // and the no-op clip (the placeholder fills its frame exactly).
+                        PlaceholderArtwork(seed: name, title: name, style: .monogram)
+                            .frame(width: diameter, height: diameter)
+                    }
+                }
                 .clipShape(.circle)
                 .overlay { Circle().strokeBorder(.primary.opacity(0.06), lineWidth: 1) }
                 VStack(spacing: 2) {

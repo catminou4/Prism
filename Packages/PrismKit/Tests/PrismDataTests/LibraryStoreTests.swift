@@ -36,7 +36,9 @@ struct LibraryStoreTests {
         #expect(!store.isInWatchlist(a))
         #expect(store.isDismissed(b))
         store.flush()
-        #expect(LibraryStore(directories: directories).dismissed == [b, a])
+        let reloaded = LibraryStore(directories: directories)
+        await reloaded.awaitDiskLoad()
+        #expect(reloaded.dismissed == [b, a])
         store.undismiss(a)
         #expect(store.dismissed == [b])
         store.clearDismissed()
@@ -139,6 +141,7 @@ struct LibraryStoreTests {
         #expect(store.saveCount == 1, "a burst of mutations produces a single write")
 
         let reloaded = LibraryStore(directories: directories)
+        await reloaded.awaitDiskLoad()
         #expect(reloaded.progress(for: movie)?.position == 100)
         #expect(reloaded.watchlist == [title])
         #expect(reloaded.favoriteChannels == ["tf1"])
@@ -150,19 +153,41 @@ struct LibraryStoreTests {
         store.updateProgress(PlaybackProgress(contentID: movie, titleID: title, position: 200, duration: 1_000))
         store.flush()
         #expect(store.saveCount == 2)
-        #expect(LibraryStore(directories: directories).progress(for: movie)?.position == 200)
+        let flushed = LibraryStore(directories: directories)
+        await flushed.awaitDiskLoad()
+        #expect(flushed.progress(for: movie)?.position == 200)
         try await Task.sleep(for: .milliseconds(300))
         #expect(store.saveCount == 2, "flush cancels the pending debounced write")
     }
 
-    @Test func corruptLibraryFileStartsEmpty() throws {
+    @Test func corruptLibraryFileStartsEmpty() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
         try Data("{\"watchlist\": 12}".utf8).write(to: directories.libraryFile)
         let store = LibraryStore(directories: directories)
+        await store.awaitDiskLoad()
         #expect(store.watchlist.isEmpty)
         try Data("not json".utf8).write(to: directories.libraryFile)
-        #expect(LibraryStore(directories: directories).progress.isEmpty)
+        let second = LibraryStore(directories: directories)
+        await second.awaitDiskLoad()
+        #expect(second.progress.isEmpty)
+    }
+
+    /// The disk decode lands on the main actor after `init`: a mutation made before
+    /// it finishes must win over the file, otherwise `apply` would silently drop it.
+    @Test func mutationBeforeDiskLoadWins() async throws {
+        let directories = AppDirectories.temporary()
+        defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }
+        let onDisk = TitleID(rawValue: "movie:disk:"), local = TitleID(rawValue: "movie:local:")
+        let populated = LibraryStore(directories: directories)
+        await populated.awaitDiskLoad()
+        populated.addToWatchlist(onDisk)
+        populated.flush()
+
+        let store = LibraryStore(directories: directories)
+        store.addToWatchlist(local)
+        await store.awaitDiskLoad()
+        #expect(store.watchlist == [local], "a pre-load mutation discards the disk snapshot")
     }
 
     @Test func continueWatchingOrderingAndNextEpisode() async throws {

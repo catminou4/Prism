@@ -55,6 +55,9 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     private var lastPresentationSize: CGSize = .zero
     private var videoCodec: String?
     private var audioCodec: String?
+    /// `seekableTimeRanges` bridges an NSArray per call and the controller polls it
+    /// at ~4 Hz for live streams; ~1 s of staleness is invisible on a DVR window.
+    private var seekableRangeCache: (range: ClosedRange<TimeInterval>?, at: ContinuousClock.Instant)?
 
     private var pipController: AVPictureInPictureController?
     private var pipObservation: NSKeyValueObservation?
@@ -189,11 +192,18 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     }
 
     var seekableRange: ClosedRange<TimeInterval>? {
-        guard let range = currentItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
-        let start = range.start.seconds
-        let end = range.end.seconds
-        guard start.isFinite, end.isFinite, end > start else { return nil }
-        return start...end
+        let now = ContinuousClock.now
+        if let cache = seekableRangeCache, now - cache.at < .seconds(1) { return cache.range }
+        let range: ClosedRange<TimeInterval>?
+        if let value = currentItem?.seekableTimeRanges.last?.timeRangeValue {
+            let start = value.start.seconds
+            let end = value.end.seconds
+            range = start.isFinite && end.isFinite && end > start ? start...end : nil
+        } else {
+            range = nil
+        }
+        seekableRangeCache = (range, now)
+        return range
     }
 
     // MARK: - Tracks
@@ -552,6 +562,7 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
         videoCodec = nil
         audioCodec = nil
         lastPresentationSize = .zero
+        seekableRangeCache = nil
         currentItem = nil
     }
 

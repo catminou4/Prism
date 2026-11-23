@@ -95,6 +95,42 @@ struct EPGGuideTests {
         #expect(EPGGuide.empty.resolveEPGID(for: withID) == nil)
     }
 
+    @Test func nameIndexParallelOrdering() {
+        // > 8 192 channels with programmes makes `makeNameIndex` take the partitioned
+        // path. Contested keys must still resolve exactly like the serial version:
+        // smallest channel id wins, display names before stripped ids.
+        var programs: [EPGProgram] = []
+        var channels: [XMLTVChannel] = []
+        func add(_ id: String, names: [String] = []) {
+            programs.append(F.program(id, 0, 60))
+            channels.append(XMLTVChannel(id: id, displayNames: names))
+        }
+        // "aa-…" sorts before every filler, "zz-…" after them: the two claimants of
+        // "Shared Contest" land in different partitions.
+        add("zz-contest.example", names: ["Shared Contest"])
+        for index in 0..<8_600 {
+            add(String(format: "ch%05d.example", index), names: ["Filler \(index)"])
+        }
+        add("aa-contest.example", names: ["Shared Contest"])
+        // Pass precedence: "Stripped Key" is claimed by a display name (pass 1) and by
+        // the stripped id "stripped-key.fr" (pass 2); the display name must win.
+        add("mmm-display.example", names: ["Stripped Key"])
+        add("stripped-key.fr", names: ["Totally Other"])
+
+        let guide = EPGGuide(programs: programs, channels: channels)
+        #expect(guide.channelCount == programs.count)
+
+        let shared = ChannelGroup(id: "shared", name: "Shared Contest", variants: [])
+        #expect(guide.resolveEPGID(for: shared) == "aa-contest.example",
+                "earliest channel id wins a contested display-name key across partitions")
+        let stripped = ChannelGroup(id: "stripped", name: "Stripped Key", variants: [])
+        #expect(guide.resolveEPGID(for: stripped) == "mmm-display.example",
+                "display-name keys keep precedence over stripped-id keys")
+        // Sanity: unique filler names still resolve.
+        let filler = ChannelGroup(id: "filler", name: "Filler 42", variants: [])
+        #expect(guide.resolveEPGID(for: filler) == "ch00042.example")
+    }
+
     @Test func merging() {
         let first = EPGGuide(programs: [F.program("a", 0, 60, "A1"), F.program("b", 0, 60, "B1")])
         let second = EPGGuide(programs: [F.program("a", 0, 60, "A1 other"), F.program("a", 60, 120, "A2"), F.program("c", 0, 30, "C1")],

@@ -75,12 +75,12 @@ public struct PosterCard<MenuContent: View>: View {
     }
 
     @ViewBuilder private func artwork(size: CGSize) -> some View {
-        let image = RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
+        let base = baseArtwork(size: size)
         if badge == nil, rank == nil, progress == nil {
             // The catalogue grid mounts plain posters as each row comes into view.
-            image
+            base
         } else {
-            image
+            base
                 .overlay(alignment: .topTrailing) {
                     if let badge {
                         MediaBadge(badge, style: .filled)
@@ -107,6 +107,19 @@ public struct PosterCard<MenuContent: View>: View {
                             .shadow(color: .black.opacity(0.4), radius: 3)
                     }
                 }
+        }
+    }
+
+    /// The artwork or, when no URL exists, the exact tree `RemoteImage`'s nil-URL path
+    /// produces — minus the loader's view node, state and environment reads. Shelves
+    /// materialize ~8 cards per layout pass, so the shortcut is worth it.
+    @ViewBuilder private func baseArtwork(size: CGSize) -> some View {
+        if let imageURL {
+            RemoteImage(url: imageURL, size: size, placeholderSeed: seed, placeholderTitle: showsTitle ? nil : title)
+        } else {
+            // `.clipped()` would be a no-op here: the placeholder fills its frame exactly.
+            PlaceholderArtwork(seed: seed, title: showsTitle ? nil : title)
+                .frame(width: size.width, height: size.height)
         }
     }
 }

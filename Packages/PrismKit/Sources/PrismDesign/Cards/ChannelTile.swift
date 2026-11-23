@@ -55,12 +55,20 @@ public struct ChannelTile<MenuContent: View>: View {
                 ArtworkSurface(radius: PrismMetrics.wideRadius) {
                     Color(white: logoURL == nil ? 0.16 : 0.36)
                         .overlay {
-                            RemoteImage(
-                                url: logoURL, size: CGSize(width: w * 0.56, height: artworkHeight * 0.54),
-                                contentMode: .fit, placeholderSeed: name, placeholderTitle: name,
-                                placeholderStyle: .channelLogo
-                            )
-                            .accessibilityHidden(true)
+                            if let logoURL {
+                                RemoteImage(
+                                    url: logoURL, size: CGSize(width: w * 0.56, height: artworkHeight * 0.54),
+                                    contentMode: .fit, placeholderSeed: name, placeholderTitle: name,
+                                    placeholderStyle: .channelLogo
+                                )
+                                .accessibilityHidden(true)
+                            } else {
+                                // Same tree as RemoteImage's nil-URL path, minus the loader node
+                                // and the no-op clip (the placeholder fills its frame exactly).
+                                PlaceholderArtwork(seed: name, title: name, style: .channelLogo)
+                                    .frame(width: w * 0.56, height: artworkHeight * 0.54)
+                                    .accessibilityHidden(true)
+                            }
                         }
                         .overlay(alignment: .topLeading) {
                             if let numberText {

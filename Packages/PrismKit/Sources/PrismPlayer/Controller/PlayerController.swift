@@ -457,9 +457,9 @@ public final class PlayerController {
         case .tracksChanged:
             refreshTracks()
         case .videoSize(let size):
-            videoSize = size
+            if videoSize != size { videoSize = size }
         case .pictureInPicture(let active):
-            isPictureInPictureActive = active
+            if isPictureInPictureActive != active { isPictureInPictureActive = active }
         }
     }
 

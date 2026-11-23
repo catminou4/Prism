@@ -420,4 +420,46 @@ struct CatalogLookupTests {
         #expect(catalog.topRated(.series, limit: 5).map(\.title) == ["Dark", "Severance"])
         #expect(catalog.topRated(.live, limit: 5).isEmpty)
     }
+
+    /// `plotProfile` skips `ProviderSynopsis.cleaned` only when it would return the text
+    /// unchanged; a wrong `passthrough` would silently alter catalog plots.
+    @Test func plotProfilePassthroughMatchesCleaned() {
+        var cases: [String] = [
+            "A simple synopsis with no issues.",
+            "Double  space inside.",
+            "Tab\there", "New\nline", "Carriage\rreturn", "Vertical\u{0B}tab", "Form\u{0C}feed",
+            "NEL\u{85}inside", "Line\u{2028}sep", "Para\u{2029}sep",
+            " Leading space", "Trailing space ", "  Double lead", "trail  ",
+            "   ", "", "x", "a  b  c",
+            "Café au lait s'il vous plaît",
+            "نص عربي للتجربة",
+            "Emoji 🎬 and text",
+            "Mixed é and  double",
+            "Ends with space ", "Starts with\u{2029}",
+            "Em\u{2003}space middle", "Tab at end\t", "Newline at start\n",
+            "a\u{3000}ideographic space",
+        ]
+        // Deterministic pseudo-random fuzz over fragment combinations.
+        let fragments = ["word", " ", "  ", "\n", "\t", "é", "🎬", "\u{85}", "\u{2028}", "\u{2029}", "a", " "]
+        var state: UInt64 = 0x9E3779B97F4A7C15
+        for _ in 0..<400 {
+            var s = ""
+            let n = Int(state % 14) + 1
+            for _ in 0..<n {
+                state = state &* 6364136223846793005 &+ 1442695040888963407
+                s += fragments[Int((state >> 33) % UInt64(fragments.count))]
+            }
+            cases.append(s)
+        }
+        var passthroughCount = 0
+        for text in cases {
+            let profile = CatalogBuilder.plotProfile(text)
+            #expect(profile.bytes == text.utf8.count)
+            if profile.passthrough {
+                passthroughCount += 1
+                #expect(ProviderSynopsis.cleaned(text) == text, "passthrough mismatch for \(text.debugDescription)")
+            }
+        }
+        #expect(passthroughCount > 0, "passthrough path never engaged")
+    }
 }
