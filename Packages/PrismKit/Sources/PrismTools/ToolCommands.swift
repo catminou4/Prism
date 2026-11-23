@@ -14,6 +14,7 @@ enum ToolCommands {
         ToolCommand(name: "gallery", summary: "<outputDir> — render the PrismDesign component gallery (light & dark PNGs)", run: GalleryCommand.run),
         ToolCommand(name: "image", summary: "<url> [maxPixelSize] — load one image through ImagePipeline and print timings", run: ImageCommand.run),
         ToolCommand(name: "catalog", summary: "[containerDir] — audit the installed app's cached catalogs and curated shelves", run: CatalogCommand.run),
+        ToolCommand(name: "launch", summary: "[containerDir] — replay the bootstrap critical path on the installed caches (time to ready / Home)", run: LaunchCommand.run),
         ToolCommand(name: "refresh", summary: "[containerDir] — real source refresh benchmark (network + decode + cache write to a scratch dir)", run: RefreshCommand.run),
         ToolCommand(name: "icon", summary: "<appiconsetDir> — render AppIconArtwork into every macOS icon size", run: IconCommand.run),
     ]

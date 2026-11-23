@@ -42,6 +42,20 @@ struct ScrollPerformanceTests {
 
         let direction: CGFloat = clip.isFlipped ? 1 : -1
         let clock = ContinuousClock()
+        // Idle first: nothing changes on screen, so any CPU/energy here is timers,
+        // animations or invalidations that keep running for nothing.
+        let idleUsage = usage(), idleEnergy = energy(), idleStart = clock.now
+        for frame in 1...300 {
+            try await clock.sleep(until: idleStart.advanced(by: .nanoseconds(16_666_667) * frame))
+            layout(host)
+        }
+        let idleSeconds = milliseconds(idleStart.duration(to: clock.now)) / 1_000
+        let idleCPU = (cpuSeconds(usage()) - cpuSeconds(idleUsage)) * 1_000
+        print("[idle-perf] Home idle \(format(idleSeconds)) s: CPU \(format(idleCPU)) ms "
+            + "(\(format(idleCPU / idleSeconds / 10)) % of a core)"
+            + (energy().flatMap { end in idleEnergy.map { " , \(format(Double(end - $0) / 1e9 / idleSeconds)) W" } } ?? ""))
+
+        let scrollUsage = usage(), scrollEnergy = energy()
         let start = clock.now
         let steps = 120
         var samples: [Double] = []
@@ -57,8 +71,12 @@ struct ScrollPerformanceTests {
             if step == steps / 2 { #expect(abs(clip.bounds.origin.y - origin.y) > 300) }
         }
         let sorted = samples.sorted()
+        let scrollSeconds = milliseconds(start.duration(to: clock.now)) / 1_000
+        let scrollCPU = (cpuSeconds(usage()) - cpuSeconds(scrollUsage)) * 1_000
         print("[scroll-perf] Home: p50 \(format(sorted[steps / 2 - 1])) ms, p95 \(format(sorted[steps * 95 / 100 - 1])) ms, "
-            + "max \(format(sorted[steps - 1])) ms, \(samples.count { $0 > 1_000.0 / 120 })/\(steps) over 8.33 ms")
+            + "max \(format(sorted[steps - 1])) ms, \(samples.count { $0 > 1_000.0 / 120 })/\(steps) over 8.33 ms, "
+            + "CPU \(format(scrollCPU)) ms"
+            + (energy().flatMap { end in scrollEnergy.map { ", \(format(Double(end - $0) / 1e9 / scrollSeconds)) W" } } ?? ""))
     }
 
     @Test func browseShelves() async throws {
