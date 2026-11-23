@@ -262,9 +262,10 @@ public struct CurationIndex: Sendable {
         // Distribution breadth: language editions (tags) and additional sources.
         var languages: Set<String> = []
         var sources: Set<SourceID> = []
-        for variant in title.variants.prefix(48) {
-            sources.insert(variant.sourceID)
-            for tag in variant.tags where isLanguageTag(tag) { languages.insert(tag) }
+        // Indexed reads: iterating `variants` copies each payload struct (see `availableAudio`).
+        for index in title.variants.indices.prefix(48) {
+            sources.insert(title.variants[index].sourceID)
+            for tag in title.variants[index].tags where isLanguageTag(tag) { languages.insert(tag) }
         }
         let editions = max(languages.count, 1) + max(sources.count - 1, 0)
         result.editions = UInt8(min(editions, 255))
@@ -521,8 +522,9 @@ public struct CurationIndex: Sendable {
 
     /// Any tag that is not about picture quality, or a language-named category.
     private static func hasLanguageHints(_ title: MediaTitle, catalog: Catalog) -> Bool {
-        title.variants.prefix(16).contains { variant in
-            variant.tags.contains { !pictureTags.contains($0) } || !catalog.providerLanguages(for: variant).isEmpty
+        title.variants.indices.prefix(16).contains { index in
+            title.variants[index].tags.contains { !pictureTags.contains($0) }
+                || !catalog.providerLanguages(for: title.variants[index]).isEmpty
         }
     }
 

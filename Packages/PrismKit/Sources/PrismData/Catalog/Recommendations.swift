@@ -213,8 +213,10 @@ public enum RecommendationBuilder {
         var result: Set<HomeAudioLanguage> = []
         // Variants are sorted best first; audio editions past the first few rarely matter and
         // bounding the scan keeps per-title audio checks cheap on huge catalogs.
-        for variant in item.variants.prefix(24) {
-            result.formUnion(availableAudio(for: variant, original: original, catalog: catalog))
+        // Indexed: `for variant in` would copy every variant's whole `Movie`/`Series`
+        // (and retain its shared strings) — measurable across 100k titles.
+        for index in item.variants.indices.prefix(24) {
+            result.formUnion(availableAudio(for: item.variants[index], original: original, catalog: catalog))
             if result == HomeAudioLanguage.defaults { break }
         }
         return result

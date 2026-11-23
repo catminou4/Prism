@@ -297,7 +297,13 @@ public enum CatalogBuilder {
                     let lower = start
                     group.addTask {
                         guard !Task.isCancelled else { return (listIndex, lower, []) }
-                        return (listIndex, lower, list[lower..<end].map(key))
+                        // Indexed loop, not `map`: the sequence iterator hands out an owned
+                        // copy of every element (a full `Movie` copy + its retains); the
+                        // subscript passes a borrow to `key`.
+                        var keys: [String] = []
+                        keys.reserveCapacity(end - lower)
+                        for index in lower..<end { keys.append(key(list[index])) }
+                        return (listIndex, lower, keys)
                     }
                     start = end
                 }
@@ -471,11 +477,16 @@ public enum CatalogBuilder {
                                 let lhsCatalog = Int(lhs.catalog), rhsCatalog = Int(rhs.catalog)
                                 let lhsPriority = catalogPriority[lhsCatalog], rhsPriority = catalogPriority[rhsCatalog]
                                 if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
-                                let lhsItem = lists[lhsCatalog][Int(lhs.item)], rhsItem = lists[rhsCatalog][Int(rhs.item)]
-                                if lhsItem.quality != rhsItem.quality { return lhsItem.quality > rhsItem.quality }
-                                let lhsLength = nameLengths[lhsCatalog][Int(lhs.item)], rhsLength = nameLengths[rhsCatalog][Int(rhs.item)]
+                                // Field reads through the subscripts, never `let item = lists[…][…]`:
+                                // binding the element copies the whole struct (~15 retains on
+                                // strings shared catalogue-wide by `shareRepeatedValues`, contended
+                                // across the parallel chunks) — that copy was ~45 % of build CPU.
+                                let lhsItem = Int(lhs.item), rhsItem = Int(rhs.item)
+                                let lhsQuality = lists[lhsCatalog][lhsItem].quality, rhsQuality = lists[rhsCatalog][rhsItem].quality
+                                if lhsQuality != rhsQuality { return lhsQuality > rhsQuality }
+                                let lhsLength = nameLengths[lhsCatalog][lhsItem], rhsLength = nameLengths[rhsCatalog][rhsItem]
                                 if lhsLength != rhsLength { return lhsLength < rhsLength }
-                                return lhsItem.id < rhsItem.id
+                                return lists[lhsCatalog][lhsItem].id < lists[rhsCatalog][rhsItem].id
                             }
                         }
                         let title = makeTitle(
@@ -777,32 +788,33 @@ public enum CatalogBuilder {
             let index = Int(ref.catalog)
             return index < plotsCleaned.count && plotsCleaned[index]
         }
-        let first = lists[Int(refs[0].catalog)][Int(refs[0].item)]
+        // `first` is read field by field (see the loop below for why no element binding).
+        let firstList = Int(refs[0].catalog), firstIndex = Int(refs[0].item)
         if refs.count == 1 {
             let ref = refs[0]
-            let rating = first.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+            let rating = lists[firstList][firstIndex].rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
             var cleanedPlot: String? = nil
-            if let raw = first.plot {
+            if let raw = lists[firstList][firstIndex].plot {
                 cleanedPlot = isClean(ref) || plotProfile(raw).passthrough ? raw : cleanPlot(raw)
             }
-            let cleanedGenres = cleanGenres(first.genres, cache: &cleanedGenreLists)
+            let cleanedGenres = cleanGenres(lists[firstList][firstIndex].genres, cache: &cleanedGenreLists)
             var single = MediaTitle(
                 id: id,
-                kind: kind, title: first.title, year: year ?? first.year, variants: [first.mediaVariant],
+                kind: kind, title: lists[firstList][firstIndex].title, year: year ?? lists[firstList][firstIndex].year, variants: [lists[firstList][firstIndex].mediaVariant],
                 plot: cleanedPlot,
-                genres: cleanedGenres, rating: rating, addedAt: first.addedAt,
+                genres: cleanedGenres, rating: rating, addedAt: lists[firstList][firstIndex].addedAt,
                 categoryIDs: categories[Int(ref.catalog)][Int(ref.item)].flatMap { categorySets[$0] } ?? [],
                 isAdult: adult[Int(ref.catalog)][Int(ref.item)]
             )
             // Artwork addresses are shared with the variant as text, never re-parsed.
-            single.$posterURL = first.posterText
-            single.$backdropURL = first.backdropText
+            single.$posterURL = lists[firstList][firstIndex].posterText
+            single.$backdropURL = lists[firstList][firstIndex].backdropText
             return single
         }
         var variants: [MediaVariant] = []
         variants.reserveCapacity(refs.count)
-        var title = first.title
-        var bestNaturalness = TextFolding.naturalnessScore(first.title)
+        var title = lists[firstList][firstIndex].title
+        var bestNaturalness = TextFolding.naturalnessScore(lists[firstList][firstIndex].title)
         var resolvedYear = year
         var poster: String?
         var backdrop: String?
@@ -816,24 +828,28 @@ public enum CatalogBuilder {
         var isAdult = false
 
         for (offset, ref) in refs.enumerated() {
-            let item = lists[Int(ref.catalog)][Int(ref.item)]
-            variants.append(item.mediaVariant)
-            if offset > 0, item.title != title {
-                let score = TextFolding.naturalnessScore(item.title)
+            // Fields are read through the subscripts: a `let item = lists[…][…]` binding
+            // copies the whole struct (and retains every shared string in it) a second time
+            // on top of the `mediaVariant` copy the title actually keeps.
+            let list = Int(ref.catalog), index = Int(ref.item)
+            variants.append(lists[list][index].mediaVariant)
+            if offset > 0, lists[list][index].title != title {
+                let candidate = lists[list][index].title
+                let score = TextFolding.naturalnessScore(candidate)
                 if score > bestNaturalness {
                     bestNaturalness = score
-                    title = item.title
+                    title = candidate
                 }
             }
-            if resolvedYear == nil { resolvedYear = item.year }
-            if poster == nil { poster = item.posterText }
-            if backdrop == nil { backdrop = item.backdropText }
+            if resolvedYear == nil { resolvedYear = lists[list][index].year }
+            if poster == nil { poster = lists[list][index].posterText }
+            if backdrop == nil { backdrop = lists[list][index].backdropText }
             // `cleaned` never lengthens a plot (it only trims and drops text), so a variant
             // whose raw plot can't beat the current best cleaned length is skipped without
             // paying for synopsis normalization — the common case is duplicate plots.
             // `plotProfile` additionally detects plots `cleaned` would return unchanged,
             // skipping the regex/NLP path for clean provider prose entirely.
-            if let rawPlot = item.plot {
+            if let rawPlot = lists[list][index].plot {
                 let clean = isClean(ref)
                 let profile = clean ? (bytes: rawPlot.utf8.count, passthrough: true) : plotProfile(rawPlot)
                 if profile.bytes > plotLength {
@@ -846,11 +862,11 @@ public enum CatalogBuilder {
                     }
                 }
             }
-            for genre in cleanGenres(item.genres, cache: &cleanedGenreLists) {
+            for genre in cleanGenres(lists[list][index].genres, cache: &cleanedGenreLists) {
                 if seenGenres.insert(TextFolding.fold(genre)).inserted { genres.append(genre) }
             }
-            if let value = item.rating, value.isFinite, value > 0 { rating = max(rating ?? 0, value) }
-            if let date = item.addedAt { addedAt = max(addedAt ?? date, date) }
+            if let value = lists[list][index].rating, value.isFinite, value > 0 { rating = max(rating ?? 0, value) }
+            if let date = lists[list][index].addedAt { addedAt = max(addedAt ?? date, date) }
             if let category = categories[Int(ref.catalog)][Int(ref.item)] {
                 if categoryIDs.isEmpty {
                     categoryIDs = categorySets[category] ?? [category]
