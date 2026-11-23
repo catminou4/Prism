@@ -396,17 +396,18 @@ public enum CatalogBuilder {
             var adult = [Bool](repeating: false, count: list.count)
             let resolver = context.resolver(catalog: catalogIndex, kind: categoryKind)
             let listKeys = keys[catalogIndex]
-            for (itemIndex, item) in list.enumerated() {
-                let category = item.categoryID.flatMap { resolver[$0] }
-                let isAdult = item.isAdult || category?.isAdult == true
+            // Indexed field reads: `enumerated()` would copy every whole item (see makeTitle).
+            for itemIndex in list.indices {
+                let category = list[itemIndex].categoryID.flatMap { resolver[$0] }
+                let isAdult = list[itemIndex].isAdult || category?.isAdult == true
                 if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
-                if !hasTaggedEditions, !item.tags.isEmpty { hasTaggedEditions = true }
+                if !hasTaggedEditions, !list[itemIndex].tags.isEmpty { hasTaggedEditions = true }
                 adult[itemIndex] = isAdult
                 cats[itemIndex] = category?.visibleID
-                if !hasTMDBIdentity, let tmdbID = item.tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
+                if !hasTMDBIdentity, let tmdbID = list[itemIndex].tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
                 let key = listKeys[itemIndex]
                 let ref = Ref(catalog: Int32(catalogIndex), item: Int32(itemIndex))
-                guard let year = item.year else {
+                guard let year = list[itemIndex].year else {
                     pendingNoYear.append((key, ref))
                     continue
                 }
