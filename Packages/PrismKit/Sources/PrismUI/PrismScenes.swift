@@ -4,10 +4,19 @@ import PrismDesign
 
 /// The app target hosts the native library, settings, and independent player window.
 public struct PrismScenes: Scene {
+    /// Purge the decoded-image memory cache when the system reports pressure —
+    /// `purgeMemory()` existed but nothing ever called it. Resumed once, lazily.
+    private static let memoryPressurePurge: any DispatchSourceMemoryPressure = {
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global(qos: .utility))
+        source.setEventHandler { ImagePipeline.shared.purgeMemory() }
+        source.resume()
+        return source
+    }()
+
     @State private var model = AppModel()
     @State private var playback = PrismPlaybackSession()
 
-    public init() {}
+    public init() { _ = Self.memoryPressurePurge }
 
     public var body: some Scene {
         Window("Prism", id: "main") {

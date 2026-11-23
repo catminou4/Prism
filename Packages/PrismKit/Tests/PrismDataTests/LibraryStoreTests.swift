@@ -130,6 +130,7 @@ struct LibraryStoreTests {
         store.updateProgress(PlaybackProgress(contentID: movie, titleID: title, position: 100, duration: 1_000, updatedAt: F.reference))
         store.addToWatchlist(title)
         store.toggleFavorite("tf1")
+        store.dismiss(TitleID(rawValue: "movie:dismissed:2000"))
         store.setPreferredVariant(movie, for: title)
         store.setPreferredChannelVariant(ContentID(source: F.a, kind: .live, nativeID: "1"), for: "tf1")
         store.lastChannelGroupID = "tf1"
@@ -145,6 +146,14 @@ struct LibraryStoreTests {
         #expect(reloaded.progress(for: movie)?.position == 100)
         #expect(reloaded.watchlist == [title])
         #expect(reloaded.favoriteChannels == ["tf1"])
+        // The O(1) membership mirrors must rebuild on disk apply too — a `didSet`
+        // bypass would leave them empty while the arrays look right.
+        #expect(reloaded.isInWatchlist(title))
+        #expect(!reloaded.isInWatchlist(TitleID(rawValue: "movie:absent:1900")))
+        #expect(reloaded.isFavorite("tf1"))
+        #expect(!reloaded.isFavorite("nope"))
+        #expect(reloaded.isDismissed(TitleID(rawValue: "movie:dismissed:2000")))
+        #expect(!reloaded.isDismissed(title))
         #expect(reloaded.preferredVariant(for: title) == movie)
         #expect(reloaded.preferredChannelVariant(for: "tf1")?.nativeID == "1")
         #expect(reloaded.lastChannelGroupID == "tf1")

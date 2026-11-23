@@ -137,7 +137,12 @@ public actor CatalogCache {
 /// Disk cache of per-source EPG programmes (same segmented format as `CatalogCache`).
 public actor EPGCache {
     public static let formatVersion: UInt32 = 1
-    static let chunkSize = 40_000
+    /// ~8k programmes/segment: `decodeChunks` decodes ≤10 segments concurrently, so
+    /// 40k chunks let a 278k-programme feed expand ~entirely in flight (~400-500 MB
+    /// transient measured); 8k bounds it to ~80k programmes per batch. Segments are
+    /// self-describing — old caches still decode, they just keep the old profile
+    /// until the next save.
+    static let chunkSize = 8_000
 
     public struct Entry: Sendable {
         public var programs: [EPGProgram]

@@ -165,6 +165,7 @@ public struct LiveScreen: View {
         .scrollIndicators(.never)
         .contentMargins(.horizontal, PrismMetrics.contentMargin, for: .scrollContent)
         .accessibilityLabel("Catégories de chaînes")
+        .prismScrollPhase()
     }
 
     private func header(channelCount: Int?) -> some View {
@@ -297,6 +298,7 @@ public struct LiveScreen: View {
                     .padding(.bottom, 36)
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                .prismScrollPhase()
             }
         }
     }

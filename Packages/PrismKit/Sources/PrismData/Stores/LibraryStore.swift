@@ -41,9 +41,13 @@ public struct ContinueWatchingItem: Identifiable, Sendable, Hashable {
 @Observable
 public final class LibraryStore {
     /// Most recent first.
-    public private(set) var watchlist: [TitleID] = []
+    public private(set) var watchlist: [TitleID] = [] {
+        didSet { watchlistSet = Set(watchlist) }
+    }
     /// Channel group ids, in user order.
-    public private(set) var favoriteChannels: [String] = []
+    public private(set) var favoriteChannels: [String] = [] {
+        didSet { favoriteChannelSet = Set(favoriteChannels) }
+    }
     public private(set) var progress: [ContentID: PlaybackProgress] = [:] {
         didSet {
             latestByTitle = nil
@@ -61,7 +65,17 @@ public final class LibraryStore {
     public private(set) var preferredVariants: [TitleID: ContentID] = [:]
     public private(set) var preferredChannelVariants: [String: ContentID] = [:]
     /// Titles the user marked “Pas intéressé”: never suggested again by the curated shelves.
-    public private(set) var dismissed: [TitleID] = []
+    public private(set) var dismissed: [TitleID] = [] {
+        didSet { dismissedSet = Set(dismissed) }
+    }
+
+    /// O(1) membership mirrors of the ordered arrays above — context menus and cards
+    /// probe `isInWatchlist`/`isDismissed`/`isFavorite` per item, and linear scans over
+    /// ~2 000-entry arrays were measurable on every library mutation. Tracked (not
+    /// `@ObservationIgnored`) so readers keep their observation subscription.
+    private var watchlistSet: Set<TitleID> = []
+    private var dismissedSet: Set<TitleID> = []
+    private var favoriteChannelSet: Set<String> = []
 
     public var lastChannelGroupID: String? {
         get { storedLastChannelGroupID }
@@ -143,7 +157,7 @@ public final class LibraryStore {
 
     // MARK: - Watchlist
 
-    public func isInWatchlist(_ id: TitleID) -> Bool { watchlist.contains(id) }
+    public func isInWatchlist(_ id: TitleID) -> Bool { watchlistSet.contains(id) }
 
     public func toggleWatchlist(_ id: TitleID) {
         if isInWatchlist(id) { removeFromWatchlist(id) } else { addToWatchlist(id) }
@@ -164,7 +178,7 @@ public final class LibraryStore {
 
     // MARK: - Dismissed suggestions
 
-    public func isDismissed(_ id: TitleID) -> Bool { dismissed.contains(id) }
+    public func isDismissed(_ id: TitleID) -> Bool { dismissedSet.contains(id) }
 
     /// Hides a title from recommendations (and from Ma liste, which it contradicts).
     public func dismiss(_ id: TitleID) {
@@ -189,7 +203,7 @@ public final class LibraryStore {
 
     // MARK: - Favourite channels
 
-    public func isFavorite(_ groupID: String) -> Bool { favoriteChannels.contains(groupID) }
+    public func isFavorite(_ groupID: String) -> Bool { favoriteChannelSet.contains(groupID) }
 
     public func toggleFavorite(_ groupID: String) {
         if isFavorite(groupID) {

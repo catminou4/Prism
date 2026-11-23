@@ -43,6 +43,7 @@ struct LiveGuide<ChannelMenu: View>: View {
                     }
                     .accessibilityLabel("Grille des programmes TV")
                     .scrollEdgeEffectStyle(.soft, for: .top)
+                    .prismScrollPhase()
                 }
                 .padding(.top, 8)
             }
@@ -196,6 +197,7 @@ private struct GuideChannelButton: View {
     let play: () -> Void
     @State private var hovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismIsScrollingContent) private var isScrollingContent
 
     var body: some View {
         Button(action: play) {
@@ -225,7 +227,10 @@ private struct GuideChannelButton: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .onHover { if !isScrollingContent { hovered = $0 } }
+        .onChange(of: isScrollingContent) { _, scrolling in
+            if scrolling && hovered { hovered = false }
+        }
         .animation(reduceMotion ? nil : PrismMotion.quickFade, value: hovered)
         .help(channel.name)
         .accessibilityLabel(channel.number.map { "Chaîne \($0), \(channel.name)" } ?? channel.name)
@@ -243,6 +248,7 @@ private struct GuideProgrammeButton: View {
     @State private var showingDetails = false
     @State private var hovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismIsScrollingContent) private var isScrollingContent
 
     private var isLive: Bool { program.isAiring(at: now) }
     private var mightReplay: Bool {
@@ -281,7 +287,10 @@ private struct GuideProgrammeButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(.rect(cornerRadius: PrismMetrics.listRowRadius))
-        .onHover { hovered = $0 }
+        .onHover { if !isScrollingContent { hovered = $0 } }
+        .onChange(of: isScrollingContent) { _, scrolling in
+            if scrolling && hovered { hovered = false }
+        }
         .animation(reduceMotion ? nil : PrismMotion.quickFade, value: hovered)
         .help("\(program.title) · \(times)")
         .accessibilityLabel("\(program.title), \(times)\(isLive ? ", en direct" : "")")

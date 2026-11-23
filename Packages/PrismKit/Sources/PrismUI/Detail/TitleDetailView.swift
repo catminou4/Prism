@@ -186,6 +186,7 @@ private struct TitleDetailContent: View {
                 isAtTop = atTop
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .prismScrollPhase()
             .background(alignment: .top) {
                 if isAtTop {
                     HeroOverscrollBackground(backdropURLs: backdrops, fallbackPosterURLs: posters, seed: title.id.rawValue)

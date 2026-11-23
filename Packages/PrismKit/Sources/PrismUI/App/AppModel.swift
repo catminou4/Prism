@@ -309,6 +309,9 @@ public final class AppModel {
         didBootstrap = true
         sources = sourceStore.load()
         isMetadataEnabled = await metadataRepository.isEnabled
+        // Le decode des caches démarre dès que `sources` est connu : il ne dépend ni de
+        // `library.json` ni des métadonnées, et chaque ms compte avant `.ready`.
+        async let cached = catalogRepository.cachedCatalogs(for: sources)
         // `library.json` is decoded off the main actor since `init`: await it on every
         // path (onboarding included) so no caller can mutate the store while the disk
         // snapshot is still in flight — a pre-load mutation would otherwise discard it.
@@ -317,11 +320,6 @@ public final class AppModel {
             phase = .onboarding
             return
         }
-        // Le guide et le catalogue mis en cache sont indépendants : leurs lectures
-        // disque (actors séparés) se chevauchent, puis le guide rejoint l'attente
-        // de `rebuildCatalog` au lieu de la suivre.
-        async let cached = catalogRepository.cachedCatalogs(for: sources)
-        async let cachedGuide = epgRepository.cachedGuide(for: sources)
         for catalog in await cached {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
@@ -330,7 +328,10 @@ public final class AppModel {
         // `reconcileTitles` therefore sees the real collections, not empty ones.
         await rebuildCatalog()
         phase = .ready
-        guide = await cachedGuide
+        // Le guide n'est pas nécessaire à `.ready` : le démarrer ici l'empêche de
+        // disputer les cœurs avec le decode catalogue pendant la fenêtre critique
+        // (~250 ms mesurées), au prix d'un guide disponible ~1 s plus tard.
+        guide = await epgRepository.cachedGuide(for: sources)
 
         let now = Date.now
         for source in sources where source.isEnabled {

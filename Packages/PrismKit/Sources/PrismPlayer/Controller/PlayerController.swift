@@ -164,7 +164,9 @@ public final class PlayerController {
     @ObservationIgnored let loadTimeout: Duration
     @ObservationIgnored let reconnectPolicy: ReconnectPolicy
     /// Stall threshold for VOD before the current attempt is reopened at the same position.
-    @ObservationIgnored let vodStallThreshold: TimeInterval = 20
+    /// Matches the live threshold: on flaky IPTV a frozen clock reads as dead air long
+    /// before 20 s, and a false positive only costs a reopen-at-position.
+    @ObservationIgnored let vodStallThreshold: TimeInterval = 8
 
     // MARK: - Init
 
@@ -486,7 +488,18 @@ public final class PlayerController {
             let window = engine.seekableRange.flatMap {
                 $0.upperBound - $0.lowerBound >= minimumWindow ? $0 : nil
             }
-            if window != timeshiftWindow { timeshiftWindow = window }
+            // A continuously growing DVR window would otherwise rewrite `timeshiftWindow`
+            // at the engine's poll rate (~4 Hz) — every write re-evaluates PlayerView and
+            // the scrubber. Sub-second drift is invisible on the timeline: publish only
+            // on ≥0.5 s bound movement (≈1 Hz worst case while the window slides).
+            let changed: Bool
+            switch (timeshiftWindow, window) {
+            case (nil, nil): changed = false
+            case let (old?, new?):
+                changed = abs(old.lowerBound - new.lowerBound) > 0.5 || abs(old.upperBound - new.upperBound) > 0.5
+            default: changed = true
+            }
+            if changed { timeshiftWindow = window }
         }
         if phase == .playing, let since = playingSince, now - since >= reconnectPolicy.stableAfter,
             reconnectCount > 0

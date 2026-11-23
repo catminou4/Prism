@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import PrismCore
 import PrismData
+import PrismDesign
 import SwiftUI
 
 @Observable

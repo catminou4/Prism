@@ -67,8 +67,11 @@ struct BrowseScreen: View {
             .onScrollPhaseChange { _, phase in
                 if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
             }
-            // Les cartes lisent ce flag pour suspendre leur survol pendant le scroll.
-            .environment(\.prismIsScrollingContent, motion.isScrolling)
+            // `.prismScrollPhase()` owns its own scroll-phase state: injecting the env from
+            // `motion.isScrolling` here would subscribe this whole page body to scroll
+            // start/stop (two full subtree re-evals per gesture) on top of the intended
+            // per-card invalidation. `motion.isScrolling` keeps feeding BrowseHero only.
+            .prismScrollPhase()
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
                 BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)

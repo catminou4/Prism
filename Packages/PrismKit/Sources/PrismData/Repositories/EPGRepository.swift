@@ -41,9 +41,17 @@ public actor EPGRepository {
             guard !Task.isCancelled else { return .empty }
             if let entry = await cache.load(source.id) {
                 let guide = await Self.makeGuide(entry.programs, channels: entry.channels)
-                guides[source.id] = guide
-                fetchedAt[source.id] = entry.fetchedAt
-                ordered.append(guide)
+                // Bootstrap now awaits this after `.ready`: a refresh that landed while
+                // the entry was being read must not be overwritten by the older disk
+                // snapshot. The decoded guide still feeds the merge when nothing fresher
+                // is in memory.
+                if let known = fetchedAt[source.id], known > entry.fetchedAt {
+                    ordered.append(guides[source.id] ?? guide)
+                } else {
+                    guides[source.id] = guide
+                    fetchedAt[source.id] = entry.fetchedAt
+                    ordered.append(guide)
+                }
             } else if DemoContent.isDemo(source) {
                 let guide = DemoContent.makeGuide()
                 guides[source.id] = guide

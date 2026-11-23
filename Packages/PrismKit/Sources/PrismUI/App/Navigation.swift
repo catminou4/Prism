@@ -137,8 +137,4 @@ public final class NavigationModel {
     }
 }
 
-extension EnvironmentValues {
-    /// `false` for pages hidden below the top of a page stack or in an unselected section:
-    /// use it to pause timers (hero carousel), video previews and polling.
-    @Entry public var isPageActive: Bool = true
-}
+// `isPageActive` lives in PrismDesign (EnvironmentValues) so cards can read it.

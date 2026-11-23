@@ -7,6 +7,10 @@ extension EnvironmentValues {
     @Entry var prismCardLifted: Bool = false
     /// A scroll container is scrolling: cards suspend hover lift/shadow and skip hover tracking.
     @Entry public var prismIsScrollingContent: Bool = false
+    /// `false` for pages hidden below the top of a page stack or in an unselected section.
+    /// Set by PrismUI's `PageStack`/`LibraryShell`; cards use it to skip eager work on
+    /// unreachable pages.
+    @Entry public var isPageActive: Bool = true
 }
 
 extension View {
@@ -256,15 +260,18 @@ private struct CardDefaultAction: ViewModifier {
 struct OptionalContextMenu<MenuContent: View>: ViewModifier {
     let menu: () -> MenuContent
     @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.isPageActive) private var isPageActive
 
     func body(content: Content) -> some View {
         if MenuContent.self == EmptyView.self {
             content
-        } else if isScrollingContent {
+        } else if isScrollingContent || !isPageActive {
             // `.contextMenu` is lazy, but `.accessibilityActions` makes SwiftUI evaluate
             // the menu content for every card's accessibility node — on shelves that is
-            // ~8 extra view subtrees per layout pass. The actions return as soon as the
-            // scroll settles.
+            // ~8 extra view subtrees per layout pass. Skipped while scrolling, and on
+            // buried pages (opacity 0, hit-testing off, AX-hidden) whose menus are
+            // unreachable anyway. The actions return as soon as the scroll settles or
+            // the page resurfaces.
             content.contextMenu { menu() }
         } else {
             content

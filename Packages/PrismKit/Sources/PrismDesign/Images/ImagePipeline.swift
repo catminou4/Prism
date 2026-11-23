@@ -61,6 +61,10 @@ public actor ImagePipeline {
     private final class InFlight<Value: Sendable> {
         let task: Task<Value, Never>
         var waiters = 0
+        /// Set when the fetch was started by the background warm path: its failure cools
+        /// `warmFailedRequests` only — foreground callers joining the same entry must not
+        /// poison `failedRequests` through `releaseData`.
+        var warmOwned = false
         init(task: Task<Value, Never>) { self.task = task }
     }
 
@@ -84,6 +88,10 @@ public actor ImagePipeline {
     private var warmQueue: [ArtworkURL.Resolved] = []
     private var warmQueued: Set<URL> = []
     private var warmRunning = 0
+    /// Warm-path-only failures: a background-priority timeout must not poison the
+    /// foreground 120 s cooldown (`failedRequests`) for a URL that would succeed
+    /// interactively. Warm enqueues check both tables.
+    private var warmFailedRequests: [URL: ContinuousClock.Instant] = [:]
     private static let warmConcurrency = 3
 
     public init(memoryCapacity: Int = 160 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
@@ -228,6 +236,7 @@ public actor ImagePipeline {
         averageColors.removeAll()
         failedRequests.removeAll()
         failedDecodes.removeAll()
+        warmFailedRequests.removeAll()
     }
 
     // MARK: Internals
@@ -293,10 +302,15 @@ public actor ImagePipeline {
                 memory.insert(image, for: key)
                 // Feed the colour memo from the decode that already happened: `averageRGBA`
                 // then never needs a second download for artwork on screen. Blurred variants
-                // would tint the sample, so only sharp decodes count.
+                // would tint the sample, so only sharp decodes count. Sampling is ~40 µs–19 ms
+                // nobody waits for (only CategoryTile reads the memo) — keep it off the
+                // decode→display path.
                 if key.blur == 0 {
-                    let rgba = await ImageDecoder.averageColor(of: image)
-                    await self.storeAverageColor(key.url, rgba)
+                    let url = key.url
+                    Task { [image] in
+                        let rgba = await ImageDecoder.averageColor(of: image)
+                        await self.storeAverageColor(url, rgba)
+                    }
                 }
             }
             return image
@@ -360,7 +374,7 @@ public actor ImagePipeline {
         guard let entry = dataInFlight[url], ObjectIdentifier(entry) == token else { return }
         if finished {
             dataInFlight[url] = nil
-            if failed, !entry.task.isCancelled {
+            if failed, !entry.task.isCancelled, !entry.warmOwned {
                 noteFailure(&failedRequests, url)
             }
             return
@@ -420,11 +434,24 @@ public actor ImagePipeline {
         return data
     }
 
+    /// True when `encodedData` would answer from disk without touching the network —
+    /// warming such a URL is pure churn. Mirrors the lookup order in `encodedData`:
+    /// the larger fallback only short-circuits the fetch when it is the preferred size.
+    private func warmServedFromDisk(_ request: ArtworkURL.Resolved) -> Bool {
+        disk.contains(request.primary)
+            || (request.fallbackIsLarger && request.fallback.map { disk.contains($0) } ?? false)
+    }
+
     private func enqueueWarm(_ urls: [URL], target: CGSize, fitting: Fitting) {
         var fresh: [ArtworkURL.Resolved] = []
         for url in urls where !url.isFileURL {
             let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary, in: &failedRequests),
+            // Bytes already on disk make the warm-up pure churn (a detached task plus a
+            // ~40 µs mmap read per URL on every scroll stop).
+            guard dataInFlight[request.primary] == nil,
+                  !isCoolingDown(request.primary, in: &failedRequests),
+                  !isCoolingDown(request.primary, in: &warmFailedRequests),
+                  !warmServedFromDisk(request),
                   warmQueued.insert(request.primary).inserted else { continue }
             fresh.append(request)
         }
@@ -442,7 +469,10 @@ public actor ImagePipeline {
         while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
             let request = warmQueue.removeFirst()
             warmQueued.remove(request.primary)
-            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary, in: &failedRequests) else { continue }
+            guard dataInFlight[request.primary] == nil,
+                  !isCoolingDown(request.primary, in: &failedRequests),
+                  !isCoolingDown(request.primary, in: &warmFailedRequests),
+                  !warmServedFromDisk(request) else { continue }
             warmRunning += 1
             let disk = disk, session = prefetchSession
             // Registered like any fetch, so an on-screen decode of the same image joins it.
@@ -450,11 +480,17 @@ public actor ImagePipeline {
                 await Self.encodedData(for: request, disk: disk, session: session)
             })
             entry.waiters = 1
+            entry.warmOwned = true
             dataInFlight[request.primary] = entry
             let token = ObjectIdentifier(entry)
             Task(priority: .utility) {
                 let data = await entry.task.value
-                self.releaseData(request.primary, token: token, finished: true, failed: data == nil)
+                // Warm failures cool the warm path only — a throttled background timeout
+                // must not mark the URL dead for on-screen loads (`failedRequests`).
+                self.releaseData(request.primary, token: token, finished: true, failed: false)
+                if data == nil, !entry.task.isCancelled {
+                    self.noteFailure(&self.warmFailedRequests, request.primary)
+                }
                 self.warmRunning -= 1
                 self.startWarming()
             }

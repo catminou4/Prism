@@ -45,7 +45,7 @@ public actor XtreamClient {
     /// `streamURL` = m3u8 when `preferHLS` and the account allows it (or lists no format), `alternateStreamURL` = ts.
     public func liveStreams(preferHLS: Bool, account: XtreamAccount?) async throws -> [Channel] {
         let adult = await adultIDs(.live)
-        let data = try await get(action: "get_live_streams")
+        let data = try await get(action: "get_live_streams", timeout: Self.listTimeout, retries: Self.listRetries)
         return try await decode {
             try XtreamDecoder.liveStreams(
                 data, sourceID: self.sourceID, credentials: self.credentials, preferHLS: preferHLS,
@@ -56,13 +56,13 @@ public actor XtreamClient {
 
     public func vodStreams() async throws -> [Movie] {
         let adult = await adultIDs(.movie)
-        let data = try await get(action: "get_vod_streams")
+        let data = try await get(action: "get_vod_streams", timeout: Self.listTimeout, retries: Self.listRetries)
         return try await decode { try XtreamDecoder.vodStreams(data, sourceID: self.sourceID, credentials: self.credentials, adultCategoryIDs: adult) }
     }
 
     public func series() async throws -> [Series] {
         let adult = await adultIDs(.series)
-        let data = try await get(action: "get_series")
+        let data = try await get(action: "get_series", timeout: Self.listTimeout, retries: Self.listRetries)
         return try await decode { try XtreamDecoder.series(data, sourceID: self.sourceID, adultCategoryIDs: adult) }
     }
 
@@ -114,10 +114,16 @@ public actor XtreamClient {
         return adultCategories[kind] ?? []
     }
 
-    private func get(action: String?, extra: [URLQueryItem] = [], timeout: TimeInterval = 30) async throws -> Data {
+    /// The three catalog lists are single giant GETs (tens of MB): panels routinely take
+    /// >30 s to emit the first byte on `get_vod_streams`, and a timed-out retry re-downloads
+    /// everything. A wide timeout plus a single retry beats three stacked 30 s attempts.
+    private static let listTimeout: TimeInterval = 120
+    private static let listRetries = 1
+
+    private func get(action: String?, extra: [URLQueryItem] = [], timeout: TimeInterval = 30, retries: Int = 2) async throws -> Data {
         let url = XtreamURLBuilder.api(credentials, action: action, extra: extra)
         do {
-            let (data, response) = try await http.data(for: url, timeout: timeout, retries: 2)
+            let (data, response) = try await http.data(for: url, timeout: timeout, retries: retries)
             switch response.statusCode {
             case 200..<300: return data
             case 401, 403: throw XtreamError.unauthorized

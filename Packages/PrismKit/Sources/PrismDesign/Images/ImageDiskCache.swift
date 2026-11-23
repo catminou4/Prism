@@ -59,6 +59,11 @@ nonisolated final class ImageDiskCache: Sendable {
         directory.appending(path: String(key.prefix(2)), directoryHint: .isDirectory).appending(path: key, directoryHint: .notDirectory)
     }
 
+    /// Existence probe for the warm path — no read, no LRU touch (a probe is not a use).
+    func contains(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(forKey: Self.key(for: url)).path)
+    }
+
     func data(for url: URL) -> Data? {
         let key = Self.key(for: url)
         let file = fileURL(forKey: key)

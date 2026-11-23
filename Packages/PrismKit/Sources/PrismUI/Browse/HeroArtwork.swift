@@ -17,6 +17,10 @@ final class HeroArtworkStore {
 
     private(set) var entries: [TitleID: Entry] = [:]
     @ObservationIgnored private var running: [Request: Resolution] = [:]
+    /// Insertion order for bounded eviction — hero metadata is re-resolvable, so
+    /// oldest-first is enough (a strict LRU would track reads nobody makes).
+    @ObservationIgnored private var entryOrder: [TitleID] = []
+    private static let maxEntries = 256
 
     private struct Request: Hashable, Sendable {
         let id: TitleID
@@ -96,7 +100,13 @@ final class HeroArtworkStore {
             entry.synopsis = enriched
         }
         guard !Task.isCancelled, usesMetadata == app.isMetadataEnabled else { return }
+        if entries[title.id] == nil { entryOrder.append(title.id) }
         entries[title.id] = entry
+        if entryOrder.count > Self.maxEntries {
+            let excess = entryOrder.count - Self.maxEntries
+            for id in entryOrder.prefix(excess) { entries[id] = nil }
+            entryOrder.removeFirst(excess)
+        }
     }
 
     private static func providerDetail(_ request: (Movie, Source)?, repository: DetailRepository) async -> MovieDetail? {

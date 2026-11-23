@@ -224,10 +224,19 @@ final class VLCEngine: NSObject, PlaybackEngine {
         }
     }
 
+    /// Last values pushed to libvlc — `applyAudio` runs per volume-slider tick and an
+    /// unconditional `isMuted` write doubled the lock crossings for nothing.
+    private var appliedAudioVolume: Int32 = -1
+    private var appliedAudioMuted = false
+
     private func applyAudio() {
         guard let audio = player.audio else { return }
         // VLCAudio volume is 0…200 (100 = unity gain): never amplify.
-        audio.volume = Int32((volumeValue * 100).rounded())
+        let volume = Int32((volumeValue * 100).rounded())
+        guard volume != appliedAudioVolume || mutedValue != appliedAudioMuted else { return }
+        appliedAudioVolume = volume
+        appliedAudioMuted = mutedValue
+        audio.volume = volume
         audio.isMuted = mutedValue
     }
 
