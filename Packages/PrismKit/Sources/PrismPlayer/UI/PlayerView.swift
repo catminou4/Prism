@@ -36,7 +36,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
     ///   - configuresWindow: applies `PlayerWindowConfigurator` to the hosting window (dedicated
     ///     player window). Pass false when embedding the player in another window.
     ///   - stopsOnDisappear: calls `controller.stop()` when the view goes away.
-    ///   - onClose: adds a close (`xmark`) button and makes Esc close the player when windowed.
+    ///   - onClose: adds a back button and makes Esc close the player when windowed.
     ///   - onChannelUp/onChannelDown: ↑/↓ zap instead of changing the volume.
     public init(
         controller: PlayerController,
@@ -235,6 +235,16 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
 
     private var topBar: some View {
         HStack(alignment: .top, spacing: PlayerMetrics.margin) {
+            if let onClose {
+                Button(action: onClose) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .buttonStyle(PlayerTransportButtonStyle(diameter: PlayerMetrics.capsuleHeight))
+                .help("Retour")
+                .accessibilityLabel("Retour")
+                .onHover { controller.setHoveringControls($0) }
+            }
             topLeadingCapsule
             Spacer(minLength: 0)
             PlayerVolumeControl(controller: controller)
@@ -256,12 +266,6 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
 
     private var topLeadingCapsule: some View {
         PlayerGlassCapsule {
-            if let onClose {
-                Button(action: onClose) { Image(systemName: "xmark") }
-                    .buttonStyle(PlayerCapsuleButtonStyle())
-                    .help("Fermer")
-                    .accessibilityLabel("Fermer")
-            }
             if controller.isPictureInPictureSupported {
                 Button {
                     controller.togglePictureInPicture()
