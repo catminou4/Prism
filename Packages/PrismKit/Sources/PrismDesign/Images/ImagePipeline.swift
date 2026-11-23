@@ -107,7 +107,11 @@ public actor ImagePipeline {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil // the disk cache below stores the encoded bytes
         configuration.waitsForConnectivity = false
-        configuration.httpAdditionalHeaders = ["Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8"]
+        // No WebP/AVIF: TMDB's CDN serves WebP to any Accept naming it (q-values ignored), and
+        // ImageIO decodes WebP in software — measured on the same w342 posters, JPEG decodes
+        // ~31 % faster (2.6 vs 3.8 ms) for ~36 % more bytes. Bytes are fetched once into the
+        // disk cache; decodes repeat on every memory-cache miss.
+        configuration.httpAdditionalHeaders = ["Accept": "image/jpeg,image/png,image/*;q=0.8"]
         if warming { configuration.networkServiceType = .background }
         // `download` drives its tasks manually: the async `URLSession` APIs bypass session
         // delegates entirely, so the 2xx/MIME/size checks and the byte cap live in the delegate.
@@ -687,11 +691,14 @@ nonisolated final class MemoryCache: @unchecked Sendable {
         }
     }
 
-    /// Drops the stalest entries until back under ~80 % of both budgets.
+    /// Once a budget is exceeded, drops the stalest entries until back under ~80 % of both.
+    /// The trigger is the limit itself, not the 80 % target: triggering at the target made
+    /// every insert of a full cache sort all entries under the lock `RemoteImage.body` takes
+    /// (measured: 1 500/1 500 steady-state poster inserts sorted, mean 104 µs, max 2.1 ms).
     private func evict(_ state: inout State) {
         let byteTarget = byteLimit * 8 / 10
         let countTarget = Self.countLimit * 8 / 10
-        guard state.bytes > byteTarget || state.entries.count > Self.countLimit else { return }
+        guard state.bytes > byteLimit || state.entries.count > Self.countLimit else { return }
         for (key, entry) in state.entries.sorted(by: { $0.value.stamp < $1.value.stamp }) {
             guard state.bytes > byteTarget || state.entries.count > countTarget else { break }
             state.entries[key] = nil

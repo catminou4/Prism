@@ -224,16 +224,17 @@ struct ImagePipelineTests {
 
         cache.insert(try gradientImage(width: 128, height: 128), for: k0)   // 64 K
         cache.insert(try gradientImage(width: 128, height: 128), for: k1)   // 128 K
-        cache.insert(try gradientImage(width: 128, height: 128), for: k2)   // 192 K > 160 K → evicts k0
+        cache.insert(try gradientImage(width: 128, height: 128), for: k2)   // 192 K ≤ 200 K → nothing evicted
+        // Reading k0 and k1 refreshes their recency: k2 becomes the stalest.
+        #expect(cache.image(for: k0) != nil)
+        #expect(cache.image(for: k1) != nil)
+
+        // 256 K > 200 K → evicts the stalest until ≤ 160 K: k2, then k0 (k1 was read after k0).
+        _ = cache.image(for: k1)
+        cache.insert(try gradientImage(width: 128, height: 128), for: k3)
+        #expect(cache.image(for: k2) == nil)
         #expect(cache.image(for: k0) == nil)
         #expect(cache.image(for: k1) != nil)
-        #expect(cache.image(for: k2) != nil)
-
-        // Reading k1 refreshes its recency: the next insert evicts k2, not k1.
-        _ = cache.image(for: k1)
-        cache.insert(try gradientImage(width: 128, height: 128), for: k3)   // evicts k2 (now the stalest)
-        #expect(cache.image(for: k1) != nil)
-        #expect(cache.image(for: k2) == nil)
         #expect(cache.image(for: k3) != nil)
     }
 
