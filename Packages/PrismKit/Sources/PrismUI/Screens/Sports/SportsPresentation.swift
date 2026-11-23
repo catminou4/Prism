@@ -83,7 +83,7 @@ nonisolated struct SportsDestination: Equatable, Sendable {
     init(_ fixture: SportsFixture, now: Date) {
         fixtureID = fixture.id
         day = Calendar.current.startOfDay(for: fixture.startsAt)
-        isLive = fixture.isLive(at: now) || !fixture.liveBroadcasts(at: now).isEmpty
+        isLive = fixture.isAiring(at: now)
     }
 }
 
@@ -128,6 +128,7 @@ nonisolated struct SportsFixture: Identifiable, Equatable, Sendable {
     let isCompanionProgram: Bool
 
     var isNamedBroadcast: Bool { guideOpponents != nil }
+    var isIdentifiedMatch: Bool { event != nil || (isNamedBroadcast && !isCompanionProgram) }
 
     init(event: SportsEvent, broadcasts: [SportsBroadcast]) {
         id = "score:\(event.id)"
@@ -157,6 +158,22 @@ nonisolated struct SportsFixture: Identifiable, Equatable, Sendable {
     var competition: String { event?.league.displayName ?? sport.displayName }
 
     var showsScore: Bool { event?.status == .live || event?.status == .final }
+
+    var scoreline: String? {
+        guard showsScore, let event, event.home.score != nil || event.away.score != nil else { return nil }
+        let home = event.home.score?.formatted() ?? "–"
+        let away = event.away.score?.formatted() ?? "–"
+        return "\(home) : \(away)"
+    }
+
+    var channelSummary: String? {
+        let names = broadcasts.map(\.channel.name)
+        return names.isEmpty ? nil : names.joined(separator: " · ")
+    }
+
+    func isAiring(at date: Date) -> Bool {
+        isLive(at: date) || (event != nil && !liveBroadcasts(at: date).isEmpty)
+    }
 
     func liveBroadcasts(at date: Date) -> [SportsBroadcast] {
         switch event?.status {

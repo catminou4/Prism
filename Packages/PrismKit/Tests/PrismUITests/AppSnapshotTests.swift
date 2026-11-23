@@ -113,7 +113,7 @@ struct AppSnapshotTests {
             )
             try await write(
                 SportsHomeShelf().environment(app).environment(navigation).environment(sport).environment(\.isPageActive, false),
-                label: scheme == .light ? "sport-shelf-light" : "sport-shelf-dark", size: CGSize(width: 1170, height: 248), scheme: scheme
+                label: scheme == .light ? "sport-shelf-light" : "sport-shelf-dark", size: CGSize(width: 1170, height: 286), scheme: scheme
             )
         }
     }

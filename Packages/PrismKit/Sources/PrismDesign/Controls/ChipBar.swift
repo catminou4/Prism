@@ -22,6 +22,7 @@ public struct ChipBar: View {
     @Binding private var selection: String?
     private let horizontalMargin: CGFloat
     @Namespace private var namespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(items: [ChipItem], selection: Binding<String?>, horizontalMargin: CGFloat = PrismMetrics.contentMargin) {
         self.items = items
@@ -35,10 +36,11 @@ public struct ChipBar: View {
                 LazyHStack(spacing: 8) {
                     ForEach(items) { item in
                         Chip(item: item, isSelected: item.id == selection, namespace: namespace) {
-                            withAnimation(PrismMotion.standard) { selection = item.id }
+                            selection = item.id
                         }
                     }
                 }
+                .animation(reduceMotion ? nil : PrismMotion.standard, value: selection)
                 .scrollTargetLayout()
                 .padding(.vertical, 6)
             }
@@ -92,7 +94,7 @@ private struct Chip: View {
         }
         .buttonStyle(.pressable)
         .onHover { hovering in
-            withAnimation(PrismMotion.quickFade) { isHovered = hovering }
+            withAnimation(reduceMotion ? nil : PrismMotion.quickFade) { isHovered = hovering }
         }
         .focusEffectDisabled()
         .accessibilityAddTraits(isSelected ? .isSelected : [])

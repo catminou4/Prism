@@ -33,6 +33,40 @@ struct SportsPresentationTests {
         #expect(program.liveBroadcasts(at: now).isEmpty)
     }
 
+    @Test func agendaPromotesWatchableLiveAndKeepsEveryFixtureInOneSection() {
+        let liveEvent = SportsEvent(
+            id: "nba-live", league: .nba, startsAt: now.addingTimeInterval(-3600), status: .live,
+            home: SportsTeam(id: "chi", name: "Chicago", abbreviation: "CHI", score: 96),
+            away: SportsTeam(id: "bos", name: "Boston", abbreviation: "BOS", score: 94)
+        )
+        let scoresOnly = SportsFixture(event: liveEvent, broadcasts: [])
+        let onAir = fixture("Brest – Marseille", startsIn: -1800)
+        let next = fixture("Lille – Lens", startsIn: 2400)
+        let ended = fixture("Nice – Rennes", startsIn: -10_800)
+        let preview = fixture("Avant-match : Lille – Lens", startsIn: 1800)
+        let fixtures = [ended, scoresOnly, onAir, preview, next]
+
+        let agenda = SportsAgenda(fixtures: fixtures, now: now, day: now, sport: nil)
+        #expect(agenda.featured?.id == onAir.id)
+        #expect(agenda.sections.map(\.kind) == [.live, .upcoming, .past])
+        #expect(agenda.sections.flatMap(\.fixtures).map(\.id) == [scoresOnly.id, next.id, ended.id])
+        #expect(agenda.otherPrograms.map(\.id) == [preview.id])
+
+        let live = SportsAgenda(fixtures: fixtures, now: now, day: nil, sport: .basketball)
+        #expect(live.featured?.id == scoresOnly.id)
+        #expect(live.sections.isEmpty)
+        #expect(live.otherPrograms.isEmpty)
+    }
+
+    @Test func agendaCanShowAProgrammeWithoutAMatch() {
+        let generic = fixture("Football : Ligue des champions", startsIn: 2400)
+        let tomorrow = fixture("Lille – Lens", startsIn: 86_400)
+        let agenda = SportsAgenda(fixtures: [generic, tomorrow], now: now, day: now, sport: nil)
+        #expect(agenda.featured?.id == generic.id)
+        #expect(agenda.sections.isEmpty)
+        #expect(agenda.otherPrograms.isEmpty)
+    }
+
     private func fixture(_ title: String, subtitle: String? = nil, startsIn: TimeInterval) -> SportsFixture {
         let start = now.addingTimeInterval(startsIn)
         let program = EPGProgram(channelID: channel.id, start: start, end: start.addingTimeInterval(7200), title: title, subtitle: subtitle)

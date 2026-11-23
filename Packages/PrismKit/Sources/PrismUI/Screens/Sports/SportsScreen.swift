@@ -9,195 +9,238 @@ struct SportsScreen: View {
     @Environment(SportsPresentation.self) private var sports: SportsPresentation?
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isPageActive) private var isActive
 
     @State private var period: Period = .schedule
     @State private var sport: BroadcastSport?
     @State private var day: Date?
-    @State private var scrollTarget: String?
+    @State private var scrollTarget: ScrollTarget?
     @State private var isRefreshingGuide = false
     @State private var showsGuidePrograms = false
 
     private enum Period: Hashable { case schedule, live }
+    private enum ScrollTarget: Hashable { case top, fixture(String) }
 
     var body: some View {
         if let sports {
-            VStack(alignment: .leading, spacing: 0) {
-                header(now: sports.now)
-                content(sports)
+            let now = sports.now
+            let calendar = Calendar.current
+            let today = calendar.startOfDay(for: now)
+            let days = calendarDays(startingAt: today, calendar: calendar)
+            let selected = day.flatMap { days.contains($0) ? $0 : nil } ?? today
+            let schedule = SportsAgenda(
+                fixtures: sports.fixtures, now: now, day: period == .schedule ? selected : nil, sport: sport,
+                calendar: calendar
+            )
+
+            GeometryReader { geometry in
+                let width = max(1, geometry.size.width - 2 * PrismMetrics.contentMargin)
+                ScrollViewReader { reader in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: PrismMetrics.shelfSpacing) {
+                            if schedule.isEmpty {
+                                emptyContent(sports)
+                                    .frame(minHeight: max(0, geometry.size.height - 200))
+                            } else {
+                                agenda(schedule, now: now, width: width)
+                                scoresNotice(sports)
+                            }
+                        }
+                        .padding(.horizontal, PrismMetrics.contentMargin)
+                        .padding(.top, 16)
+                        .padding(.bottom, 44)
+                        .id(ScrollTarget.top)
+                    }
+                    .scrollEdgeEffectStyle(.soft, for: .top)
+                    .safeAreaBar(edge: .top, spacing: 0) {
+                        header(selected: selected, days: days, today: today)
+                    }
+                    .task(id: scrollTarget) {
+                        guard let scrollTarget else { return }
+                        withAnimation(reduceMotion ? nil : PrismMotion.standard) {
+                            reader.scrollTo(scrollTarget, anchor: scrollTarget == .top ? .top : .center)
+                        }
+                        self.scrollTarget = nil
+                    }
+                }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .modifier(SportsUpdates())
-            .onChange(of: sports.destination, initial: true) { _, destination in
+            .onChange(of: isActive ? sports.destination : nil, initial: true) { _, destination in
                 guard let destination else { return }
                 sport = nil
                 period = destination.isLive ? .live : .schedule
                 day = destination.day
-                if let fixture = sports.fixtures.first(where: { $0.id == destination.fixtureID }), !fixture.isIdentifiedMatch {
+                if sports.fixtures.contains(where: { $0.id == destination.fixtureID && !$0.isIdentifiedMatch }) {
                     showsGuidePrograms = true
                 }
-                scrollTarget = destination.fixtureID
+                scrollTarget = .fixture(destination.fixtureID)
                 sports.destination = nil
             }
         }
     }
 
-    private func header(now: Date) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .center) {
-                Text("Sport")
-                    .font(.system(size: 36, weight: .bold))
-                    .tracking(-1)
-                    .accessibilityAddTraits(.isHeader)
-                Spacer(minLength: 16)
-                Picker("Affichage", selection: $period) {
-                    Text("Programme").tag(Period.schedule)
-                    Text("En direct").tag(Period.live)
-                }
-                .pickerStyle(.segmented)
-                .controlSize(.large)
-                .labelsHidden()
-                .fixedSize()
+    private func header(selected: Date, days: [Date], today: Date) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                BrowseHeading(title: "Sport")
+
+                Button("Programme", systemImage: "calendar") { setPeriod(.schedule) }
+                    .modifier(SportsPeriodStyle(isSelected: period == .schedule))
+                Button("En direct", systemImage: "dot.radiowaves.left.and.right") { setPeriod(.live) }
+                    .modifier(SportsPeriodStyle(isSelected: period == .live))
 
                 GlassCircleButton(systemName: "arrow.clockwise", accessibilityLabel: "Actualiser le guide TV", action: refreshGuide)
-                    .disabled(isRefreshingGuide || app.isRefreshingGuide || app.sources.isEmpty)
+                    .disabled(isRefreshingGuide || app.isRefreshingGuide || !app.sources.contains(where: \.isEnabled))
                     .help("Actualiser le guide TV")
+                    .padding(.leading, 4)
+                    .padding(.trailing, PrismMetrics.contentMargin)
             }
 
             HStack(spacing: 12) {
-                Picker("Discipline", selection: $sport) {
-                    Text("Tous").tag(nil as BroadcastSport?)
-                    ForEach(BroadcastSport.allCases, id: \.self) { value in
-                        Text(value.displayName).tag(Optional(value))
+                ChipBar(items: Self.disciplines, selection: Binding(
+                    get: { sport?.rawValue ?? "all" },
+                    set: { value in
+                        let next = value.flatMap(BroadcastSport.init(rawValue:))
+                        guard sport != next else { return }
+                        sport = next
+                        scrollTarget = .top
                     }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                Spacer(minLength: 0)
+                ))
+                .accessibilityLabel("Disciplines")
+
                 if period == .schedule {
-                    let today = Calendar.current.startOfDay(for: now)
-                    let window = SportsPresentation.scheduleWindow(from: today)
-                    DatePicker(
-                        "Date du programme", selection: dayBinding(today: today, in: window),
-                        in: window.start...window.end.addingTimeInterval(-1), displayedComponents: .date
-                    )
-                    .labelsHidden()
-                    .environment(\.locale, Locale(identifier: "fr-FR"))
-                    .fixedSize()
+                    dateMenu(selected: selected, days: days, today: today)
+                        .padding(.trailing, PrismMetrics.contentMargin)
                 }
             }
         }
-        .padding(.horizontal, PrismMetrics.contentMargin)
-        .padding(.top, 26)
-        .padding(.bottom, 18)
+        .padding(.top, 20)
+        .padding(.bottom, 12)
     }
 
-    @ViewBuilder private func content(_ sports: SportsPresentation) -> some View {
-        let calendar = Calendar.current
-        let date = sports.now
-        let today = calendar.startOfDay(for: date)
-        let selected = dayBinding(today: today, in: SportsPresentation.scheduleWindow(from: today)).wrappedValue
-        let entries = sports.fixtures.filter { fixture in
-            guard sport == nil || fixture.sport == sport else { return false }
-            switch period {
-            case .schedule: return calendar.isDate(fixture.startsAt, inSameDayAs: selected)
-            case .live: return fixture.isLive(at: date) || !fixture.liveBroadcasts(at: date).isEmpty
+    private static let disciplines = [ChipItem(id: "all", title: "Tous les sports")] + BroadcastSport.allCases.map {
+        ChipItem(id: $0.rawValue, title: $0.displayName, systemImage: $0.symbol)
+    }
+
+    private func dateMenu(selected: Date, days: [Date], today: Date) -> some View {
+        Menu {
+            Picker("Date du programme", selection: Binding(get: { selected }, set: { date in
+                guard selected != date else { return }
+                day = date
+                scrollTarget = .top
+            })) {
+                ForEach(days, id: \.self) { date in
+                    Text(date == today ? "Aujourd’hui" : SportsTypography.longDay(date)).tag(date)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            GlassCapsuleLabel(
+                title: selected == today ? "Aujourd’hui" : SportsTypography.longDay(selected),
+                systemImage: "calendar"
+            )
+        }
+        .modifier(SportsGlassMenu())
+        .accessibilityLabel("Date du programme")
+        .accessibilityValue(SportsTypography.longDay(selected))
+    }
+
+    private func calendarDays(startingAt today: Date, calendar: Calendar) -> [Date] {
+        let window = SportsPresentation.scheduleWindow(from: today)
+        let count = calendar.dateComponents([.day], from: window.start, to: window.end).day ?? 0
+        return (0..<count).compactMap { calendar.date(byAdding: .day, value: $0, to: window.start) }
+    }
+
+    private func setPeriod(_ value: Period) {
+        guard period != value else { return }
+        period = value
+        scrollTarget = .top
+    }
+
+    @ViewBuilder private func agenda(_ schedule: SportsAgenda, now: Date, width: CGFloat) -> some View {
+        if let lead = schedule.featured {
+            ZStack {
+                SportsFeature(
+                    fixture: lead, now: now,
+                    size: CGSize(width: width, height: min(364, max(290, width * 0.31)))
+                )
+                .id(ScrollTarget.fixture(lead.id))
+                .transition(.opacity)
+            }
+            .animation(reduceMotion ? nil : PrismMotion.quickFade, value: lead.id)
+        }
+        ForEach(schedule.sections) { section in
+            VStack(alignment: .leading, spacing: PrismMetrics.shelfHeaderSpacing) {
+                ShelfHeader(section.kind.title)
+                eventGrid(section.fixtures, now: now, width: width)
             }
         }
 
-        if !sports.hasLoaded && entries.isEmpty {
+        if !schedule.otherPrograms.isEmpty {
+            VStack(alignment: .leading, spacing: PrismMetrics.shelfHeaderSpacing) {
+                GlassCapsuleButton(
+                    title: showsGuidePrograms ? "Masquer les autres programmes" : "Autres programmes du guide",
+                    systemImage: showsGuidePrograms ? "chevron.up" : "chevron.down",
+                    trailingChevron: false, style: .regular
+                ) {
+                    showsGuidePrograms.toggle()
+                }
+
+                if showsGuidePrograms {
+                    eventGrid(schedule.otherPrograms, now: now, width: width)
+                }
+            }
+        }
+    }
+
+    private func eventGrid(_ fixtures: [SportsFixture], now: Date, width: CGFloat) -> some View {
+        let spacing = PrismMetrics.cardSpacing
+        let columns = max(1, min(3, max(2, fixtures.count), Int((width + spacing) / (320 + spacing))))
+        let cardWidth = (width - CGFloat(columns - 1) * spacing) / CGFloat(columns)
+        return LazyVGrid(
+            columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: spacing, alignment: .topLeading), count: columns),
+            alignment: .leading, spacing: PrismMetrics.gridRowSpacing
+        ) {
+            ForEach(fixtures) { fixture in
+                SportsEventCard(fixture: fixture, now: now, width: cardWidth)
+                    .id(ScrollTarget.fixture(fixture.id))
+            }
+        }
+    }
+
+    @ViewBuilder private func emptyContent(_ sports: SportsPresentation) -> some View {
+        if !sports.hasLoaded {
             ProgressView()
                 .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityLabel("Chargement du programme sportif")
-        } else if entries.isEmpty {
-            emptyState(sports)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            let matches = entries.filter(\.isIdentifiedMatch)
-            let featured = matches.isEmpty ? entries.filter { !$0.isCompanionProgram } : matches
-            let extra = matches.isEmpty ? entries.filter(\.isCompanionProgram) : entries.filter { !$0.isIdentifiedMatch }
-            ScrollViewReader { reader in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        if period == .schedule {
-                            Text(SportsTypography.longDay(selected))
-                                .font(.headline)
-                                .accessibilityAddTraits(.isHeader)
-                                .padding(.bottom, 10)
-                        }
-                        ForEach(featured) { fixture in
-                            scheduleRow(fixture, now: date)
-                        }
-                        if !extra.isEmpty {
-                            Button {
-                                showsGuidePrograms.toggle()
-                            } label: {
-                                Label(showsGuidePrograms ? "Masquer les autres programmes" : "Autres programmes du guide",
-                                      systemImage: showsGuidePrograms ? "chevron.up" : "chevron.down")
-                                    .font(.callout.weight(.medium))
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.secondary)
-                            .padding(.vertical, 16)
-                            if showsGuidePrograms {
-                                ForEach(extra) { fixture in
-                                    scheduleRow(fixture, now: date)
-                                }
-                            }
-                        }
-                        if sports.liveStatus == .needsKey {
-                            Button("Configurer les scores en direct", systemImage: "gearshape") { openSettings() }
-                                .buttonStyle(.link)
-                                .padding(.top, 22)
-                        } else if sports.liveStatus == .unavailable {
-                            Text("Scores en direct temporairement indisponibles")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .padding(.top, 22)
-                        }
-                    }
-                    .padding(.horizontal, PrismMetrics.contentMargin)
-                    .padding(.bottom, 32)
-                }
-                .onChange(of: scrollTarget, initial: true) { _, target in
-                    guard let target else { return }
-                    withAnimation(reduceMotion ? nil : PrismMotion.standard) { reader.scrollTo(target, anchor: .center) }
-                    scrollTarget = nil
-                }
-                .scrollEdgeEffectStyle(.soft, for: .top)
-            }
+            let missingGuide = app.guide.isEmpty && sports.fixtures.isEmpty
+            EmptyStateView(
+                symbol: "sportscourt",
+                title: missingGuide ? "Programme sportif indisponible" : (period == .live ? "Aucune rencontre en direct" : "Aucune rencontre à cette date"),
+                message: missingGuide ? "Actualisez le guide TV ou configurez les scores dans Réglages." : nil,
+                actionTitle: missingGuide && sports.liveStatus == .needsKey ? "Ouvrir les réglages" : nil,
+                action: { openSettings() }
+            )
         }
     }
 
-    private func scheduleRow(_ fixture: SportsFixture, now: Date) -> some View {
-        VStack(spacing: 0) {
-            SportsScheduleRow(fixture: fixture, now: now)
-            Divider()
+    @ViewBuilder private func scoresNotice(_ sports: SportsPresentation) -> some View {
+        if sports.liveStatus == .needsKey {
+            GlassCapsuleButton(
+                title: "Configurer les scores en direct", systemImage: "gearshape", trailingChevron: false, style: .regular
+            ) { openSettings() }
+        } else if sports.liveStatus == .unavailable {
+            Label("Scores en direct temporairement indisponibles", systemImage: "info.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
-        .id(fixture.id)
-    }
-
-    private func emptyState(_ sports: SportsPresentation) -> some View {
-        let missingGuide = app.guide.isEmpty && sports.fixtures.isEmpty
-        return EmptyStateView(
-            symbol: "sportscourt",
-            title: missingGuide ? "Programme sportif indisponible" : (period == .live ? "Aucune rencontre en direct" : "Aucune rencontre à cette date"),
-            message: missingGuide ? "Actualisez le guide TV ou configurez les scores dans Réglages." : nil,
-            actionTitle: missingGuide && sports.liveStatus == .needsKey ? "Ouvrir les réglages" : nil,
-            action: { openSettings() }
-        )
-    }
-
-    private func dayBinding(today: Date, in window: DateInterval) -> Binding<Date> {
-        Binding(get: {
-            if let day, day >= window.start, day < window.end { return day }
-            return today
-        }, set: { day = Calendar.current.startOfDay(for: $0) })
     }
 
     private func refreshGuide() {
+        isRefreshingGuide = true
         Task {
-            isRefreshingGuide = true
             defer { isRefreshingGuide = false }
             for source in app.sources where source.isEnabled {
                 guard !Task.isCancelled else { return }
@@ -207,80 +250,49 @@ struct SportsScreen: View {
     }
 }
 
-private struct SportsScheduleRow: View {
-    @Environment(AppModel.self) private var app
-    @Environment(\.playPrismItem) private var playItem
-    let fixture: SportsFixture
-    let now: Date
+private struct SportsPeriodStyle: ViewModifier {
+    @Environment(\.prismSnapshotRendering) private var snapshot
+    let isSelected: Bool
 
-    var body: some View {
-        let live = fixture.liveBroadcasts(at: now)
-        HStack(alignment: .center, spacing: 20) {
-            SportsArtwork(fixture: fixture, size: CGSize(width: 192, height: 108))
-
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 9) {
-                    Text(SportsTypography.hour(fixture.startsAt))
-                        .font(.callout.weight(.semibold).monospacedDigit())
-                    Text(fixture.competition)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                if let event = fixture.event {
-                    SportsTeamLine(team: event.home, showsScore: fixture.showsScore)
-                    SportsTeamLine(team: event.away, showsScore: fixture.showsScore)
-                    if event.league == .boxing, event.status == .final, let result = event.resultSummary {
-                        Text(result)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+    func body(content: Content) -> some View {
+        Group {
+            if snapshot {
+                content.buttonStyle(.plain)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(isSelected ? Color.white : Color.primary)
+                    .padding(.horizontal, 14)
+                    .frame(height: PrismMetrics.toolbarButtonSize)
+                    .background {
+                        if isSelected { Capsule().fill(Color.accentColor) }
+                        else { Capsule().fill(.clear).prismGlass() }
                     }
-                } else {
-                    Text(fixture.title).font(.headline).lineLimit(2)
-                }
-                HStack(spacing: 8) {
-                    SportsStatus(fixture: fixture, now: now)
-                    if !fixture.broadcasts.isEmpty {
-                        Text(fixture.broadcasts.map(\.channel.name).joined(separator: " · "))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
+            } else if isSelected {
+                content.buttonStyle(.glassProminent)
+            } else {
+                content.buttonStyle(.glass)
             }
-            .frame(maxWidth: 300, alignment: .leading)
-
-            Spacer(minLength: 0)
-            playControl(live)
         }
-        .padding(.vertical, 13)
-        .accessibilityElement(children: .contain)
-    }
-
-    @ViewBuilder private func playControl(_ broadcasts: [SportsBroadcast]) -> some View {
-        let playback = SportsPlayback(app: app, play: playItem)
-        if let broadcast = broadcasts.first, broadcasts.count == 1 {
-            GlassCapsuleButton(title: "Regarder", systemImage: "play.fill", trailingChevron: false, style: .regular) {
-                playback(broadcast)
-            }
-            .help("Regarder sur \(broadcast.channel.name)")
-        } else if !broadcasts.isEmpty {
-            Menu {
-                ForEach(broadcasts) { broadcast in
-                    Button(broadcast.channel.name) { playback(broadcast) }
-                }
-            } label: {
-                GlassCapsuleLabel(title: "Regarder", systemImage: "play.fill")
-                    .prismGlass(.regular, in: .capsule, interactive: true)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-        }
+        .buttonBorderShape(.capsule)
+        .controlSize(.large)
+        .fixedSize()
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
-private extension SportsFixture {
-    var isIdentifiedMatch: Bool { event != nil || (isNamedBroadcast && !isCompanionProgram) }
+struct SportsGlassMenu: ViewModifier {
+    var style: PrismGlassStyle = .regular
+    var circular = false
+
+    func body(content: Content) -> some View {
+        let menu = content
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        if circular {
+            menu.prismGlass(style, in: .circle, interactive: true)
+        } else {
+            menu.prismGlass(style, in: .capsule, interactive: true)
+        }
+    }
 }

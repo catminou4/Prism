@@ -4,10 +4,13 @@ import PrismData
 import PrismDesign
 import SwiftUI
 
-/// A single downsampled artwork slot shared by the shelf and the programme.
+/// Sports artwork with a team or channel fallback at the same display size.
 struct SportsArtwork: View {
+    enum Placement { case card, feature }
+
     let fixture: SportsFixture
     let size: CGSize
+    var placement: Placement = .card
 
     @State private var failedURLs: Set<URL> = []
 
@@ -17,15 +20,26 @@ struct SportsArtwork: View {
     }
 
     var body: some View {
-        LinearGradient(colors: [Color(white: 0.24), Color(white: 0.10)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            .frame(width: size.width, height: size.height)
-            .overlay { content }
-            .clipShape(.rect(cornerRadius: PrismMetrics.wideRadius))
-            .overlay {
-                RoundedRectangle(cornerRadius: PrismMetrics.wideRadius)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-            }
-            .accessibilityHidden(true)
+        ZStack {
+            LinearGradient(colors: palette, startPoint: .bottomLeading, endPoint: .topTrailing)
+            RadialGradient(
+                colors: [.white.opacity(0.16), .clear], center: .init(x: 0.76, y: 0.27),
+                startRadius: 0, endRadius: max(1, size.width * 0.48)
+            )
+
+            content
+        }
+        .frame(width: size.width, height: size.height)
+        .clipped()
+        .accessibilityHidden(true)
+    }
+
+    private var palette: [Color] {
+        switch fixture.sport {
+        case .football: [Color(red: 0.04, green: 0.14, blue: 0.23), Color(red: 0.10, green: 0.45, blue: 0.48)]
+        case .basketball: [Color(red: 0.20, green: 0.06, blue: 0.13), Color(red: 0.61, green: 0.28, blue: 0.13)]
+        case .boxing: [Color(red: 0.14, green: 0.09, blue: 0.28), Color(red: 0.42, green: 0.27, blue: 0.66)]
+        }
     }
 
     @ViewBuilder private var content: some View {
@@ -35,12 +49,19 @@ struct SportsArtwork: View {
                 onLoadFailure: { failedURLs.insert(artworkURL) }
             )
         } else {
-            fallback
+            let isFeature = placement == .feature
+            let center = CGPoint(x: size.width * (isFeature ? 0.755 : 0.5), y: size.height * (isFeature ? 0.5 : 0.55))
+            Ellipse()
+                .strokeBorder(.white.opacity(0.09), lineWidth: 1)
+                .frame(width: size.width * 0.52, height: size.height * 0.86)
+                .rotationEffect(.degrees(-27))
+                .position(center)
+            emblems(diameter: min(isFeature ? 112 : 88, size.height * (isFeature ? 0.34 : 0.40)))
+                .position(center)
         }
     }
 
-    @ViewBuilder private var fallback: some View {
-        let diameter = max(28, min(58, size.height * 0.40))
+    @ViewBuilder private func emblems(diameter: CGFloat) -> some View {
         if let event = fixture.event {
             HStack(spacing: diameter * 0.4) {
                 SportsArtworkBadge(logo: event.home.logoURL, monogram: Self.monogram(event.home), diameter: diameter)
@@ -85,8 +106,8 @@ private struct SportsArtworkBadge: View {
 
     var body: some View {
         Circle()
-            .fill(Color(white: 0.42, opacity: 0.35))
-            .overlay { Circle().strokeBorder(Color(white: 0.8, opacity: 0.22), lineWidth: 1) }
+            .fill(.white.opacity(0.13))
+            .overlay { Circle().strokeBorder(.white.opacity(0.27), lineWidth: 1) }
             .frame(width: diameter, height: diameter)
             .overlay { content.foregroundStyle(Color(white: 0.9)) }
     }
@@ -101,7 +122,7 @@ private struct SportsArtworkBadge: View {
             )
         } else if let monogram, !monogram.isEmpty {
             Text(monogram)
-                .font(.system(size: diameter * 0.30, weight: .semibold, design: .monospaced))
+                .font(.system(size: diameter * 0.30, weight: .bold, design: .rounded))
                 .tracking(0.2)
         } else if let symbol {
             Image(systemName: symbol)
