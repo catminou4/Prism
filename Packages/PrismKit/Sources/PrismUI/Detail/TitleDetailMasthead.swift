@@ -3,6 +3,7 @@ import PrismDesign
 import SwiftUI
 
 struct TitleDetailMasthead: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let title: MediaTitle
     let height: CGFloat
     let blurAmount: Double
@@ -33,11 +34,17 @@ struct TitleDetailMasthead: View {
         GeometryReader { geometry in
             let size = geometry.size
             let textWidth = min(530, size.width * 0.62)
+            let shouldReduceMotion = reduceMotion
             ZStack(alignment: .bottomLeading) {
                 HeroBackdrop(
                     backdropURLs: backdrops, seed: title.id.rawValue, fallbackPosterURLs: posters,
                     leadingScrim: 0.30, extendsUnderSidebar: true, artSize: size, blurAmount: blurAmount
                 )
+                .visualEffect { content, proxy in
+                    let pull = max(0, proxy.frame(in: .scrollView(axis: .vertical)).minY)
+                    let zoom = shouldReduceMotion ? 1 : 1 + pull / max(1, size.height)
+                    return content.scaleEffect(zoom, anchor: .bottom)
+                }
                 .allowsHitTesting(false)
 
                 VStack(alignment: .leading, spacing: 12) {

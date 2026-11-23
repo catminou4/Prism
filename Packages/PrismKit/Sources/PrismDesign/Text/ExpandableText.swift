@@ -160,10 +160,11 @@ private struct ExpandedTextPopover: View {
             VStack(alignment: .leading, spacing: 8) {
                 if let title {
                     Text(title).font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
                 }
                 text
                     .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.92))
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
@@ -172,6 +173,9 @@ private struct ExpandedTextPopover: View {
         }
         .frame(maxHeight: 320)
         .fixedSize(horizontal: false, vertical: true)
+        // The hero uses white text in both system appearances. Give the popover its own
+        // opaque surface so the native light popover material cannot wash that text out.
+        .background(Color(white: 0.13))
     }
 }
 

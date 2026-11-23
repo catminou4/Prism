@@ -400,18 +400,29 @@ private struct HighlightPage: View {
     var body: some View {
         let quickPlay = title.kind == .movie ? QuickPlay.option(for: title, app: app) : nil
         ZStack(alignment: .bottomLeading) {
-            HeroBackdrop(
-                backdropURLs: app.heroArtwork.backdropURLs(for: title), seed: title.id.rawValue,
-                fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
-                leadingScrim: 0.72, artSize: size
-            )
+            Button {
+                navigation.push(.title(title.id))
+            } label: {
+                HeroBackdrop(
+                    backdropURLs: app.heroArtwork.backdropURLs(for: title), seed: title.id.rawValue,
+                    fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
+                    leadingScrim: 0.72, artSize: size
+                )
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .focusEffectDisabled()
+            .accessibilityLabel("Voir la fiche de \(title.title)")
             VStack(alignment: .leading, spacing: 10) {
-                if let label = highlight.label { LabelPill(label).staggeredReveal(revealed, order: 0) }
+                if let label = highlight.label {
+                    LabelPill(label).staggeredReveal(revealed, order: 0).allowsHitTesting(false)
+                }
                 TitleLogo(
                     url: metadata?.images.logoURL, fallbackTitle: title.title,
                     maxSize: CGSize(width: min(420, size.width * 0.4), height: min(120, size.height * 0.2))
                 )
                 .staggeredReveal(revealed, order: 1, distance: 18)
+                .allowsHitTesting(false)
                 HStack(spacing: 6) {
                     Text(facts.joined(separator: " · "))
                     if let rating = title.rating, rating > 0, rating < 9.6 {
@@ -423,6 +434,7 @@ private struct HighlightPage: View {
                 .font(PrismFont.heroMeta.weight(.medium))
                 .foregroundStyle(PrismColors.onArtworkSecondary)
                 .staggeredReveal(revealed, order: 2)
+                .allowsHitTesting(false)
                 if let synopsis {
                     Text(synopsis)
                         .font(PrismFont.heroBody)
@@ -431,6 +443,7 @@ private struct HighlightPage: View {
                         .lineSpacing(PrismFont.heroLineSpacing)
                         .transition(.opacity)
                         .staggeredReveal(revealed, order: 3)
+                        .allowsHitTesting(false)
                 }
                 HStack(spacing: PrismMetrics.heroButtonSpacing) {
                     if let quickPlay {

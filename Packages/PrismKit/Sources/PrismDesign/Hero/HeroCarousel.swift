@@ -17,6 +17,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
     @State private var direction: Edge = .trailing
     @State private var hovering = false
     @State private var isWindowVisible = true
+    @State private var scrollHitRegion = HeroScrollHitRegion()
     @Environment(\.appearsActive) private var appearsActive
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -81,9 +82,12 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         .overlay(alignment: .bottom) { navigationControls }
         .background {
             WindowOcclusionReader(isVisible: $isWindowVisible)
-            if canPage { HeroHorizontalScrollReader { go(to: currentIndex + $0) } }
+            if canPage { HeroHorizontalScrollReader(region: scrollHitRegion) { go(to: currentIndex + $0) } }
         }
         .onHover { hovering = $0 }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+            scrollHitRegion.frame = frame
+        }
         .focusable(canPage)
         .focusEffectDisabled()
         .onKeyPress(.leftArrow) {

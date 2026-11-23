@@ -35,18 +35,30 @@ nonisolated struct HeroScrollGesture {
     }
 }
 
+/// Updated during layout without invalidating the carousel on every scroll frame.
+final class HeroScrollHitRegion {
+    var frame: CGRect = .zero
+
+    func contains(_ point: CGPoint, in viewport: CGRect) -> Bool {
+        viewport.contains(point) && frame.contains(point)
+    }
+}
+
 /// An AppKit event monitor scoped to the visible hero in the key window. Its invisible view never
 /// becomes a hit-test target, leaving buttons, links and vertical scrolling with SwiftUI.
 struct HeroHorizontalScrollReader: NSViewRepresentable {
+    let region: HeroScrollHitRegion
     let onPage: (Int) -> Void
 
     func makeNSView(context: Context) -> MonitorView {
         let view = MonitorView()
+        view.region = region
         view.onPage = onPage
         return view
     }
 
     func updateNSView(_ view: MonitorView, context: Context) {
+        view.region = region
         view.onPage = onPage
     }
 
@@ -55,6 +67,7 @@ struct HeroHorizontalScrollReader: NSViewRepresentable {
     }
 
     final class MonitorView: NSView {
+        var region: HeroScrollHitRegion?
         var onPage: ((Int) -> Void)?
         private var monitor: Any?
         private var gesture = HeroScrollGesture()
@@ -87,15 +100,24 @@ struct HeroHorizontalScrollReader: NSViewRepresentable {
 
         private func shouldConsume(_ event: NSEvent) -> Bool {
             guard let window, window.isKeyWindow, window.attachedSheet == nil, event.window === window else { return false }
+            // SwiftUI clips a scrolling hero inside its hosting view; AppKit's visibleRect
+            // alone does not reflect that clipping and may still cover a shelf below it.
+            guard let contentView = window.contentView, let region else { return false }
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            let bounds = contentView.bounds
+            let position = CGPoint(
+                x: point.x - bounds.minX,
+                y: contentView.isFlipped ? point.y - bounds.minY : bounds.maxY - point.y
+            )
+            let viewport = CGRect(origin: .zero, size: bounds.size)
+            let insideHero = region.contains(position, in: viewport)
             if !event.momentumPhase.isEmpty {
-                let discard = isTracking && gesture.consumesMomentum
-                if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) {
+                let discard = insideHero && isTracking && gesture.consumesMomentum
+                if !insideHero || event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) {
                     isTracking = false
                 }
                 return discard
             }
-
-            let insideHero = visibleRect.contains(convert(event.locationInWindow, from: nil))
             let phase = event.phase
             let deltaX = event.scrollingDeltaX
             let deltaY = event.scrollingDeltaY

@@ -25,6 +25,18 @@ struct HeroBehaviorTests {
         #expect(!gesture.consumesMomentum)
     }
 
+    @Test func heroSwipeIsLimitedToItsVisiblePosition() {
+        let region = HeroScrollHitRegion()
+        let viewport = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        region.frame = CGRect(x: 0, y: 0, width: 1000, height: 500)
+        #expect(region.contains(CGPoint(x: 300, y: 300), in: viewport))
+        #expect(!region.contains(CGPoint(x: 300, y: 650), in: viewport))
+        region.frame = CGRect(x: 0, y: -400, width: 1000, height: 500)
+        #expect(region.contains(CGPoint(x: 300, y: 50), in: viewport))
+        #expect(!region.contains(CGPoint(x: 300, y: 300), in: viewport))
+        #expect(!region.contains(CGPoint(x: 300, y: -20), in: viewport))
+    }
+
     @Test func artworkRejectsMislabelledPortraitsAndRespectsEXIFOrientation() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

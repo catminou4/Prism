@@ -392,6 +392,8 @@ struct RepositoryTests {
         let afterMiss = StubURLProtocol.requestCount(host: host)
         #expect(await repository.metadata(for: unknown) == nil)
         #expect(StubURLProtocol.requestCount(host: host) == afterMiss, "negative result cached")
+        #expect(await repository.metadata(for: unknown, tmdbID: 949)?.title == "Heat")
+        #expect(StubURLProtocol.requestCount(host: host) == afterMiss, "a later provider ID bypasses the cached search miss")
 
         async let firstTrend = repository.weeklyTrending(for: .movie)
         async let secondTrend = repository.weeklyTrending(for: .movie)

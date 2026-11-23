@@ -69,6 +69,7 @@ private struct TitleDetailContent: View {
     @Environment(\.isPageActive) private var isPageActive
     @Environment(\.openURL) private var openURL
     @Environment(\.prismSnapshotRendering) private var snapshotRendering
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let title: MediaTitle
     let editions: [TitleEdition]
 
@@ -225,14 +226,16 @@ private struct TitleDetailContent: View {
             }
             .onScrollGeometryChange(for: Int.self) { scroll in
                 let distance = max(0, scroll.contentOffset.y + scroll.contentInsets.top)
-                return min(20, Int((distance / 240 * 20).rounded()))
+                let heroHeight = Self.mastheadHeight(for: viewport.size.height)
+                let progress = max(0, min(1, (distance / heroHeight - 0.78) / 0.20))
+                return Int((progress * 20).rounded())
             } action: { _, step in
                 heroBlurStep = step
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
             .prismScrollPhase()
             .background(alignment: .top) {
-                if isAtTop {
+                if reduceMotion && isAtTop {
                     HeroOverscrollBackground(backdropURLs: backdrops, fallbackPosterURLs: posters, seed: title.id.rawValue)
                         .frame(height: Self.mastheadHeight(for: viewport.size.height))
                 }
