@@ -7,6 +7,7 @@ import PrismPlayer
 
 struct SourceDetailView: View {
     @Environment(AppModel.self) private var app
+    @Environment(\.isPageActive) private var isPageActive
     let sourceID: SourceID
     /// Comptages calculés une fois par publication de catalogue dans `AppModel`
     /// (`countsBySource`) — plus de 3 scans O(catalogue) à chaque visite de page.
@@ -81,7 +82,10 @@ struct SourceDetailView: View {
             // Les comptages par source sont calculés à la demande (une passe
             // @concurrent sur tout le catalogue) : cette fiche est leur seule
             // lectrice, on les prépare à l'ouverture et après chaque republication.
-            .task(id: app.catalogRevision) { app.prepareSourceCounts() }
+            // La lecture paresseuse de `catalogRevision` (ternaire) évite de
+            // souscrire quand la page est enfouie : ni réévaluation ni passe de
+            // comptage tant que la fiche n'est pas visible.
+            .task(id: isPageActive ? app.catalogRevision : nil) { app.prepareSourceCounts() }
             .sheet(isPresented: $editing) { EditSourceSheet(source: source) }
             .sheet(isPresented: $filteringCategories) {
                 SourceCategorySheet(

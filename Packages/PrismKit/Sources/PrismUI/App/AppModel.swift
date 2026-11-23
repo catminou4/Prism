@@ -12,9 +12,35 @@ public struct CurationRequest: Hashable, Sendable {
     let curationRevision: Int
     let trendingRevision: Int
     let languages: Set<HomeAudioLanguage>
+    /// Content token of `profile`: the payload itself can hold ~2 000 dismissed
+    /// ids, so `==`/`hash` go through this revision — `.task(id:)` pays the
+    /// comparison on every body evaluation of every page asking for a feed.
+    /// Two requests sharing a `profileRevision` always carry equal profiles
+    /// (the revision only bumps when the rebuilt profile differs).
+    let profileRevision: Int
     let profile: CurationProfile
     /// Shelves rotate once a day.
     let day: Int
+
+    public static func == (lhs: CurationRequest, rhs: CurationRequest) -> Bool {
+        lhs.scope == rhs.scope
+            && lhs.catalogRevision == rhs.catalogRevision
+            && lhs.curationRevision == rhs.curationRevision
+            && lhs.trendingRevision == rhs.trendingRevision
+            && lhs.languages == rhs.languages
+            && lhs.profileRevision == rhs.profileRevision
+            && lhs.day == rhs.day
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(scope)
+        hasher.combine(catalogRevision)
+        hasher.combine(curationRevision)
+        hasher.combine(trendingRevision)
+        hasher.combine(languages)
+        hasher.combine(profileRevision)
+        hasher.combine(day)
+    }
 }
 
 /// App-wide state: sources, the merged catalog, the EPG guide, the search index and the
@@ -41,7 +67,14 @@ public final class AppModel {
     @ObservationIgnored private let sourceStore: SourceStore
     @ObservationIgnored private let settings = AppSettings()
     @ObservationIgnored private let isEphemeral: Bool
-    public private(set) var library: LibraryStore
+    public private(set) var library: LibraryStore {
+        didSet {
+            // A swapped store invalidates the curation memo and its observation
+            // (tests/previews reassign it); the next read re-arms on the new one.
+            curationProfileDirty = true
+            curationProfileObservedStore = nil
+        }
+    }
 
     // MARK: State
 
@@ -85,6 +118,16 @@ public final class AppModel {
     private var hiddenCategoriesBySource: [String: [String]] = [:]
     /// Bumped every time `catalog` is replaced (cheap change token for views/tasks).
     public private(set) var catalogRevision = 0
+    /// Bumped when `curationProfile`'s content actually changes — the token views
+    /// compare instead of the profile's collections (see `CurationRequest`).
+    public private(set) var curationProfileRevision = 0
+    /// Memoized `curationProfile`: rebuilding it copies the watchlist and hashes
+    /// up to 2 000 dismissed ids, and pages ask for a request on every body
+    /// evaluation. Dropped by `observeCurationProfile` when its inputs mutate.
+    @ObservationIgnored private var curationProfileCache: CurationProfile?
+    @ObservationIgnored private var curationProfileDirty = true
+    /// The `LibraryStore` instance currently observed for profile inputs.
+    @ObservationIgnored private var curationProfileObservedStore: LibraryStore?
 
     public var hideAdultContent: Bool {
         didSet {
@@ -215,19 +258,85 @@ public final class AppModel {
     }
 
     /// What the curated shelves know about the user (local only).
+    ///
+    /// Memoized: each rebuild copies the watchlist and hashes up to 2 000
+    /// dismissed ids, and view bodies ask for a curation request on every
+    /// evaluation. `observeCurationProfile` drops the memo when watchlist,
+    /// dismissed or history mutate; the revision only bumps when the rebuilt
+    /// profile actually differs, so no-op writes don't invalidate feeds.
     public var curationProfile: CurationProfile {
+        observeCurationProfile()
+        if curationProfileDirty {
+            let profile = CurationProfile(
+                watchlist: library.watchlist,
+                watched: Self.watchedTitleIDs(in: library.history),
+                dismissed: Set(library.dismissed)
+            )
+            if profile != curationProfileCache {
+                curationProfileRevision &+= 1
+                curationProfileCache = profile
+            }
+            curationProfileDirty = false
+        }
+        return curationProfileCache ?? CurationProfile()
+    }
+
+    /// Most recent first, deduplicated — the `watched` input of `CurationProfile`.
+    private static func watchedTitleIDs(in history: [HistoryEntry]) -> [TitleID] {
         var watched: [TitleID] = []
         var seen: Set<TitleID> = []
-        for entry in library.history.prefix(48) {
+        for entry in history.prefix(48) {
             if case .title(let id) = entry.target, seen.insert(id).inserted { watched.append(id) }
         }
-        return CurationProfile(watchlist: library.watchlist, watched: watched, dismissed: Set(library.dismissed))
+        return watched
+    }
+
+    /// (Re)arms one-shot observation of exactly the library collections
+    /// `curationProfile` reads. `withObservationTracking` fires on the first
+    /// mutation after arming; `onChange` runs synchronously inside the write's
+    /// `willSet` (already on the main actor), marks the memo dirty — the next
+    /// read rebuilds from post-write state — and re-arms for the next mutation.
+    private func observeCurationProfile() {
+        let store = library
+        guard curationProfileObservedStore !== store else { return }
+        curationProfileObservedStore = store
+        withObservationTracking {
+            MainActor.assumeIsolated {
+                _ = store.watchlist
+                _ = store.dismissed
+                _ = store.history
+            }
+        } onChange: { [weak self, weak store] in
+            MainActor.assumeIsolated {
+                guard let self, let store, self.library === store else { return }
+                // Keep the old cache: the lazy rebuild compares against it, so a
+                // mutation landing on identical content doesn't bump the
+                // revision (and needlessly recompose every feed).
+                self.curationProfileDirty = true
+                // Re-arm for the next mutation; this write is already covered —
+                // the rebuild reads the landed state on next access.
+                self.curationProfileObservedStore = nil
+                self.observeCurationProfile()
+                // The dirty flag is @ObservationIgnored: without a tracked write,
+                // feed bodies never re-evaluate and dismissed/watchlisted changes
+                // stay invisible until an unrelated trigger. Rebuild on the next
+                // main-actor turn (this onChange runs inside willSet, pre-write);
+                // `curationProfileRevision` bumps only when content differs.
+                Task { @MainActor [weak self] in _ = self?.curationProfile }
+            }
+        }
     }
 
     public func curationRequest(for scope: CurationScope) -> CurationRequest {
-        CurationRequest(
+        // Read the profile first: a dirty memo rebuilds here and bumps
+        // `curationProfileRevision`, so the revision must be sampled after —
+        // arguments evaluate left to right and a stale token would make the
+        // request fail `refreshFeed`'s freshness check on its first use.
+        let profile = curationProfile
+        return CurationRequest(
             scope: scope, catalogRevision: catalogRevision, curationRevision: curationRevision,
-            trendingRevision: trendingRevision, languages: homeAudioLanguages, profile: curationProfile,
+            trendingRevision: trendingRevision, languages: homeAudioLanguages,
+            profileRevision: curationProfileRevision, profile: profile,
             day: Int(Date.now.timeIntervalSince1970 / 86_400)
         )
     }
@@ -714,11 +823,21 @@ public final class AppModel {
     }
 
     private func publish(_ built: Catalog, recommendations: Recommendations) {
-        library.reconcileTitles(in: built)
         catalog = built
         searchIndex = nil
         self.recommendations = recommendations
         catalogRevision &+= 1
+        let publishedRevision = catalogRevision
+        // `reconcileTitles` walks every library collection (progress, history,
+        // preferences — ~30 ms measured at the collection caps) on the main
+        // actor. Inline, it used to sit on `.ready`'s critical path and delay
+        // every republish; deferred by one actor turn it lands right after the
+        // new snapshot is visible. The revision guard drops it when a newer
+        // publish already superseded this one (that publish enqueues its own).
+        Task(priority: .utility) { [weak self] in
+            guard let self, self.catalogRevision == publishedRevision else { return }
+            self.library.reconcileTitles(in: built)
+        }
         trendingTask?.cancel()
         trendingTask = nil
         trendingIDs = [:]

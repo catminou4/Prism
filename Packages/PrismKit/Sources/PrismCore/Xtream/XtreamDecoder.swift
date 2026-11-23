@@ -367,20 +367,32 @@ public enum XtreamDecoder {
 
     // MARK: Helpers
 
+    /// Index of the first byte that isn't JSON whitespace (space, tab, LF, CR),
+    /// or nil for empty/blank payloads.
+    static func firstJSONByte(_ data: Data) -> Data.Index? {
+        data.firstIndex(where: { $0 != 0x20 && $0 != 0x0A && $0 != 0x0D && $0 != 0x09 })
+    }
+
+    /// Bytes actually fed to the JSON parser: whitespace/BOM handling + gzip inflation
+    /// for panels that emit compressed bodies without `Content-Encoding`.
+    static func payloadBytes(_ data: Data, first: Data.Index) -> Data {
+        // Some panels prepend whitespace before a UTF-8 BOM.
+        var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+        // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
+        // (URLSession only decompresses when the header is present). A failed inflate falls
+        // back to the raw bytes, preserving the previous parse error.
+        if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
+            payload = inflated
+        }
+        return payload
+    }
+
     static func json(_ data: Data) throws -> Any {
-        guard let first = data.firstIndex(where: { $0 != 0x20 && $0 != 0x0A && $0 != 0x0D && $0 != 0x09 }) else {
+        guard let first = firstJSONByte(data) else {
             return [Any]()
         }
         do {
-            // Some panels prepend whitespace before a UTF-8 BOM.
-            var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
-            // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
-            // (URLSession only decompresses when the header is present). A failed inflate falls
-            // back to the raw bytes, preserving the previous parse error.
-            if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
-                payload = inflated
-            }
-            return try LenientValue.parse(payload)
+            return try LenientValue.parse(payloadBytes(data, first: first))
         } catch {
             let preview = String(decoding: data[first...].prefix(80), as: UTF8.self)
             throw XtreamError.decoding("JSON invalide : \(preview)")
@@ -389,6 +401,13 @@ public enum XtreamDecoder {
 
     /// Top-level array (or dictionary of elements).
     static func elements(_ data: Data) throws -> [Any] {
+        // Huge list endpoints: slice the top-level array and parse slices in parallel.
+        // `JSONArrayChunks` only accepts clean `[…]` payloads and returns nil otherwise —
+        // the sequential path below then reproduces the exact same result or error.
+        if let first = firstJSONByte(data),
+           let items = JSONArrayChunks.parse(payloadBytes(data, first: first)) {
+            return items
+        }
         let value = try json(data)
         if let dict = value as? [String: Any] {
             if let userInfo = dict["user_info"] {

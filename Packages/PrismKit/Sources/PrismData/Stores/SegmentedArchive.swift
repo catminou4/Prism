@@ -4,12 +4,17 @@ import Foundation
 /// and decoded in parallel (one JSONDecoder per segment).
 ///
 /// Layout: `"PRSG"` magic · format version (UInt32 LE) · segment count (UInt32 LE) ·
-/// per segment: tag (UInt8) + byte length (UInt32 LE) · then the LZFSE-compressed JSON payloads.
+/// per segment: tag (UInt8) + byte length (UInt32 LE) · then the compressed JSON payloads.
 /// Any mismatch (magic, version, truncated data) makes `segments(in:version:)` return `nil`.
+///
+/// Payload codec: LZFSE-compressed JSON. `decompressPayload` also accepts LZ4 (`"bv41"` magic)
+/// so a future codec switch decodes archives of either generation; measured on catalog JSON,
+/// LZ4 compresses ~60× faster but at ~1.6-1.7× the bytes — decode is JSONDecoder-bound, so the
+/// larger payload buys nothing at launch while doubling cache footprint: LZFSE stays.
 enum SegmentedArchive {
     struct Segment: Sendable {
         var tag: UInt8
-        /// LZFSE-compressed JSON.
+        /// Compressed JSON (LZFSE; the decoder also accepts LZ4 payloads).
         var payload: Data
     }
 
@@ -69,14 +74,31 @@ enum SegmentedArchive {
 
     static func encodeSegment<T: Encodable>(_ value: T, tag: UInt8) throws -> Segment {
         try autoreleasepool {
-            let json = try JSONEncoder().encode(value)
+            let encoder = JSONEncoder()
+            // Escaping `/` as `\/` costs a scan plus one byte per slash on URL-heavy catalog data
+            // (~2% of the JSON): `.withoutEscapingSlashes` shrinks it and the encode pass. Still
+            // plain JSON — every decoder (old and new) reads it unchanged.
+            encoder.outputFormatting = .withoutEscapingSlashes
+            let json = try encoder.encode(value)
             return Segment(tag: tag, payload: try (json as NSData).compressed(using: .lzfse) as Data)
         }
     }
 
+    /// Apple's LZ4 streams begin with the `"bv41"` magic (LZFSE uses `"bvx…"`).
+    private static let lz4Magic = Data("bv41".utf8)
+
+    /// Expands a payload with the codec its magic announces, falling back to the other codec so a
+    /// payload written by either generation decodes (and truly foreign data still returns `nil`).
+    static func decompressPayload(_ payload: Data) -> Data? {
+        let nsData = payload as NSData
+        let preferred: NSData.CompressionAlgorithm = payload.count >= 4 && payload.prefix(4) == lz4Magic ? .lz4 : .lzfse
+        if let json = try? nsData.decompressed(using: preferred) as Data { return json }
+        return try? nsData.decompressed(using: preferred == .lz4 ? .lzfse : .lz4) as Data
+    }
+
     static func decodeSegment<T: Decodable>(_ type: T.Type, from segment: Segment) -> T? {
         autoreleasepool {
-            guard let json = try? (segment.payload as NSData).decompressed(using: .lzfse) as Data else { return nil }
+            guard let json = decompressPayload(segment.payload) else { return nil }
             return try? JSONDecoder().decode(T.self, from: json)
         }
     }

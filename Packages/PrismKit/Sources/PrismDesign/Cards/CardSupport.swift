@@ -174,6 +174,7 @@ struct CardContainer<Content: View, MenuContent: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotHover) private var forcedHover
     @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.isPageActive) private var isPageActive
 
     private var isHovered: Bool { (hovering || forcedHover) && !isScrollingContent }
 
@@ -191,69 +192,87 @@ struct CardContainer<Content: View, MenuContent: View>: View {
         self.content = content
     }
 
-    var body: some View {
-        // While a scroll container is moving, cards take a lean path: a tap gesture
-        // replaces the Button's control machinery, and the hover/lift environment and
-        // tracking modifiers are skipped — shelves materialize ~8 cards in a single
-        // layout pass and every saved node counts. The untaken branch is never
-        // instantiated, so these modifiers cost nothing during the scroll itself.
-        Group {
-            if isScrollingContent {
+    /// The card's interactive core: while a scroll container is moving, cards take a lean
+    /// path — a tap gesture replaces the Button's control machinery, and the hover/lift
+    /// environment and tracking modifiers are skipped — shelves materialize ~8 cards in a
+    /// single layout pass and every saved node counts. The untaken branch is never
+    /// instantiated, so these modifiers cost nothing during the scroll itself.
+    @ViewBuilder private var cardBody: some View {
+        if isScrollingContent {
+            if let action {
+                content(isHovered)
+                    .contentShape(.rect)
+                    .onTapGesture { action() }
+            } else {
+                content(isHovered)
+            }
+        } else {
+            Group {
                 if let action {
-                    content(isHovered)
-                        .contentShape(.rect)
-                        .onTapGesture { action() }
+                    Button(action: action) {
+                        content(isHovered)
+                    }
+                    .buttonStyle(CardPressStyle(isHovered: isHovered, hoverScale: hoverScale, reduceMotion: reduceMotion))
                 } else {
                     content(isHovered)
+                        .hoverLiftEffect(
+                            isHovered: isHovered, isPressed: false, scale: hoverScale,
+                            pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion
+                        )
                 }
-            } else {
-                Group {
-                    if let action {
-                        Button(action: action) {
-                            content(isHovered)
-                        }
-                        .buttonStyle(CardPressStyle(isHovered: isHovered, hoverScale: hoverScale, reduceMotion: reduceMotion))
-                    } else {
-                        content(isHovered)
-                            .hoverLiftEffect(
-                                isHovered: isHovered, isPressed: false, scale: hoverScale,
-                                pressedScale: 0.97, shadow: false, reduceMotion: reduceMotion
-                            )
-                    }
-                }
-                .environment(\.prismCardLifted, isHovered)
-                .onHover { inside in
-                    hovering = inside
-                }
-                .focusEffectDisabled()
             }
+            .environment(\.prismCardLifted, isHovered)
+            .onHover { inside in
+                hovering = inside
+            }
+            .focusEffectDisabled()
         }
-        .onChange(of: isScrollingContent) { _, scrolling in
-            // Drop stale hover state: missed exits would otherwise leave a lift behind.
-            if !scrolling { hovering = false }
-        }
-        .modifier(OptionalContextMenu(menu: menu))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(action == nil ? [] : .isButton)
-        .modifier(CardDefaultAction(action: action))
     }
-}
 
-/// During scroll, cards activate through a tap gesture instead of a `Button`, so the
-/// default accessibility action (VoiceOver activation) must be attached explicitly —
-/// applied after `accessibilityElement(children: .combine)` so it lands on the merged
-/// element. Outside scroll the `Button` already provides it.
-private struct CardDefaultAction: ViewModifier {
-    let action: (() -> Void)?
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    /// Context menu + its accessibility actions. `.contextMenu` is lazy, but
+    /// `.accessibilityActions` makes SwiftUI evaluate the menu content for every card's
+    /// accessibility node — on shelves that is ~8 extra view subtrees per layout pass.
+    /// Skipped while scrolling, and on buried pages (opacity 0, hit-testing off,
+    /// AX-hidden) whose menus are unreachable anyway. The actions return as soon as the
+    /// scroll settles or the page resurfaces. Inlined (rather than a `ViewModifier`) so
+    /// shelf materialization doesn't pay for the extra modified-content node per card.
+    @ViewBuilder private func withMenu<V: View>(_ content: V) -> some View {
+        if MenuContent.self == EmptyView.self {
+            content
+        } else if isScrollingContent || !isPageActive {
+            content.contextMenu { menu() }
+        } else {
+            content
+                .contextMenu { menu() }
+                .accessibilityActions { menu() }
+        }
+    }
 
-    func body(content: Content) -> some View {
+    /// During scroll, cards activate through a tap gesture instead of a `Button`, so the
+    /// default accessibility action (VoiceOver activation) must be attached explicitly —
+    /// applied after `accessibilityElement(children: .combine)` so it lands on the merged
+    /// element. Outside scroll the `Button` already provides it.
+    @ViewBuilder private func withDefaultAction<V: View>(_ content: V) -> some View {
         if isScrollingContent, let action {
             content.accessibilityAction { action() }
         } else {
             content
         }
+    }
+
+    var body: some View {
+        withDefaultAction(
+            withMenu(
+                cardBody
+                    .onChange(of: isScrollingContent) { _, scrolling in
+                        // Drop stale hover state: missed exits would otherwise leave a lift behind.
+                        if !scrolling { hovering = false }
+                    }
+            )
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityAddTraits(action == nil ? [] : .isButton)
+        )
     }
 }
 

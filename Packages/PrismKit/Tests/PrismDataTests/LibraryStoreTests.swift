@@ -138,8 +138,18 @@ struct LibraryStoreTests {
         #expect(store.saveCount == 0, "writes are debounced")
         #expect(!FileManager.default.fileExists(atPath: directories.libraryFile.path(percentEncoded: false)))
 
-        try await Task.sleep(for: .milliseconds(600))
+        // Poll instead of a fixed sleep: under parallel-suite CPU contention the
+        // 150 ms debounce (main-actor hop + detached write) can land well past 600 ms.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.saveCount == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
         #expect(store.saveCount == 1, "a burst of mutations produces a single write")
+        let fileDeadline = ContinuousClock.now + .seconds(5)
+        while !FileManager.default.fileExists(atPath: directories.libraryFile.path(percentEncoded: false)),
+              ContinuousClock.now < fileDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
 
         let reloaded = LibraryStore(directories: directories)
         await reloaded.awaitDiskLoad()

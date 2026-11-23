@@ -171,6 +171,49 @@ struct XMLTVParserTests {
         let document = try XMLTVParser.parse(Data(text.utf8))
         #expect(document.programs.map(\.title) == ["One"])
     }
+
+    /// Internal DTD declarations must take the Foundation fallback and produce
+    /// exactly what `parseFoundationXML` yields (entity semantics included).
+    @Test func internalDTDFallsBackToFoundationParser() throws {
+        let text = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE tv [
+        <!ENTITY showtitle "Le Journal">
+        <!ATTLIST title lang CDATA "fr">
+        ]>
+        <tv>
+          <channel id="tf1.fr"><display-name>TF1</display-name></channel>
+          <programme start="20250101120000 +0100" stop="20250101130000 +0100" channel="tf1.fr">
+            <title>&showtitle;</title>
+          </programme>
+        </tv>
+        """
+        let data = Data(text.utf8)
+        let document = try XMLTVParser.parse(data)
+        let reference = try XMLTVParser.parseFoundationXML(data, window: nil, timeShiftHours: 0)
+        #expect(document.programs == reference.programs)
+        #expect(document.channels == reference.channels)
+    }
+
+    /// External-only DOCTYPEs (the common XMLTV form) stay on the SAX fast path
+    /// and must parse identically to the Foundation implementation.
+    @Test func externalDoctypeStaysOnFastPath() throws {
+        let text = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE tv SYSTEM "xmltv.dtd">
+        <tv>
+          <channel id="tf1.fr"><display-name>TF1</display-name></channel>
+          <programme start="20250101120000 +0100" stop="20250101130000 +0100" channel="tf1.fr">
+            <title>Le Journal</title>
+          </programme>
+        </tv>
+        """
+        let data = Data(text.utf8)
+        let document = try XMLTVParser.parse(data)
+        let reference = try XMLTVParser.parseFoundationXML(data, window: nil, timeShiftHours: 0)
+        #expect(document.programs == reference.programs)
+        #expect(document.channels == reference.channels)
+    }
 }
 
 enum XMLTVTestTime {

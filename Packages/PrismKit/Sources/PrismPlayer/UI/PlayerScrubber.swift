@@ -7,6 +7,11 @@ struct PlayerScrubber: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @GestureState private var dragFraction: Double?
     @State private var hoverFraction: Double?
+    /// Hover tooltip doesn't need per-event updates: mouse-move events arrive at
+    /// display rate (up to 120 Hz+) and each `hoverFraction` write re-evaluates the
+    /// whole scrubber. ~30 Hz is indistinguishable for a 52 pt tooltip.
+    @State private var lastHoverWrite = Date.distantPast
+    private static let hoverWriteInterval: TimeInterval = 1.0 / 30
 
     private var isLive: Bool { controller.isLive }
     private var isSeekableLive: Bool { isLive && controller.timeshiftWindow != nil }
@@ -128,8 +133,16 @@ struct PlayerScrubber: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
-                    if seekable { hoverFraction = min(1, max(0, location.x / width)) }
-                case .ended: hoverFraction = nil
+                    if seekable {
+                        let now = Date()
+                        guard now.timeIntervalSince(lastHoverWrite) >= Self.hoverWriteInterval
+                        else { return }
+                        lastHoverWrite = now
+                        hoverFraction = min(1, max(0, location.x / width))
+                    }
+                case .ended:
+                    hoverFraction = nil
+                    lastHoverWrite = .distantPast
                 }
             }
             .gesture(seekable ? dragGesture(width: width) : nil)

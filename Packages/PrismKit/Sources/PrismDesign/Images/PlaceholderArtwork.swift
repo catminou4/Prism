@@ -56,13 +56,19 @@ public struct PlaceholderArtwork: View {
             .accessibilityHidden(true)
     }
 
-    private var artworkBody: some View {
-        ZStack {
+    @ViewBuilder private var artworkBody: some View {
+        let stack = ZStack {
             LinearGradient(colors: palette.gradient, startPoint: palette.start, endPoint: palette.end)
             RadialGradient(colors: Self.glowColors, center: palette.glowCenter, startRadius: 0, endRadius: 225)
             label
         }
-        .accessibilityHidden(true)
+        // `.none` renders no accessibility content (gradients/shapes aren't AX elements),
+        // so the modifier would be a no-op node on every card materialization.
+        if style == .none {
+            stack
+        } else {
+            stack.accessibilityHidden(true)
+        }
     }
 
     @ViewBuilder private var label: some View {

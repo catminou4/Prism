@@ -519,13 +519,19 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
 
     private func handleTime(_ seconds: TimeInterval) {
         guard let item = currentItem, seconds.isFinite else { return }
+        // `buffered` is dead data for live: `bufferedFraction` is always 0 and the
+        // scrubber maps programme/DVR progress instead. Skipping the
+        // `loadedTimeRanges` NSArray bridge saves an O(ranges) walk every tick —
+        // VLC already reports `buffered == current` for every stream.
         var buffered = seconds
-        for value in item.loadedTimeRanges {
-            let range = value.timeRangeValue
-            let start = range.start.seconds
-            let end = range.end.seconds
-            if start.isFinite, end.isFinite, start <= seconds + 0.5, end >= seconds {
-                buffered = max(buffered, end)
+        if !isLive {
+            for value in item.loadedTimeRanges {
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = range.end.seconds
+                if start.isFinite, end.isFinite, start <= seconds + 0.5, end >= seconds {
+                    buffered = max(buffered, end)
+                }
             }
         }
         eventHandler?(.time(current: seconds, buffered: buffered))

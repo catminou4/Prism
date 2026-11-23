@@ -59,21 +59,15 @@ public enum CatalogBuilder {
         }
         // Provider-language labels per variant, resolved once: `providerLanguages(for:)` sits on
         // hot audio paths and would otherwise interpolate category prefixes on every call.
+        // The ~250k-variant scan is sharded across workers; variant ids are unique, so the
+        // per-shard dictionaries merge without collisions.
         let providerLangsStart = ContinuousClock.now
         if !indexes.categoryLanguages.isEmpty {
             let languageMaps = providerLanguageMaps(context: context, categoryLanguages: indexes.categoryLanguages)
-            var languages: [ContentID: Set<String>] = [:]
-            for title in movies {
-                for variant in title.variants {
-                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
-                }
-            }
-            for title in series {
-                for variant in title.variants {
-                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
-                }
-            }
-            indexes.providerLanguages = languages
+            indexes.providerLanguages = await providerLanguagesIndex(
+                movies: movies, series: series,
+                languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages
+            )
         }
         BuildProfile.mark("providerLanguages", since: providerLangsStart)
         indexes.movieByTitleID = movieGroups.titleIndex
@@ -197,6 +191,57 @@ public enum CatalogBuilder {
             let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
             let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
             result[variant.id] = categoryLanguages[canonicalID] ?? []
+        }
+    }
+
+    /// Sharded, parallel version of the provider-language scan: each worker resolves a
+    /// contiguous range of titles (`movies` then `series`) into its own dictionary. Results
+    /// are merged back in shard (title) order with overwrite — reproducing the sequential
+    /// scan's last-writer-wins even if a variant id ever appears under two titles.
+    static func providerLanguagesIndex(
+        movies: [MediaTitle], series: [MediaTitle],
+        languageMaps: [SourceID: [MediaKind: ProviderLanguageMaps]],
+        categoryLanguages: [String: Set<String>]
+    ) async -> [ContentID: Set<String>] {
+        let movieCount = movies.count, seriesCount = series.count
+        let totalTitles = movieCount + seriesCount
+        guard totalTitles > 0 else { return [:] }
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 10))
+        let shards = min(workers, totalTitles)
+        return await withTaskGroup(of: (Int, [ContentID: Set<String>]).self) { group in
+            for shard in 0..<shards {
+                let lowerTitle = shard * totalTitles / shards
+                let upperTitle = (shard + 1) * totalTitles / shards
+                group.addTask {
+                    var local: [ContentID: Set<String>] = [:]
+                    for titleIndex in lowerTitle..<upperTitle {
+                        let title = titleIndex < movieCount ? movies[titleIndex] : series[titleIndex - movieCount]
+                        for variant in title.variants {
+                            collectProviderLanguages(
+                                variant, languageMaps: languageMaps,
+                                categoryLanguages: categoryLanguages, into: &local
+                            )
+                        }
+                    }
+                    return (shard, local)
+                }
+            }
+            // Buffer shard results tagged with their position, then size the union exactly:
+            // every variant lands in one shard, so `part.count` sums to the true variant
+            // total. Reserving on title count undershoots (a title can hold several variants)
+            // and would force a mid-merge rehash of ~200k entries.
+            var parts: [(Int, [ContentID: Set<String>])] = []
+            parts.reserveCapacity(shards)
+            var capacity = 0
+            for await part in group {
+                capacity += part.1.count
+                parts.append(part)
+            }
+            parts.sort { $0.0 < $1.0 }
+            var merged: [ContentID: Set<String>] = [:]
+            merged.reserveCapacity(capacity)
+            for (_, part) in parts { merged.merge(part) { _, second in second } }
+            return merged
         }
     }
 
@@ -337,6 +382,32 @@ public enum CatalogBuilder {
         var elapsed: Double = 0
         var refsProcessed: Int = 0
         var multiVariant: Int = 0
+        var plotMemoCalls = 0
+        var plotMemoHits = 0
+    }
+
+    /// Per-chunk memo for `ProviderSynopsis.cleaned` on synopsis strings. Provider plots
+    /// repeat verbatim across a title's variants (and across sibling titles), and `cleaned`'s
+    /// language-recognition path dominates build time on plot-heavy catalogs. Storage is
+    /// chunk-local so concurrent chunks never contend — unlike the global memo inside
+    /// `ProviderSynopsis`, whose mutex serializes lookups and self-disables on unique-key
+    /// streams. Bounded: cleared when full, which only costs recomputation, never correctness.
+    struct CleanedPlotMemo {
+        private var map: [String: String?] = [:]
+        private let limit = 2_048
+        /// Probe counters, reported under `PRISM_BUILD_PROFILE=1`.
+        private(set) var calls = 0
+        private(set) var hits = 0
+
+        /// `CatalogBuilder.cleanPlot` memoized on the exact non-nil input string.
+        mutating func cleaned(_ plot: String) -> String? {
+            calls += 1
+            if let hit = map[plot] { hits += 1; return hit }
+            let result = CatalogBuilder.cleanPlot(plot)
+            if map.count >= limit { map.removeAll(keepingCapacity: true) }
+            map[plot] = .some(result)
+            return result
+        }
     }
 
     struct NameIdentity: Hashable, Sendable {
@@ -460,6 +531,7 @@ public enum CatalogBuilder {
                     built.titles.reserveCapacity(upper - lower)
                     built.added.reserveCapacity(upper - lower)
                     var cleanedGenreLists: [[String]: [String]] = [:]
+                    var plotMemo = CleanedPlotMemo()
                     for index in lower..<upper {
                         let offer = frozenGroups[index]
                         built.refsProcessed += offer.refs.count
@@ -480,11 +552,13 @@ public enum CatalogBuilder {
                         let title = makeTitle(
                             id: offer.id(kind: kind), kind: kind, year: offer.name.year, refs: refs, lists: lists,
                             categories: frozenCategories, categorySets: context.singleCategorySets, adult: frozenAdult,
-                            cleanedGenreLists: &cleanedGenreLists
+                            cleanedGenreLists: &cleanedGenreLists, plotMemo: &plotMemo
                         )
                         built.added.append(title.addedAt?.timeIntervalSinceReferenceDate ?? -.infinity)
                         built.titles.append(title)
                     }
+                    built.plotMemoCalls = plotMemo.calls
+                    built.plotMemoHits = plotMemo.hits
                     let e = ContinuousClock.now - chunkStart
                     built.elapsed = Double(e.components.seconds) * 1_000 + Double(e.components.attoseconds) / 1e15
                     return built
@@ -501,7 +575,9 @@ public enum CatalogBuilder {
             let multi = chunks.reduce(0) { $0 + $1.multiVariant }
             let times = chunks.map(\.elapsed).sorted(by: >)
             let slowest = times.prefix(4).map { String(format: "%.0f", $0) }.joined(separator: ",")
-            FileHandle.standardError.write(Data("[profile] \(label) chunks: \(chunks.count) chunks, \(refs) refs, \(multi) multi-variant; slowest ms: \(slowest)\n".utf8))
+            let plotCalls = chunks.reduce(0) { $0 + $1.plotMemoCalls }
+            let plotHits = chunks.reduce(0) { $0 + $1.plotMemoHits }
+            FileHandle.standardError.write(Data("[profile] \(label) chunks: \(chunks.count) chunks, \(refs) refs, \(multi) multi-variant, plotMemo \(plotHits)/\(plotCalls) hits; slowest ms: \(slowest)\n".utf8))
         }
         guard !Task.isCancelled else { return MediaGroups() }
         let added = chunks.flatMap(\.added)
@@ -600,8 +676,13 @@ public enum CatalogBuilder {
     /// preserves the exact sequential output: refs and aliases keep first-appearance order.
     static func reconcileMediaIdentities<V: GroupableMedia>(_ groups: [MediaGroup], lists: [[V]]) async -> [MediaGroup] {
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        // Dense per-item `tmdbID` table: the chunk passes below probe it once per ref with
+        // (catalog, item) coordinates scattered across the catalog. Touching the ~400-byte
+        // Movie/Series struct per probe costs a RAM/TLB miss each; the Int? table is ~25x
+        // denser and stays cache-resident, which is worth ~25% of chunk time on large lists.
+        let tmdbIDs = lists.map { list in list.map(\.tmdbID) }
         guard groups.count >= 8_192, workers > 1 else {
-            return reconcileMediaIdentitiesChunk(groups, lists: lists)
+            return reconcileMediaIdentitiesChunk(groups, tmdbIDs: tmdbIDs)
         }
         let chunk = (groups.count + workers - 1) / workers
         let partsStart = ContinuousClock.now
@@ -609,7 +690,7 @@ public enum CatalogBuilder {
             for lower in stride(from: 0, to: groups.count, by: chunk) {
                 let upper = min(lower + chunk, groups.count)
                 group.addTask {
-                    (lower, reconcileMediaIdentitiesChunk(Array(groups[lower..<upper]), lists: lists))
+                    (lower, reconcileMediaIdentitiesChunk(Array(groups[lower..<upper]), tmdbIDs: tmdbIDs))
                 }
             }
             var collected: [(Int, [MediaGroup])] = []
@@ -643,7 +724,8 @@ public enum CatalogBuilder {
     }
 
     /// The reconciliation pass itself, run sequentially or once per chunk.
-    private static func reconcileMediaIdentitiesChunk<V: GroupableMedia>(_ groups: [MediaGroup], lists: [[V]]) -> [MediaGroup] {
+    /// `tmdbIDs[catalog][item]` mirrors `lists[catalog][item].tmdbID` (built once by the caller).
+    private static func reconcileMediaIdentitiesChunk(_ groups: [MediaGroup], tmdbIDs: [[Int?]]) -> [MediaGroup] {
         var result: [MediaGroup] = []
         result.reserveCapacity(groups.count)
         var byTMDBID: [Int: Int] = [:]
@@ -661,7 +743,7 @@ public enum CatalogBuilder {
 
         for group in groups {
             if group.refs.count == 1, let ref = group.refs.first {
-                guard let id = lists[Int(ref.catalog)][Int(ref.item)].tmdbID, id > 0 else {
+                guard let id = tmdbIDs[Int(ref.catalog)][Int(ref.item)], id > 0 else {
                     result.append(group)
                     continue
                 }
@@ -676,7 +758,7 @@ public enum CatalogBuilder {
             var singleID: Int? = nil
             var conflicting = false
             for ref in group.refs {
-                guard let id = lists[Int(ref.catalog)][Int(ref.item)].tmdbID, id > 0 else { continue }
+                guard let id = tmdbIDs[Int(ref.catalog)][Int(ref.item)], id > 0 else { continue }
                 if singleID == nil {
                     singleID = id
                 } else if id != singleID {
@@ -698,7 +780,7 @@ public enum CatalogBuilder {
             var identified: [Int: [Ref]] = [:]
             var unidentified: [Ref] = []
             for ref in group.refs {
-                if let id = lists[Int(ref.catalog)][Int(ref.item)].tmdbID, id > 0 {
+                if let id = tmdbIDs[Int(ref.catalog)][Int(ref.item)], id > 0 {
                     identified[id, default: []].append(ref)
                 } else {
                     unidentified.append(ref)
@@ -768,7 +850,7 @@ public enum CatalogBuilder {
     static func makeTitle<V: GroupableMedia>(
         id: TitleID, kind: MediaKind, year: Int?, refs: [Ref], lists: [[V]],
         categories: [[String?]], categorySets: [String: Set<String>], adult: [[Bool]],
-        cleanedGenreLists: inout [[String]: [String]]
+        cleanedGenreLists: inout [[String]: [String]], plotMemo: inout CleanedPlotMemo
     ) -> MediaTitle {
         let first = lists[Int(refs[0].catalog)][Int(refs[0].item)]
         if refs.count == 1 {
@@ -776,7 +858,7 @@ public enum CatalogBuilder {
             let rating = first.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
             var cleanedPlot: String? = nil
             if let raw = first.plot {
-                cleanedPlot = plotProfile(raw).passthrough ? raw : cleanPlot(raw)
+                cleanedPlot = plotProfile(raw).passthrough ? raw : plotMemo.cleaned(raw)
             }
             let cleanedGenres = cleanGenres(first.genres, cache: &cleanedGenreLists)
             var single = MediaTitle(
@@ -832,7 +914,7 @@ public enum CatalogBuilder {
                     if profile.passthrough {
                         plot = rawPlot
                         plotLength = profile.bytes
-                    } else if let candidate = cleanPlot(rawPlot), candidate.utf8.count > plotLength {
+                    } else if let candidate = plotMemo.cleaned(rawPlot), candidate.utf8.count > plotLength {
                         plot = candidate
                         plotLength = candidate.utf8.count
                     }

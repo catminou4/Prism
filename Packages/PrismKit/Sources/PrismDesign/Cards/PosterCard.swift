@@ -67,7 +67,9 @@ public struct PosterCard<MenuContent: View>: View {
                         }
                     }
                     .lineLimit(1)
-                    .frame(width: w, alignment: .leading)
+                    // No explicit width: the card's outer `.frame(width:)` already bounds
+                    // the proposal, so each line truncates identically — one less node per
+                    // card during shelf materialization.
                 }
             }
             .frame(width: w, alignment: .leading)

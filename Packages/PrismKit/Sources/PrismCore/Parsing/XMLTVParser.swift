@@ -41,7 +41,13 @@ public enum XMLTVParser {
     public static func parse(_ data: Data, window: DateInterval? = nil, timeShiftHours: Double = 0) throws -> XMLTVDocument {
         let xml = Gzip.isCompressed(data) ? try Gzip.decompress(data) : data
         guard !xml.isEmpty else { throw XMLTVError.invalidData }
+        return try parseXML(xml, window: window, timeShiftHours: timeShiftHours)
+    }
 
+    /// `XMLParser` (Foundation) implementation on already-decompressed XML.
+    /// Kept as the exact-semantics path for documents whose DTD declares
+    /// entities/attlists — see `XMLTVParserSAX.swift` for the fast path.
+    static func parseFoundationXML(_ xml: Data, window: DateInterval?, timeShiftHours: Double) throws -> XMLTVDocument {
         let delegate = XMLTVParserDelegate(window: window, shift: timeShiftHours * 3600)
         let parser = XMLParser(data: xml)
         parser.shouldResolveExternalEntities = false

@@ -190,9 +190,16 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
+            // `viewport` is class storage — free. `scrollAvailability` is @State: writing it
+            // re-evaluates the whole shelf (and its ~8 cards) in the middle of a page scroll.
+            // It only feeds the hover chevrons, which are hidden while scrolling anyway; the
+            // value is refreshed lazily on hover (see `.onHover` below) and VoiceOver paging
+            // reads `viewport.edges` directly, which is always current.
             viewport.edges = newValue
-            let availability = newValue.availability
-            if scrollAvailability != availability { scrollAvailability = availability }
+            if !isScrollingContent {
+                let availability = newValue.availability
+                if scrollAvailability != availability { scrollAvailability = availability }
+            }
             if layoutWidth == nil, measuredWidth != newValue.width { measuredWidth = newValue.width }
         }
         .padding(.top, -Self.liftInset.top)
@@ -201,24 +208,38 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         // One overlay hosts both chevrons so `.animation(value:)` scopes to them alone —
         // on the row it propagated an animation attribute into every card's subtree each
         // time a shelf materialized (~8 cards × ~30 nodes of wasted attribute writes).
+        // The whole overlay is gated on hover: while scrolling or at rest it collapses to
+        // an empty view instead of ~5 dead nodes per shelf materialization.
         .overlay {
-            HStack(spacing: 0) {
-                chevron(.leading)
-                Spacer(minLength: 0)
-                chevron(.trailing)
+            if isHovered {
+                HStack(spacing: 0) {
+                    chevron(.leading)
+                    Spacer(minLength: 0)
+                    chevron(.trailing)
+                }
+                .animation(PrismMotion.quickFade, value: scrollAvailability)
+                .transition(reduceMotion ? AnyTransition.opacity : AnyTransition.opacity.combined(with: .scale(scale: 0.8)))
             }
-            .animation(PrismMotion.quickFade, value: scrollAvailability)
         }
         .onHover { inside in
             guard !isScrollingContent else { return }
+            if inside {
+                // `scrollAvailability` writes were deferred while scrolling — refresh it
+                // now so the chevrons show the right arrows on the first hovered frame.
+                let availability = viewport.edges.availability
+                if scrollAvailability != availability { scrollAvailability = availability }
+            }
             withAnimation(PrismMotion.quickFade) { hovering = inside }
         }
         .onChange(of: isScrollingContent) { _, scrolling in
             if !scrolling { hovering = false }
         }
         .accessibilityScrollAction { edge in
-            if edge == .leading && scrollAvailability.backward { page(.leading) }
-            if edge == .trailing && scrollAvailability.forward { page(.trailing) }
+            // `viewport.edges` is always current (class storage, updated even mid-scroll),
+            // so VoiceOver paging never depends on the deferred `scrollAvailability` state.
+            let availability = viewport.edges.availability
+            if edge == .leading && availability.backward { page(.leading) }
+            if edge == .trailing && availability.forward { page(.trailing) }
         }
     }
 

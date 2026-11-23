@@ -85,7 +85,7 @@ public actor ImagePipeline {
     private var failedDecodes: [Key: ContinuousClock.Instant] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
-    private var warmQueue: [ArtworkURL.Resolved] = []
+    private var warmQueue = WarmQueue()
     private var warmQueued: Set<URL> = []
     private var warmRunning = 0
     /// Warm-path-only failures: a background-priority timeout must not poison the
@@ -454,33 +454,42 @@ public actor ImagePipeline {
     private func enqueueWarm(_ requests: [ArtworkURL.Resolved]) {
         var fresh: [ArtworkURL.Resolved] = []
         for request in requests {
-            // Bytes already on disk make the warm-up pure churn (a detached task plus a
-            // ~40 µs mmap read per URL on every scroll stop).
+            // Cheap actor-state checks first: a URL already queued or in flight must not
+            // pay the disk stat below (up to two `fileExists` calls for TMDB fallbacks).
             guard dataInFlight[request.primary] == nil,
                   !isCoolingDown(request.primary, in: &failedRequests),
                   !isCoolingDown(request.primary, in: &warmFailedRequests),
-                  !warmServedFromDisk(request),
-                  warmQueued.insert(request.primary).inserted else { continue }
+                  !warmQueued.contains(request.primary),
+                  // Bytes already on disk make the warm-up pure churn (a detached task plus
+                  // a ~40 µs mmap read per URL on every scroll stop).
+                  !warmServedFromDisk(request) else { continue }
+            warmQueued.insert(request.primary)
             fresh.append(request)
         }
         guard !fresh.isEmpty else { return }
-        // The latest screen matters most: its items go ahead of older, possibly scrolled-away ones.
-        warmQueue.insert(contentsOf: fresh, at: 0)
-        if warmQueue.count > 600 {
-            for dropped in warmQueue[600...] { warmQueued.remove(dropped.primary) }
-            warmQueue.removeSubrange(600...)
-        }
-        startWarming()
+        // The latest screen matters most: its items go ahead of older, possibly scrolled-away
+        // ones. `push` preserves that order while keeping enqueue/dequeue O(1).
+        for dropped in warmQueue.push(fresh) { warmQueued.remove(dropped.primary) }
+        startWarming(trusting: fresh.count)
     }
 
-    private func startWarming() {
-        while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
-            let request = warmQueue.removeFirst()
+    /// `trustedPrefix` counts leading queue entries validated during the `enqueueWarm` call
+    /// that triggered this drain. They sit at the dequeue end and were checked microseconds
+    /// ago in the same actor turn, so re-running the lookups would return identical results —
+    /// and `encodedData` re-checks the disk cache regardless, making a rare stale launch a
+    /// harmless disk read rather than a wrong fetch.
+    private func startWarming(trusting trustedPrefix: Int = 0) {
+        var trusted = trustedPrefix
+        while warmRunning < Self.warmConcurrency, let request = warmQueue.pop() {
             warmQueued.remove(request.primary)
-            guard dataInFlight[request.primary] == nil,
-                  !isCoolingDown(request.primary, in: &failedRequests),
-                  !isCoolingDown(request.primary, in: &warmFailedRequests),
-                  !warmServedFromDisk(request) else { continue }
+            if trusted > 0 {
+                trusted -= 1
+            } else {
+                guard dataInFlight[request.primary] == nil,
+                      !isCoolingDown(request.primary, in: &failedRequests),
+                      !isCoolingDown(request.primary, in: &warmFailedRequests),
+                      !warmServedFromDisk(request) else { continue }
+            }
             warmRunning += 1
             let disk = disk, session = prefetchSession
             // Registered like any fetch, so an on-screen decode of the same image joins it.
@@ -518,6 +527,47 @@ public actor ImagePipeline {
             entry.task.cancel()
             inFlight[key] = nil
         }
+    }
+}
+
+/// Bounded newest-first queue for byte warm-ups. Live entries sit between `head` (oldest)
+/// and the array end (newest = next dequeue), so `push`/`pop`/trim are O(1) amortized —
+/// a front-insert + `removeFirst` array shifted every element on each scroll stop.
+/// Dequeue order and the 600-entry cap are identical to that queue: the newest batch
+/// first, in request order, then older batches newest-first; overflow drops the oldest
+/// entries and reports them for untracking.
+nonisolated struct WarmQueue {
+    private var items: [ArtworkURL.Resolved] = []
+    /// First live index; `items[..<head]` is dead capacity reclaimed on compaction.
+    private var head = 0
+
+    /// Queues `fresh` ahead of everything already waiting; returns entries evicted by the cap.
+    @discardableResult
+    mutating func push(_ fresh: [ArtworkURL.Resolved]) -> [ArtworkURL.Resolved] {
+        items.append(contentsOf: fresh.reversed())
+        let live = items.count - head
+        guard live > 600 else { return [] }
+        let excess = live - 600
+        let dropped = Array(items[head..<(head + excess)])
+        head += excess
+        // Reclaim the dead prefix once it is both large and the majority of the buffer,
+        // so trims stay amortized O(1) instead of memmoving on every over-cap push.
+        if head > 512, head * 2 >= items.count {
+            items.removeFirst(head)
+            head = 0
+        }
+        return dropped
+    }
+
+    /// The next warm request (newest first), or nil when drained.
+    mutating func pop() -> ArtworkURL.Resolved? {
+        guard head < items.count else { return nil }
+        let request = items.removeLast()
+        if head == items.count {
+            items.removeAll(keepingCapacity: true)
+            head = 0
+        }
+        return request
     }
 }
 

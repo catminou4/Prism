@@ -228,6 +228,74 @@ struct ZZAuditImages {
         print("ZZAUDIT dead-url different-size retry: \(t2.duration(to: clock.now) / .milliseconds(1)) ms")
     }
 
+    // MARK: WarmQueue — ordering correctness + O(1) ops vs the old array queue
+
+    @Test func warmQueuePreservesNewestFirstOrder() throws {
+        func resolved(_ n: Int) throws -> ArtworkURL.Resolved {
+            ArtworkURL.Resolved(
+                primary: try #require(URL(string: "https://img.test/\(n).jpg")),
+                fallback: nil, fallbackIsLarger: false, isOriginal: false
+            )
+        }
+        var queue = WarmQueue()
+        // Two batches: the second must dequeue entirely before the first, in order.
+        _ = queue.push(try (0..<3).map { try resolved($0) })
+        _ = queue.push(try (10..<14).map { try resolved($0) })
+        var order: [Int] = []
+        while let next = queue.pop() {
+            order.append(Int(next.primary.lastPathComponent.dropLast(4)) ?? -1)
+        }
+        #expect(order == [10, 11, 12, 13, 0, 1, 2])
+    }
+
+    @Test func warmQueueCapsAndReportsDrops() throws {
+        func resolved(_ n: Int) -> ArtworkURL.Resolved {
+            ArtworkURL.Resolved(
+                primary: URL(fileURLWithPath: "/tmp/\(n).jpg"),
+                fallback: nil, fallbackIsLarger: false, isOriginal: false
+            )
+        }
+        var queue = WarmQueue()
+        var droppedTotal = 0
+        // Push 700 one-by-one: the cap must hold and the oldest entries must drop first.
+        for n in 0..<700 {
+            droppedTotal += queue.push([resolved(n)]).count
+        }
+        #expect(droppedTotal == 100)
+        // `pop` yields newest first: survivors are 100…699, so 699 comes out first.
+        let popped = queue.pop()
+        #expect(popped?.primary.lastPathComponent == "699.jpg")
+        // Exactly 600 remain after the first pop accounted for.
+        var count = 1
+        while queue.pop() != nil { count += 1 }
+        #expect(count == 600)
+    }
+
+    @Test func warmQueueOps() {
+        func resolved(_ n: Int) -> ArtworkURL.Resolved {
+            ArtworkURL.Resolved(
+                primary: URL(fileURLWithPath: "/tmp/\(n).jpg"),
+                fallback: nil, fallbackIsLarger: false, isOriginal: false
+            )
+        }
+        // Steady-state scroll churn on a full 600-entry queue: a 6-URL warm batch
+        // enqueue + six dequeues, repeated. The old array pattern memmoves ~30 KB
+        // and re-retains every element per op; WarmQueue is O(1). The batch is built
+        // once outside the timed region — URL creation is not what is measured.
+        let batch = (700..<706).map { resolved($0) }
+        var oldQueue = (0..<600).map { resolved($0) }
+        bench("old insert-at-0 + removeFirst ×6", iterations: 20_000) {
+            oldQueue.insert(contentsOf: batch, at: 0)
+            for _ in 0..<6 { _ = oldQueue.removeFirst() }
+        }
+        var newQueue = WarmQueue()
+        for n in 0..<300 { _ = newQueue.push([resolved(n), resolved(n + 1_000)]) }
+        bench("WarmQueue push(6) + pop ×6", iterations: 20_000) {
+            _ = newQueue.push(batch)
+            for _ in 0..<6 { _ = newQueue.pop() }
+        }
+    }
+
     // MARK: Decode-failure cooldown — per-call latency
 
     @Test func decodeFailureCooldown() async throws {

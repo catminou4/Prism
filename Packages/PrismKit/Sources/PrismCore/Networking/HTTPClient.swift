@@ -75,8 +75,8 @@ public struct HTTPClient: Sendable {
 
     static func isRetryable(_ error: URLError) -> Bool {
         switch error.code {
-        // Definitive DNS failures are not transient: retrying just delays the same error.
-        case .timedOut, .networkConnectionLost, .cannotConnectToHost, .badServerResponse:
+        case .timedOut, .networkConnectionLost, .cannotConnectToHost, .dnsLookupFailed,
+             .cannotFindHost, .badServerResponse:
             true
         default:
             false
