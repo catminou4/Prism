@@ -443,6 +443,7 @@ public enum CatalogBuilder {
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunk = max(2_048, groupCount / (workers * 2))
         let frozenCategories = resolvedCategories, frozenAdult = adultFlags
+        let plotsCleaned = context.catalogs.map(\.plotsCleaned)
         // Variant ordering hoisted out of the comparator: every item of a catalog shares its
         // sourceID, so priority is a per-catalog array lookup, and the name byte length is
         // computed once per item instead of twice per comparison.
@@ -480,7 +481,7 @@ public enum CatalogBuilder {
                         let title = makeTitle(
                             id: offer.id(kind: kind), kind: kind, year: offer.name.year, refs: refs, lists: lists,
                             categories: frozenCategories, categorySets: context.singleCategorySets, adult: frozenAdult,
-                            cleanedGenreLists: &cleanedGenreLists
+                            plotsCleaned: plotsCleaned, cleanedGenreLists: &cleanedGenreLists
                         )
                         built.added.append(title.addedAt?.timeIntervalSinceReferenceDate ?? -.infinity)
                         built.titles.append(title)
@@ -768,15 +769,21 @@ public enum CatalogBuilder {
     static func makeTitle<V: GroupableMedia>(
         id: TitleID, kind: MediaKind, year: Int?, refs: [Ref], lists: [[V]],
         categories: [[String?]], categorySets: [String: Set<String>], adult: [[Bool]],
-        cleanedGenreLists: inout [[String]: [String]]
+        plotsCleaned: [Bool] = [], cleanedGenreLists: inout [[String]: [String]]
     ) -> MediaTitle {
+        /// Catalogues imported with `SourceCatalog.cleaningPlots()` already hold
+        /// `ProviderSynopsis.cleaned` output: the selection below uses it as-is.
+        func isClean(_ ref: Ref) -> Bool {
+            let index = Int(ref.catalog)
+            return index < plotsCleaned.count && plotsCleaned[index]
+        }
         let first = lists[Int(refs[0].catalog)][Int(refs[0].item)]
         if refs.count == 1 {
             let ref = refs[0]
             let rating = first.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
             var cleanedPlot: String? = nil
             if let raw = first.plot {
-                cleanedPlot = plotProfile(raw).passthrough ? raw : cleanPlot(raw)
+                cleanedPlot = isClean(ref) || plotProfile(raw).passthrough ? raw : cleanPlot(raw)
             }
             let cleanedGenres = cleanGenres(first.genres, cache: &cleanedGenreLists)
             var single = MediaTitle(
@@ -827,7 +834,8 @@ public enum CatalogBuilder {
             // `plotProfile` additionally detects plots `cleaned` would return unchanged,
             // skipping the regex/NLP path for clean provider prose entirely.
             if let rawPlot = item.plot {
-                let profile = plotProfile(rawPlot)
+                let clean = isClean(ref)
+                let profile = clean ? (bytes: rawPlot.utf8.count, passthrough: true) : plotProfile(rawPlot)
                 if profile.bytes > plotLength {
                     if profile.passthrough {
                         plot = rawPlot

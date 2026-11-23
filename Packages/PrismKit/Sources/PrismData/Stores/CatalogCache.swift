@@ -30,6 +30,9 @@ public actor CatalogCache {
         /// load (~1 s on a 250k-title catalogue). `nil` in archives written before the
         /// flag existed — they still get the migration pass, then re-save flagged.
         var titlesRefined: Bool?
+        /// Mirrors `SourceCatalog.plotsCleaned` (`nil` in older archives: the builder then
+        /// cleans their plots itself, as before).
+        var plotsCleaned: Bool?
     }
 
     public nonisolated let directories: AppDirectories
@@ -82,7 +85,8 @@ public actor CatalogCache {
             channelCount: catalog.channels.count, movieCount: catalog.movies.count, seriesCount: catalog.series.count,
             // Catalogs reach `save` already refined: provider decoders run
             // `TitleRefinement.refine` and cache decodes refine legacy archives.
-            titlesRefined: true
+            titlesRefined: true,
+            plotsCleaned: catalog.plotsCleaned
         )
         async let channels = SegmentedArchive.encodeChunks(catalog.channels, tag: Tag.channels.rawValue, chunkSize: chunkSize)
         async let movies = SegmentedArchive.encodeChunks(catalog.movies, tag: Tag.movies.rawValue, chunkSize: chunkSize)
@@ -113,6 +117,7 @@ public actor CatalogCache {
               meta.channelCount <= 2_000_000, meta.movieCount <= 2_000_000,
               meta.seriesCount <= 2_000_000 else { return nil }
         var empty = SourceCatalog(sourceID: meta.sourceID, categories: meta.categories, account: meta.account, fetchedAt: meta.fetchedAt)
+        empty.plotsCleaned = meta.plotsCleaned == true
         // The meta counts are exact (verified below): reserve once instead of paying
         // repeated buffer growth while ~300k items append chunk by chunk.
         empty.channels.reserveCapacity(meta.channelCount)

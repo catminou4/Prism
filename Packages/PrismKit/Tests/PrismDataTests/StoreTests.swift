@@ -92,6 +92,40 @@ struct StoreTests {
         #expect(decodedLegacy.movies.first?.title == "Narcos")
     }
 
+    /// Plots cleaned at import (`cleaningPlots`) keep their flag through the cache, and the
+    /// builder then produces exactly the plots it produced from the raw text.
+    @Test func cleanedPlotsRoundTripAndBuildIdentically() async throws {
+        let mixed = "Une famille de Winden découvre un secret qui traverse les générations et le temps.\n\n"
+            + "A family in Winden uncovers a secret that spans several generations and time itself."
+        let messy = "  Deux  espaces   et\tune tabulation dans ce résumé un peu sale du fournisseur.  "
+        let movies = [
+            F.movie(F.a, "1", "Dark", year: 2017, plot: mixed),
+            F.movie(F.a, "2", "Heat", year: 1995, plot: messy),
+            F.movie(F.a, "3", "Heat", year: 1995, quality: .uhd, plot: mixed),
+            F.movie(F.a, "4", "Vide", plot: "   "),
+        ]
+        let series = [F.series(F.a, "s1", "Dark", year: 2017, plot: mixed), F.series(F.a, "s2", "Dark", year: 2017, plot: messy)]
+        let raw = SourceCatalog(sourceID: F.a, movies: movies, series: series)
+        let cleaned = await raw.cleaningPlots()
+        #expect(cleaned.plotsCleaned)
+        #expect(cleaned.movies.map(\.plot) == movies.map { ProviderSynopsis.cleaned($0.plot) })
+        #expect(cleaned.series.map(\.plot) == series.map { ProviderSynopsis.cleaned($0.plot) })
+
+        let archive = try await CatalogCache.encode(cleaned, version: CatalogCache.formatVersion)
+        let decoded = try #require(await CatalogCache.decode(archive, version: CatalogCache.formatVersion))
+        #expect(decoded.plotsCleaned)
+        let legacy = try #require(await CatalogCache.decode(
+            try await CatalogCache.encode(raw, version: CatalogCache.formatVersion), version: CatalogCache.formatVersion
+        ))
+        #expect(!legacy.plotsCleaned, "raw catalogues keep being cleaned by the builder")
+
+        let fromRaw = await F.build([F.source(F.a)], [raw])
+        let fromCleaned = await F.build([F.source(F.a)], [decoded])
+        #expect(fromRaw.movies.map(\.plot) == fromCleaned.movies.map(\.plot))
+        #expect(fromRaw.series.map(\.plot) == fromCleaned.series.map(\.plot))
+        #expect(fromRaw.movies.map(\.id) == fromCleaned.movies.map(\.id))
+    }
+
     @Test func corruptedCacheIsIgnored() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }

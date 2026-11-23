@@ -86,6 +86,10 @@ public actor CatalogRepository {
                 do {
                     var (catalog, epgURLs) = try await self.performRefresh(source) { continuation.yield($0) }
                     try Task.checkCancellation()
+                    // Synopsis cleaning (regex + language recognition) happens once here and
+                    // is persisted with the cache, instead of in every launch's catalogue build.
+                    catalog = await catalog.cleaningPlots()
+                    try Task.checkCancellation()
                     catalog.shareRepeatedValues()
                     if !DemoContent.isDemo(source) {
                         do {

@@ -398,6 +398,15 @@ public struct SourceCatalog: Codable, Sendable {
     public var series: [Series]
     public var account: XtreamAccount?
     public var fetchedAt: Date
+    /// `true` once every movie and series plot went through `ProviderSynopsis.cleaned`
+    /// (`cleaningPlots()`): the catalogue builder then uses them as-is instead of running
+    /// the regex + language-recognition pass again on every launch. Not part of the coded
+    /// form — `CatalogCache` persists it in its own metadata.
+    public var plotsCleaned = false
+
+    private enum CodingKeys: String, CodingKey {
+        case sourceID, categories, channels, movies, series, account, fetchedAt
+    }
 
     public init(sourceID: SourceID, categories: [Category] = [], channels: [Channel] = [], movies: [Movie] = [], series: [Series] = [], account: XtreamAccount? = nil, fetchedAt: Date = .now) {
         self.sourceID = sourceID
