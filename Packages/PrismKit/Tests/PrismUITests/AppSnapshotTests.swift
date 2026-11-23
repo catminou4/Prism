@@ -12,6 +12,59 @@ import Testing
 @MainActor
 @Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["PRISM_APP_SNAPSHOTS"] == "1"))
 struct AppSnapshotTests {
+    @Test func episodePlaybackSheet() async throws {
+        let app = await AppModel.preview()
+        let series = try #require(app.catalog.series.first { $0.variants.count > 1 })
+        let options = series.variants.compactMap { variant -> TitlePlaybackOption? in
+            guard let source = app.source(variant.sourceID), let episode = variant.series?.seasons?.first?.episodes.first else { return nil }
+            return TitlePlaybackOption(edition: TitleEdition(variant: variant, source: source), episode: episode)
+        }
+        let option = try #require(options.first)
+        let episode = try #require(option.episode)
+        let metadata = TMDBEpisodeInfo(
+            season: episode.season, number: episode.number, title: "Le signal",
+            overview: "À la tombée de la nuit, un signal inattendu interrompt la radio du port. En suivant sa piste, le capitaine découvre un carnet abandonné dont les dernières pages semblent avoir été écrites le jour même.",
+            runtimeMinutes: 48
+        )
+        let still = ProcessInfo.processInfo.environment["PRISM_SNAPSHOT_ARTWORK"].map { URL(fileURLWithPath: $0) }
+        for scheme in [ColorScheme.light, .dark] {
+            let suffix = scheme == .light ? "light" : "dark"
+            try await write(
+                TitlePlaybackSheet(
+                    title: series,
+                    selection: TitlePlaybackSelection(options: options, otherEditions: [], episode: episode, preferred: option.id),
+                    hero: .episode(episode, metadata: metadata, backdrop: still, poster: nil),
+                    repository: app.detailRepository,
+                    resumePosition: { _ in scheme == .dark ? 180 : nil }, onPlay: { _, _ in }
+                ),
+                label: "episode-editions-\(suffix)", size: CGSize(width: 1040, height: 652), scheme: scheme
+            )
+        }
+    }
+
+    @Test func moviePlaybackSheet() async throws {
+        let app = await AppModel.preview()
+        let movie = try #require(app.catalog.movies.first { $0.variants.count > 1 })
+        let options = movie.variants.compactMap { variant -> TitlePlaybackOption? in
+            app.source(variant.sourceID).flatMap { TitlePlaybackOption(edition: TitleEdition(variant: variant, source: $0)) }
+        }
+        let backdrop = ProcessInfo.processInfo.environment["PRISM_SNAPSHOT_ARTWORK"].map { URL(fileURLWithPath: $0) }
+        try await write(
+            TitlePlaybackSheet(
+                title: movie,
+                selection: TitlePlaybackSelection(options: options, otherEditions: [], episode: nil, preferred: options.first?.id),
+                hero: .title(
+                    movie, facts: ["2023", "Thriller", "112 min", "12+"],
+                    plot: "Un ancien pilote accepte une dernière mission : traverser la frontière avec une cargaison dont il ignore tout.",
+                    rating: 7.4, runtimeMinutes: 112, backdrop: backdrop, poster: nil, logo: nil
+                ),
+                repository: app.detailRepository,
+                resumePosition: { _ in nil }, onPlay: { _, _ in }
+            ),
+            label: "movie-editions", size: CGSize(width: 1040, height: 652)
+        )
+    }
+
     @Test func mainSurfaces() async throws {
         let app = await AppModel.preview()
         let movie = try #require(app.catalog.movies.first { $0.variants.count > 1 })
@@ -77,19 +130,6 @@ struct AppSnapshotTests {
         try await write(
             TitleDetailView(titleID: series.id).environment(app).environment(navigation),
             label: "serie", size: CGSize(width: 1170, height: 870)
-        )
-        let options = movie.variants.compactMap { variant -> TitlePlaybackOption? in
-            guard let source = app.source(variant.sourceID) else { return nil }
-            return TitlePlaybackOption(edition: TitleEdition(variant: variant, source: source))
-        }
-        try await write(
-            TitlePlaybackSheet(
-                title: movie,
-                selection: TitlePlaybackSelection(options: options, otherEditions: [], episode: nil, preferred: nil),
-                repository: app.detailRepository,
-                resumePosition: { _ in nil }, onPlay: { _, _ in }
-            ),
-            label: "editions", size: CGSize(width: 540, height: 540)
         )
         for scheme in [ColorScheme.dark, .light] {
             let suffix = scheme == .light ? "-light" : ""

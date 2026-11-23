@@ -278,11 +278,35 @@ private struct TitleDetailContent: View {
             TitlePlaybackSheet(
                 title: title,
                 selection: selection,
+                hero: playbackHero(for: selection.episode),
                 repository: app.detailRepository,
                 resumePosition: { position(for: $0, equivalentEpisode: selection.episode) },
                 onPlay: { option, position in play(option, from: position) }
             )
         }
+    }
+
+    private var titleFacts: [String] {
+        [
+            year.map(String.init),
+            genres.first.map(DetailPresentation.genreLabel),
+            title.kind == .movie ? minutes.map { "\($0) min" } : nil,
+            enriched?.certification,
+        ].compactMap { $0 }
+    }
+
+    private func playbackHero(for episode: Episode?) -> PlaybackSheetHero {
+        guard let episode else {
+            return .title(
+                title, facts: titleFacts, plot: plot, rating: enriched?.voteAverage,
+                runtimeMinutes: title.kind == .movie ? minutes : nil,
+                backdrop: backdrops.first, poster: posters.first, logo: enriched?.images.logoURL
+            )
+        }
+        let metadata = seasonMetadata.flatMap { metadata in
+            metadata.matches(seasonLookup) && metadata.season == episode.season ? metadata.episodes[episode.number] : nil
+        }
+        return .episode(episode, metadata: metadata, backdrop: backdrops.first, poster: posters.first)
     }
 
     private func masthead(viewportHeight: CGFloat) -> some View {
@@ -291,13 +315,7 @@ private struct TitleDetailContent: View {
         let option = edition.flatMap { TitlePlaybackOption(edition: $0, episode: episode) }
         let progress = isPageActive ? option.flatMap { resumeProgress(for: $0) } : nil
         let resuming = progress != nil
-        let facts = [
-            title.kind == .series ? "Série" : "Film",
-            year.map(String.init),
-            genres.first.map(DetailPresentation.genreLabel),
-            title.kind == .movie ? minutes.map { "\($0) min" } : nil,
-            enriched?.certification,
-        ].compactMap { $0 }
+        let facts = [title.kind == .series ? "Série" : "Film"] + titleFacts
         let label = episode.map {
             "\(resuming ? "Reprendre" : "Lire") \(EpisodeCoordinate($0).label)"
         } ?? (resuming ? "Reprendre" : "Lecture")
@@ -433,7 +451,7 @@ private struct TitleDetailContent: View {
         return DetailEpisodeTile(
             episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched
         ) {
-            choosePlayback(episode: episode)
+            choosePlayback(episode: episode, alwaysShowPicker: true)
         }
         .contextMenu {
             Button(watched ? "Marquer comme non vu" : "Marquer comme vu", systemImage: watched ? "circle" : "checkmark.circle") {

@@ -21,6 +21,11 @@ public struct MediaBadge: View {
         self.style = style
     }
 
+    /// Whether `text` is a picture-quality label (`4K`, `HDR`…) rendered filled.
+    public nonisolated static func isQualityLabel(_ text: String) -> Bool {
+        filledLabels.contains(text.uppercased())
+    }
+
     /// Picks the Apple convention for well-known labels (quality → filled, others → outlined).
     public init(automatic text: String) {
         self.init(text, style: Self.filledLabels.contains(text.uppercased()) ? .filled : .outlined)

@@ -7,14 +7,20 @@ public struct TitleLogo: View {
     private let url: URL?
     private let fallbackTitle: String
     private let maxSize: CGSize
+    private let fallbackFont: Font
     @State private var logo: CGImage?
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(url: URL?, fallbackTitle: String, maxSize: CGSize = CGSize(width: PrismMetrics.titleLogoMaxWidth, height: PrismMetrics.titleLogoMaxHeight)) {
+    public init(
+        url: URL?, fallbackTitle: String,
+        maxSize: CGSize = CGSize(width: PrismMetrics.titleLogoMaxWidth, height: PrismMetrics.titleLogoMaxHeight),
+        fallbackFont: Font = PrismFont.heroTitle
+    ) {
         self.url = url
         self.fallbackTitle = fallbackTitle
         self.maxSize = maxSize
+        self.fallbackFont = fallbackFont
     }
 
     public var body: some View {
@@ -29,7 +35,7 @@ public struct TitleLogo: View {
                     .transition(.opacity)
                     .accessibilityLabel(Text(fallbackTitle))
             } else {
-                HeroTitleText(fallbackTitle)
+                HeroTitleText(fallbackTitle, font: fallbackFont)
                     .transition(.opacity)
             }
         }

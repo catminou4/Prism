@@ -60,7 +60,7 @@ struct DetailEpisodeTile: View {
         .buttonStyle(CardButtonStyle(hoverScale: 1.025))
         .accessibilityLabel(accessibleName)
         .accessibilityValue(watched ? "Vu" : progress.map { $0.fraction.formatted(.percent.precision(.fractionLength(0))) + " regardé" } ?? "")
-        .accessibilityHint("Lancer la lecture")
+        .accessibilityHint("Afficher l’épisode et les options de lecture")
         .help(title)
         .task(id: [metadata?.overview, episode.plot]) {
             let synopsis = await DetailPresentation.synopsis([metadata?.overview, episode.plot])

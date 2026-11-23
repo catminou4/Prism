@@ -10,16 +10,15 @@ struct TitlePlaybackSelection: Identifiable {
     let otherEditions: [TitleEdition]
     let episode: Episode?
     let preferred: ContentID?
-
-    var subtitle: String? {
-        episode.map { "\(EpisodeCoordinate($0).label) · \($0.title)" }
-    }
 }
 
+/// Immersive Apple TV–style playback sheet for a film or an episode: full-bleed artwork,
+/// title, facts, synopsis and play actions, then the language / edition picker as tiles.
 struct TitlePlaybackSheet: View {
     @Environment(\.dismiss) private var dismiss
     let title: MediaTitle
     let selection: TitlePlaybackSelection
+    let hero: PlaybackSheetHero
     let repository: DetailRepository
     let resumePosition: (TitlePlaybackOption) -> TimeInterval?
     let onPlay: (TitlePlaybackOption, TimeInterval?) -> Void
@@ -31,17 +30,24 @@ struct TitlePlaybackSheet: View {
     @State private var isLoading = false
     @State private var loadingRevision = 0
     @State private var isClosing = false
+    @State private var synopsis: String?
     @FocusState private var focusedOption: ContentID?
+
+    private static let size = CGSize(width: 1040, height: 652)
+    private static let heroHeight: CGFloat = 446
+    private static let margin: CGFloat = 40
 
     init(
         title: MediaTitle,
         selection: TitlePlaybackSelection,
+        hero: PlaybackSheetHero,
         repository: DetailRepository,
         resumePosition: @escaping (TitlePlaybackOption) -> TimeInterval?,
         onPlay: @escaping (TitlePlaybackOption, TimeInterval?) -> Void
     ) {
         self.title = title
         self.selection = selection
+        self.hero = hero
         self.repository = repository
         self.resumePosition = resumePosition
         self.onPlay = onPlay
@@ -55,76 +61,238 @@ struct TitlePlaybackSheet: View {
             ?? visible.first { $0.id == selection.preferred }
             ?? visible.first
         VStack(alignment: .leading, spacing: 0) {
-            header
-            VStack(alignment: .leading, spacing: 14) {
-                if choices.filters.count > 1 { languageFilters }
-                editionList(section, activeID: selected?.id)
-                if selected?.titleEdition.edition.key == "MULTI" {
-                    Label("Les pistes audio se choisissent dans le lecteur.", systemImage: "waveform")
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
-                }
-                connectionStatus
-            }
-            .padding(.horizontal, 22)
-            .padding(.bottom, 16)
-            Divider()
-            footer(selected)
+            heroInfo(selected: selected)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .frame(height: Self.heroHeight)
+            editionPicker(section, selected: selected)
+                .padding(.top, 2)
+            Spacer(minLength: 0)
         }
-        .frame(width: 552)
+        .frame(width: Self.size.width, height: Self.size.height)
+        .background { PlaybackSheetBackdrop(hero: hero, size: Self.size, heroHeight: Self.heroHeight) }
+        .overlay(alignment: .top) { toolbar }
+        .environment(\.colorScheme, .dark)
+        .presentationBackground(.black)
+        .task(id: hero.synopsisCandidates) {
+            let value = await DetailPresentation.synopsis(hero.synopsisCandidates)
+            if !Task.isCancelled { synopsis = value }
+        }
         .task(id: loadingRevision) { await resolveEditions() }
     }
 
-    private var header: some View {
-        HStack(spacing: 14) {
-            let posterShape = RoundedRectangle(cornerRadius: PrismMetrics.smallArtworkRadius)
-            RemoteImage(
-                url: title.posterURL, size: CGSize(width: 44, height: 66),
-                placeholderSeed: title.id.rawValue, placeholderTitle: title.title, placeholderStyle: .monogram
-            )
-            .clipShape(posterShape)
-            .overlay { posterShape.strokeBorder(.primary.opacity(0.09), lineWidth: 1) }
-            .accessibilityHidden(true)
+    // MARK: Hero
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Sources et langues")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
+    private var toolbar: some View {
+        HStack(spacing: 12) {
+            if selection.episode != nil {
                 Text(title.title)
-                    .font(.system(size: 23, weight: .semibold))
-                    .lineLimit(2)
-                if let subtitle = selection.subtitle {
-                    Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1)
+                    .shadow(color: .black.opacity(0.3), radius: 6, y: 1)
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(.isHeader)
             Spacer(minLength: 0)
+            GlassCircleButton(systemName: "xmark", style: .dark, accessibilityLabel: "Fermer", action: cancel)
+                .keyboardShortcut(.cancelAction)
+                .help("Fermer")
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 20)
-        .padding(.bottom, 17)
+        .padding(.leading, Self.margin)
+        .padding(.trailing, 18)
+        .padding(.top, 18)
     }
 
-    private var languageFilters: some View {
-        let filters = choices.filters
-        return VStack(alignment: .leading, spacing: 7) {
-            Text("Langues et versions")
-                .font(.subheadline.weight(.semibold))
-                .accessibilityAddTraits(.isHeader)
-            ViewThatFits(in: .horizontal) {
-                if filters.count <= 4 {
-                    filterBar(filters, overflow: [])
-                }
-                let inline = Array(filters.filter { !$0.id.hasPrefix("version-") }.prefix(2))
-                filterBar(inline, overflow: filters.filter { !inline.contains($0) })
-                filterBar([], overflow: filters)
+    private func heroInfo(selected: TitlePlaybackOption?) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(hero.eyebrow.uppercased(with: Locale(identifier: "fr-FR")))
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(.white.opacity(0.7))
+            heroTitle
+                .padding(.top, 6)
+            metaLine(selected: selected)
+                .padding(.top, 10)
+            if let synopsis {
+                ExpandableText(synopsis, lineLimit: 3, font: .system(size: 14), popoverTitle: hero.name, lineSpacing: 3)
+                    .padding(.top, 12)
             }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Filtrer les éditions")
+            actions(selected: selected)
+                .padding(.top, 22)
+        }
+        .frame(maxWidth: 600, alignment: .leading)
+        .padding(.horizontal, Self.margin)
+        .padding(.bottom, 24)
+    }
+
+    @ViewBuilder private var heroTitle: some View {
+        let font = Font.system(size: 36, weight: .bold)
+        if let logo = hero.logo {
+            TitleLogo(url: logo, fallbackTitle: hero.name, maxSize: CGSize(width: 360, height: 96), fallbackFont: font)
+        } else {
+            Text(hero.name)
+                .font(font)
+                .tracking(-0.6)
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+                .shadow(color: .black.opacity(0.25), radius: 10, y: 2)
+                .textSelection(.enabled)
+                .accessibilityAddTraits(.isHeader)
+        }
+    }
+
+    private func metaLine(selected: TitlePlaybackOption?) -> some View {
+        let quality = (selected?.label ?? "").components(separatedBy: " · ")
+            .filter { MediaBadge.isQualityLabel($0) }
+        return HStack(spacing: 8) {
+            if !hero.details.isEmpty {
+                Text(hero.details.joined(separator: " · "))
+            }
+            if let rating = hero.rating {
+                if !hero.details.isEmpty { Text("·") }
+                Label(rating, systemImage: "star.fill")
+                    .labelStyle(.titleAndIcon)
+                    .accessibilityLabel("Note \(rating) sur 10")
+            }
+            if !quality.isEmpty {
+                BadgeRow(quality.map { BadgeSpec($0, style: .filled) }, spacing: 4)
+                    .padding(.leading, 2)
+            }
+        }
+        .font(.system(size: 13, weight: .medium))
+        .foregroundStyle(.white.opacity(0.75))
+        .lineLimit(1)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func actions(selected: TitlePlaybackOption?) -> some View {
+        let position = selected.flatMap(resumePosition)
+        let runtime = (selected?.duration.flatMap { $0 > 0 ? $0 : nil } ?? hero.runtimeSeconds).map(Double.init)
+        let fraction = position.flatMap { position in runtime.map { min(max(position / $0, 0.02), 1) } }
+        let remaining = position.flatMap { position in runtime.map { max(1, Int(($0 - position) / 60)) } }
+        let playTitle = selection.episode == nil ? "Lecture" : "Lire l’épisode"
+        let title = position == nil ? playTitle : remaining.map { "\($0) min restantes" } ?? "Reprendre"
+        return HStack(spacing: 12) {
+            PrimaryCapsuleButton(title, systemImage: "play.fill", progress: position == nil ? nil : fraction ?? 0, minWidth: 196) {
+                if let selected { confirm(selected, position: position) }
+            }
+            .fixedSize()
+            .keyboardShortcut(.defaultAction)
+            .disabled(selected == nil || isClosing)
+            if position != nil, let selected {
+                GlassCapsuleButton(title: "Depuis le début", systemImage: "arrow.counterclockwise", trailingChevron: false) {
+                    confirm(selected, position: nil)
+                }
+                .fixedSize()
+                .disabled(isClosing)
+            }
+            if let selected {
+                Text(selected.titleEdition.edition.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
+                    .padding(.leading, 4)
+                    .accessibilityLabel("Édition choisie : \(selected.titleEdition.edition.title)")
+            }
+        }
+    }
+
+    // MARK: Editions
+
+    private func editionPicker(_ section: PlaybackSheetChoices.Section, selected: TitlePlaybackOption?) -> some View {
+        let visible = section.ordered
+        let groups = section.groups
+        let duplicates = groups.reduce(into: [ContentID: Int]()) { $0.merge($1.duplicateNumbers) { first, _ in first } }
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 10) {
+                Text("Langue et version")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(.white)
+                    .accessibilityAddTraits(.isHeader)
+                Text(visible.count.formatted())
+                    .font(.system(size: 13, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.5))
+                    .accessibilityLabel(visible.count == 1 ? "1 édition" : "\(visible.count) éditions")
+                if groups.count == 1, let source = groups.first?.source {
+                    sourceLabel(source)
+                        .foregroundStyle(.white.opacity(0.5))
+                        .padding(.leading, 6)
+                }
+                Spacer(minLength: 12)
+                if choices.filters.count > 1 {
+                    filterBars
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("Filtrer les éditions")
+                }
+            }
+            .frame(minHeight: 32)
+            .padding(.horizontal, Self.margin)
+
+            if visible.isEmpty {
+                HStack(spacing: 10) {
+                    if isLoading { ProgressView().controlSize(.small) }
+                    Text(isLoading ? "Recherche d’une édition disponible…" : "Aucune édition disponible.")
+                }
+                .font(.callout)
+                .foregroundStyle(.white.opacity(0.6))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: PlaybackEditionTile.size.height)
+                .padding(.horizontal, 18)
+                .background(.white.opacity(0.06), in: .rect(cornerRadius: 14))
+                .padding(.horizontal, Self.margin)
+                .padding(.vertical, 6)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        LazyHStack(spacing: 12) {
+                            ForEach(visible) { option in
+                                PlaybackEditionTile(
+                                    option: option, selected: option.id == selected?.id, focused: focusedOption == option.id,
+                                    duplicateNumber: duplicates[option.id], showsSource: groups.count > 1
+                                ) {
+                                    selectedID = option.id
+                                    focusedOption = option.id
+                                }
+                                .focused($focusedOption, equals: option.id)
+                                .onKeyPress(.leftArrow) { moveSelection(from: option.id, by: -1, options: visible, proxy: proxy) }
+                                .onKeyPress(.rightArrow) { moveSelection(from: option.id, by: 1, options: visible, proxy: proxy) }
+                                .id(option.id)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .contentMargins(.horizontal, Self.margin, for: .scrollContent)
+                    .scrollIndicators(.hidden)
+                    .scrollEdgeEffectStyle(.soft, for: [.leading, .trailing])
+                    .frame(height: PlaybackEditionTile.size.height + 12)
+                    .onAppear {
+                        if let id = selected?.id { proxy.scrollTo(id, anchor: .center) }
+                    }
+                }
+                .id(language)
+            }
+
+            HStack(spacing: 18) {
+                if selected?.titleEdition.edition.key == "MULTI" {
+                    Label("Les pistes audio se choisissent dans le lecteur.", systemImage: "waveform")
+                }
+                connectionStatus
+            }
+            .font(.system(size: 12))
+            .foregroundStyle(.white.opacity(0.55))
+            .frame(height: 22)
+            .padding(.horizontal, Self.margin)
+        }
+    }
+
+    private var filterBars: some View {
+        let filters = choices.filters
+        return ViewThatFits(in: .horizontal) {
+            if filters.count <= 4 {
+                filterBar(filters, overflow: [])
+            }
+            let inline = Array(filters.filter { !$0.id.hasPrefix("version-") }.prefix(2))
+            filterBar(inline, overflow: filters.filter { !inline.contains($0) })
+            filterBar([], overflow: filters)
         }
     }
 
@@ -173,11 +341,11 @@ struct TitlePlaybackSheet: View {
             }
         }
         .font(.subheadline.weight(active ? .semibold : .medium))
-        .foregroundStyle(active ? .primary : .secondary)
+        .foregroundStyle(active ? Color.black : Color.white.opacity(0.75))
         .padding(.horizontal, 12)
-        .frame(height: 31)
-        .background(active ? Color.primary.opacity(0.10) : .clear, in: .capsule)
-        .prismGlass(interactive: true)
+        .frame(height: 30)
+        .background(active ? Color.white : .clear, in: .capsule)
+        .prismGlass(.dark, interactive: true)
         .contentShape(.capsule)
     }
 
@@ -188,76 +356,9 @@ struct TitlePlaybackSheet: View {
         focusedOption = nil
     }
 
-    private func editionList(_ section: PlaybackSheetChoices.Section, activeID: ContentID?) -> some View {
-        let visible = section.options
-        let groups = section.groups
-        let expected = selection.options.count + selection.otherEditions.count
-        let rows = min(max(visible.count, expected > 0 && language == .all ? expected : 1), 5)
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text("Éditions disponibles")
-                    .font(.subheadline.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                Text(visible.count.formatted())
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel(visible.count == 1 ? "1 édition" : "\(visible.count) éditions")
-                Spacer(minLength: 0)
-                if groups.count == 1, let source = groups.first?.source {
-                    sourceLabel(source)
-                }
-            }
-            if visible.isEmpty {
-                Text(isLoading ? "Recherche d’une édition disponible…" : "Aucune édition disponible.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .background(PrismColors.panelFill, in: .rect(cornerRadius: 12))
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(groups) { group in
-                                if groups.count > 1 {
-                                    sourceLabel(group.source)
-                                        .accessibilityAddTraits(.isHeader)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 7)
-                                }
-                                ForEach(group.options) { option in
-                                    PlaybackSheetOptionRow(
-                                        option: option, selected: option.id == activeID, focused: focusedOption == option.id,
-                                        duplicateNumber: group.duplicateNumbers[option.id]
-                                    ) {
-                                        selectedID = option.id
-                                        focusedOption = option.id
-                                    }
-                                    .focused($focusedOption, equals: option.id)
-                                    .onKeyPress(.upArrow) { moveSelection(from: option.id, by: -1, options: section.ordered, proxy: proxy) }
-                                    .onKeyPress(.downArrow) { moveSelection(from: option.id, by: 1, options: section.ordered, proxy: proxy) }
-                                    .id(option.id)
-                                }
-                            }
-                        }
-                        .padding(4)
-                    }
-                    .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-                    .onAppear {
-                        if let activeID { proxy.scrollTo(activeID, anchor: .center) }
-                    }
-                    .frame(height: CGFloat(rows) * 40 + 8 + (groups.count > 1 ? 28 : 0))
-                }
-                .id(language)
-                .background(PrismColors.panelFill, in: .rect(cornerRadius: 12))
-            }
-        }
-    }
-
     private func sourceLabel(_ source: Source) -> some View {
         Label(source.name, systemImage: "tv")
             .font(.caption.weight(.medium))
-            .foregroundStyle(.secondary)
             .lineLimit(1)
     }
 
@@ -269,7 +370,7 @@ struct TitlePlaybackSheet: View {
         }
         let next = options[index + step].id
         selectedID = next
-        proxy.scrollTo(next)
+        withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo(next) }
         focusedOption = next
         return .handled
     }
@@ -280,53 +381,25 @@ struct TitlePlaybackSheet: View {
                 ProgressView().controlSize(.small)
                 Text("Vérification des autres éditions…")
             }
-            .foregroundStyle(.secondary)
-            .font(.callout)
         } else if !failures.isEmpty {
             HStack(spacing: 10) {
                 Label("Certaines sources sont indisponibles.", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.secondary)
-                Spacer()
                 Button("Réessayer") {
                     guard !isLoading else { return }
                     isLoading = true
                     loadingRevision += 1
                 }
-                    .buttonStyle(.glass)
-                    .controlSize(.small)
+                .buttonStyle(.glass)
+                .controlSize(.small)
             }
-            .font(.callout)
         }
     }
 
-    private func footer(_ selected: TitlePlaybackOption?) -> some View {
-        let position = selected.flatMap(resumePosition)
-        return HStack(spacing: 8) {
-            Button("Annuler", role: .cancel) {
-                isClosing = true
-                dismiss()
-            }
-                .buttonStyle(.glass)
-                .keyboardShortcut(.cancelAction)
-            Spacer(minLength: 8)
-            if position != nil, let selected {
-                Button("Depuis le début") { confirm(selected, position: nil) }
-                    .buttonStyle(.glass)
-                    .disabled(isClosing)
-            }
-            Button {
-                if let selected { confirm(selected, position: position) }
-            } label: {
-                Label(position == nil ? "Lire" : "Reprendre", systemImage: "play.fill")
-            }
-            .buttonStyle(.glassProminent)
-            .tint(Color(white: 0.28))
-            .keyboardShortcut(.defaultAction)
-            .disabled(selected == nil || isClosing)
-        }
-        .controlSize(.large)
-        .padding(.horizontal, 22)
-        .padding(.vertical, 14)
+    // MARK: Actions
+
+    private func cancel() {
+        isClosing = true
+        dismiss()
     }
 
     private func confirm(_ option: TitlePlaybackOption, position: TimeInterval?) {
