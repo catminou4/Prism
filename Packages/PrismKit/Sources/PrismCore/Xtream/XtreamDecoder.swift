@@ -245,11 +245,11 @@ public enum XtreamDecoder {
 
         var bySeason: [Int: [Episode]] = [:]
         var seenIDs = Set<String>()
-        for (index, item) in raw.enumerated() {
+        for item in raw {
             guard let ep = JSONObject(item.value), let id = ep.string("id", "stream_id"), seenIDs.insert(id).inserted else { continue }
             let epInfo = ep.object("info") ?? JSONObject.empty
             let season = ep.int("season") ?? item.season ?? epInfo.int("season") ?? 1
-            let number = ep.int("episode_num", "episode") ?? epInfo.int("episode_num") ?? (index + 1)
+            let number = ep.int("episode_num", "episode") ?? epInfo.int("episode_num") ?? ((bySeason[season]?.count ?? 0) + 1)
             let ext = ep.string("container_extension")
             let duration = epInfo.int("duration_secs") ?? LenientValue.hms(epInfo.value(["duration"]))
             let episode = Episode(
@@ -331,21 +331,27 @@ public enum XtreamDecoder {
     // MARK: Helpers
 
     static func json(_ data: Data) throws -> Any {
-        let trimmed = data.drop { $0 == 0x20 || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }
-        guard !trimmed.isEmpty else { return [Any]() }
+        guard let first = data.firstIndex(where: { $0 != 0x20 && $0 != 0x0A && $0 != 0x0D && $0 != 0x09 }) else {
+            return [Any]()
+        }
         do {
-            return try LenientValue.parse(Data(trimmed))
+            // Some panels prepend whitespace before a UTF-8 BOM.
+            let payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+            return try LenientValue.parse(payload)
         } catch {
-            let preview = String(decoding: trimmed.prefix(80), as: UTF8.self)
+            let preview = String(decoding: data[first...].prefix(80), as: UTF8.self)
             throw XtreamError.decoding("JSON invalide : \(preview)")
         }
     }
 
-    /// Top-level array (or dictionary of elements). An auth-error object yields no element.
+    /// Top-level array (or dictionary of elements).
     static func elements(_ data: Data) throws -> [Any] {
         let value = try json(data)
         if let dict = value as? [String: Any] {
-            if dict["user_info"] != nil { return [] }
+            if let userInfo = dict["user_info"] {
+                if JSONObject(userInfo)?.bool("auth") == false { throw XtreamError.unauthorized }
+                throw XtreamError.decoding("Liste attendue, réponse de compte reçue")
+            }
             if dict.values.allSatisfy({ $0 is [String: Any] }) { return LenientValue.array(dict) }
             return []
         }

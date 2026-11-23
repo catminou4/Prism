@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import PrismCore
 import PrismData
+import PrismDesign
 import QuartzCore
 import SwiftUI
 import Testing
@@ -11,6 +12,108 @@ import Testing
 @MainActor
 @Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["PRISM_SCROLL_PERF"] == "1"))
 struct ScrollPerformanceTests {
+    @Test func homeFeed() async throws {
+        _ = NSApplication.shared
+        let model = AppModel(directories: .temporary("prism-home-scroll-bench"), credentials: InMemoryCredentialStore(),
+                             library: .inMemory(), isEphemeral: true)
+        for try await _ in model.importDemo() {}
+        await model.refreshFeed(model.curationRequest(for: .home))
+        #expect(!model.feed(for: .home).highlights.isEmpty)
+
+        let frame = CGRect(x: 0, y: 0, width: 1_660, height: 960)
+        let host = NSHostingView(rootView: LibraryShell().environment(model).frame(width: frame.width, height: frame.height))
+        host.frame = frame
+        let window = NSWindow(contentRect: frame.offsetBy(dx: -20_000, dy: -20_000),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        layout(host)
+        try await Task.sleep(for: .milliseconds(700))
+        layout(host)
+
+        let scroll = try #require(scrollView(in: host, minimumWidth: 1_000))
+        let clip = scroll.contentView
+        let origin = clip.bounds.origin
+        let distance = min(4_800, clip.documentRect.height - clip.bounds.height)
+        #expect(distance > 300)
+
+        let direction: CGFloat = clip.isFlipped ? 1 : -1
+        let clock = ContinuousClock()
+        let start = clock.now
+        let steps = 120
+        var samples: [Double] = []
+        for step in 1...steps {
+            try await clock.sleep(until: start.advanced(by: .nanoseconds(8_333_333) * step))
+            let fraction = CGFloat(min(step, steps - step)) / CGFloat(steps / 2)
+            let destination = CGPoint(x: origin.x, y: origin.y + direction * distance * fraction)
+            let sampleStart = clock.now
+            clip.scroll(to: destination)
+            scroll.reflectScrolledClipView(clip)
+            layout(host)
+            samples.append(milliseconds(sampleStart.duration(to: clock.now)))
+            if step == steps / 2 { #expect(abs(clip.bounds.origin.y - origin.y) > 300) }
+        }
+        let sorted = samples.sorted()
+        print("[scroll-perf] Home: p50 \(format(sorted[steps / 2 - 1])) ms, p95 \(format(sorted[steps * 95 / 100 - 1])) ms, "
+            + "max \(format(sorted[steps - 1])) ms, \(samples.count { $0 > 1_000.0 / 120 })/\(steps) over 8.33 ms")
+    }
+
+    @Test func browseShelves() async throws {
+        _ = NSApplication.shared
+        let titles = (0..<360).map { index in
+            MediaTitle(id: TitleID(rawValue: "movie:\(index)"), kind: .movie,
+                       title: "Film \(index)", year: 2000 + index % 25, variants: [])
+        }
+        let model = AppModel(directories: .temporary("prism-shelves-bench"), credentials: InMemoryCredentialStore(),
+                             library: .inMemory(), isEphemeral: true)
+        let navigation = NavigationModel()
+        let size = CGSize(width: 1_170, height: 870)
+        let frame = CGRect(origin: .zero, size: size)
+        let host = NSHostingView(rootView: ScrollView {
+            LazyVStack(alignment: .leading, spacing: PrismMetrics.shelfSpacing) {
+                ForEach(0..<20) { index in
+                    TitleShelf(title: "Sélection \(index)", items: Array(titles[(index * 18)..<(index * 18 + 18)]))
+                }
+            }
+        }.frame(width: size.width, height: size.height)
+            .environment(\.prismShelfViewportWidth, size.width)
+            .environment(model).environment(navigation))
+        host.frame = frame
+        let window = NSWindow(contentRect: frame.offsetBy(dx: -20_000, dy: -20_000),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        layout(host)
+        let scroll = try #require(scrollView(in: host))
+        let clip = scroll.contentView
+        let origin = clip.bounds.origin
+        let direction: CGFloat = clip.isFlipped ? 1 : -1
+        try await Task.sleep(for: .milliseconds(100))
+        let clock = ContinuousClock()
+        let start = clock.now
+        let steps = 240
+        var samples: [Double] = []
+        for step in 1...steps {
+            try await clock.sleep(until: start.advanced(by: .nanoseconds(8_333_333) * step))
+            let offset = min(step, steps - step)
+            let destination = CGPoint(x: origin.x, y: origin.y + direction * CGFloat(offset * 24))
+            let sampleStart = clock.now
+            clip.scroll(to: destination)
+            scroll.reflectScrolledClipView(clip)
+            layout(host)
+            samples.append(milliseconds(sampleStart.duration(to: clock.now)))
+            if step == steps / 2 { #expect(abs(clip.bounds.origin.y - destination.y) < 1) }
+        }
+        let sorted = samples.sorted()
+        let wall = milliseconds(start.duration(to: clock.now))
+        print("[scroll-perf] 20 shelves × 18 posters: p50 \(format(sorted[119])) ms, "
+            + "p95 \(format(sorted[227])) ms, max \(format(sorted[239])) ms, "
+            + "\(samples.count { $0 > 1_000.0 / 120 })/240 over 8.33 ms, wall \(format(wall)) ms")
+        print("[scroll-perf] slow steps: \(samples.enumerated().filter { $0.element > 1_000.0 / 120 }.map { "\($0.offset + 1):\(format($0.element))" }.joined(separator: ", "))")
+    }
+
     @Test func titleGrid() async throws {
         _ = NSApplication.shared
         let titles = (0..<100_000).map { index in
@@ -83,9 +186,9 @@ struct ScrollPerformanceTests {
         }
     }
 
-    private func scrollView(in view: NSView) -> NSScrollView? {
-        if let scroll = view as? NSScrollView { return scroll }
-        return view.subviews.lazy.compactMap { scrollView(in: $0) }.first
+    private func scrollView(in view: NSView, minimumWidth: CGFloat = 0) -> NSScrollView? {
+        if let scroll = view as? NSScrollView, scroll.frame.width >= minimumWidth { return scroll }
+        return view.subviews.lazy.compactMap { scrollView(in: $0, minimumWidth: minimumWidth) }.first
     }
 
     private func layout(_ host: NSView) {

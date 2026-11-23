@@ -10,16 +10,21 @@ struct SportsScreen: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.isPageActive) private var isActive
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var period: Period = .schedule
     @State private var sport: BroadcastSport?
     @State private var day: Date?
     @State private var scrollTarget: ScrollTarget?
+    @State private var scrollRegion: ScrollRegion = .top
     @State private var isRefreshingGuide = false
     @State private var showsGuidePrograms = false
 
     private enum Period: Hashable { case schedule, live }
     private enum ScrollTarget: Hashable { case top, fixture(String) }
+    private enum ScrollRegion: Equatable { case top, artwork, programme }
+
+    private static let controlsInset: CGFloat = 54
 
     var body: some View {
         if let sports {
@@ -33,27 +38,44 @@ struct SportsScreen: View {
                 calendar: calendar
             )
 
+            let hasFeature = schedule.featured != nil
             GeometryReader { geometry in
                 let width = max(1, geometry.size.width - 2 * PrismMetrics.contentMargin)
+                let featureSize = CGSize(
+                    width: max(1, geometry.size.width),
+                    height: min(364, max(290, width * 0.31))
+                )
                 ScrollViewReader { reader in
                     ScrollView {
                         VStack(alignment: .leading, spacing: PrismMetrics.shelfSpacing) {
                             if schedule.isEmpty {
                                 emptyContent(sports)
-                                    .frame(minHeight: max(0, geometry.size.height - 200))
+                                    .frame(minHeight: max(0, geometry.size.height - Self.controlsInset - 44))
                             } else {
-                                agenda(schedule, now: now, width: width)
+                                agenda(schedule, now: now, width: width, featureSize: featureSize)
                                 scoresNotice(sports)
                             }
                         }
                         .padding(.horizontal, PrismMetrics.contentMargin)
-                        .padding(.top, 16)
+                        .padding(.top, hasFeature ? 0 : Self.controlsInset)
                         .padding(.bottom, 44)
                         .id(ScrollTarget.top)
                     }
-                    .scrollEdgeEffectStyle(.soft, for: .top)
-                    .safeAreaBar(edge: .top, spacing: 0) {
-                        header(selected: selected, days: days, today: today)
+                    .scrollEdgeEffectHidden(true, for: .top)
+                    .scrollContentBackground(.hidden)
+                    .onScrollGeometryChange(for: ScrollRegion.self) { scroll in
+                        let offset = scroll.contentOffset.y + scroll.contentInsets.top
+                        if offset <= 1 { return .top }
+                        return offset < featureSize.height - Self.controlsInset ? .artwork : .programme
+                    } action: { _, region in
+                        scrollRegion = region
+                    }
+                    .background(alignment: .top) {
+                        if isActive, scrollRegion == .top, let lead = schedule.featured {
+                            SportsFeatureBackdrop(fixture: lead, size: featureSize)
+                                .id(lead.id)
+                                .allowsHitTesting(false)
+                        }
                     }
                     .task(id: scrollTarget) {
                         guard let scrollTarget else { return }
@@ -63,6 +85,10 @@ struct SportsScreen: View {
                         self.scrollTarget = nil
                     }
                 }
+                .ignoresSafeArea(.container, edges: hasFeature ? .top : [])
+            }
+            .overlay(alignment: .top) {
+                controls(selected: selected, days: days, today: today, overArtwork: hasFeature && scrollRegion != .programme)
             }
             .modifier(SportsUpdates())
             .onChange(of: isActive ? sports.destination : nil, initial: true) { _, destination in
@@ -79,47 +105,54 @@ struct SportsScreen: View {
         }
     }
 
-    private func header(selected: Date, days: [Date], today: Date) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                BrowseHeading(title: "Sport")
+    private func controls(selected: Date, days: [Date], today: Date, overArtwork: Bool) -> some View {
+        HStack(spacing: 10) {
+            Text("Sport")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(overArtwork ? Color.white : Color.primary)
+                .shadow(color: overArtwork ? .black.opacity(0.65) : .clear, radius: 3, y: 1)
+                .accessibilityAddTraits(.isHeader)
 
-                Button("Programme", systemImage: "calendar") { setPeriod(.schedule) }
-                    .modifier(SportsPeriodStyle(isSelected: period == .schedule))
-                Button("En direct", systemImage: "dot.radiowaves.left.and.right") { setPeriod(.live) }
-                    .modifier(SportsPeriodStyle(isSelected: period == .live))
+            Spacer(minLength: 16)
 
-                GlassCircleButton(systemName: "arrow.clockwise", accessibilityLabel: "Actualiser le guide TV", action: refreshGuide)
-                    .disabled(isRefreshingGuide || app.isRefreshingGuide || !app.sources.contains(where: \.isEnabled))
-                    .help("Actualiser le guide TV")
-                    .padding(.leading, 4)
-                    .padding(.trailing, PrismMetrics.contentMargin)
+            Button("Programme") { setPeriod(.schedule) }
+                .modifier(SportsPeriodStyle(isSelected: period == .schedule))
+            Button("En direct", systemImage: "dot.radiowaves.left.and.right") { setPeriod(.live) }
+                .modifier(SportsPeriodStyle(isSelected: period == .live))
+
+            sportMenu()
+            if period == .schedule {
+                dateMenu(selected: selected, days: days, today: today)
             }
 
-            HStack(spacing: 12) {
-                ChipBar(items: Self.disciplines, selection: Binding(
-                    get: { sport?.rawValue ?? "all" },
-                    set: { value in
-                        let next = value.flatMap(BroadcastSport.init(rawValue:))
-                        guard sport != next else { return }
-                        sport = next
-                        scrollTarget = .top
-                    }
-                ))
-                .accessibilityLabel("Disciplines")
-
-                if period == .schedule {
-                    dateMenu(selected: selected, days: days, today: today)
-                        .padding(.trailing, PrismMetrics.contentMargin)
-                }
-            }
+            GlassCircleButton(systemName: "arrow.clockwise", accessibilityLabel: "Actualiser le guide TV", action: refreshGuide)
+                .disabled(isRefreshingGuide || app.isRefreshingGuide || !app.sources.contains(where: \.isEnabled))
+                .help("Actualiser le guide TV")
         }
-        .padding(.top, 20)
-        .padding(.bottom, 12)
+        .environment(\.colorScheme, overArtwork ? .dark : colorScheme)
+        .padding(.horizontal, PrismMetrics.contentMargin)
+        .padding(.top, 8)
     }
 
-    private static let disciplines = [ChipItem(id: "all", title: "Tous les sports")] + BroadcastSport.allCases.map {
-        ChipItem(id: $0.rawValue, title: $0.displayName, systemImage: $0.symbol)
+    private func sportMenu() -> some View {
+        Menu {
+            Picker("Discipline", selection: Binding(get: { sport }, set: { next in
+                guard sport != next else { return }
+                sport = next
+                scrollTarget = .top
+            })) {
+                Text("Tous les sports").tag(nil as BroadcastSport?)
+                ForEach(BroadcastSport.allCases, id: \.self) { discipline in
+                    Label(discipline.displayName, systemImage: discipline.symbol).tag(Optional(discipline))
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            GlassCapsuleLabel(title: sport?.displayName ?? "Tous les sports", systemImage: sport?.symbol ?? "line.3.horizontal.decrease")
+        }
+        .modifier(SportsGlassMenu())
+        .accessibilityLabel("Discipline")
+        .accessibilityValue(sport?.displayName ?? "Tous les sports")
     }
 
     private func dateMenu(selected: Date, days: [Date], today: Date) -> some View {
@@ -157,16 +190,14 @@ struct SportsScreen: View {
         scrollTarget = .top
     }
 
-    @ViewBuilder private func agenda(_ schedule: SportsAgenda, now: Date, width: CGFloat) -> some View {
+    @ViewBuilder private func agenda(_ schedule: SportsAgenda, now: Date, width: CGFloat, featureSize: CGSize) -> some View {
         if let lead = schedule.featured {
             ZStack {
-                SportsFeature(
-                    fixture: lead, now: now,
-                    size: CGSize(width: width, height: min(364, max(290, width * 0.31)))
-                )
-                .id(ScrollTarget.fixture(lead.id))
-                .transition(.opacity)
+                SportsFeature(fixture: lead, now: now, size: featureSize)
+                    .id(ScrollTarget.fixture(lead.id))
+                    .transition(.opacity)
             }
+            .padding(.horizontal, -PrismMetrics.contentMargin)
             .animation(reduceMotion ? nil : PrismMotion.quickFade, value: lead.id)
         }
         ForEach(schedule.sections) { section in
@@ -273,7 +304,7 @@ private struct SportsPeriodStyle: ViewModifier {
             }
         }
         .buttonBorderShape(.capsule)
-        .controlSize(.large)
+        .controlSize(.regular)
         .fixedSize()
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }

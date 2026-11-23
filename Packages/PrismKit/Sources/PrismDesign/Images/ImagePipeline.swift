@@ -74,6 +74,7 @@ public actor ImagePipeline {
     private var inFlight: [Key: InFlight<CGImage?>] = [:]
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
+    private var failedRequests: [URL: ContinuousClock.Instant] = [:]
     private var prefetches: [URL: Task<Void, Never>] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
@@ -207,6 +208,7 @@ public actor ImagePipeline {
         memory.removeAll()
         disk.removeAll()
         averageColors.removeAll()
+        failedRequests.removeAll()
     }
 
     // MARK: Internals
@@ -272,6 +274,7 @@ public actor ImagePipeline {
         if let existing = dataInFlight[url] {
             entry = existing
         } else {
+            guard !isCoolingDown(url) else { return nil }
             let disk = disk, session = session
             entry = InFlight(task: Task.detached(priority: .userInitiated) {
                 await Self.encodedData(for: request, disk: disk, session: session)
@@ -285,15 +288,24 @@ public actor ImagePipeline {
         } onCancel: {
             Task { await self.releaseData(url, token: token, finished: false) }
         }
-        releaseData(url, token: token, finished: true)
+        releaseData(url, token: token, finished: true, failed: data == nil)
         return data
     }
 
-    private func releaseData(_ url: URL, token: ObjectIdentifier, finished: Bool) {
+    private func releaseData(_ url: URL, token: ObjectIdentifier, finished: Bool, failed: Bool = false) {
         guard let entry = dataInFlight[url], ObjectIdentifier(entry) == token else { return }
         if finished {
-            // Bytes are on disk now (or the fetch failed): later decodes read the disk cache.
             dataInFlight[url] = nil
+            if failed, !entry.task.isCancelled {
+                if failedRequests.count >= 2_048 {
+                    let now = ContinuousClock.now
+                    failedRequests = failedRequests.filter { $0.value > now }
+                    if failedRequests.count >= 2_048 {
+                        for key in Array(failedRequests.keys.prefix(128)) { failedRequests[key] = nil }
+                    }
+                }
+                failedRequests[url] = ContinuousClock.now.advanced(by: .seconds(120))
+            }
             return
         }
         entry.waiters -= 1
@@ -301,6 +313,13 @@ public actor ImagePipeline {
             entry.task.cancel()
             dataInFlight[url] = nil
         }
+    }
+
+    private func isCoolingDown(_ url: URL) -> Bool {
+        guard let expiry = failedRequests[url] else { return false }
+        if expiry > ContinuousClock.now { return true }
+        failedRequests[url] = nil
+        return false
     }
 
     /// Disk hit, else network (validated as an image before being stored). A resized TMDB request
@@ -334,7 +353,8 @@ public actor ImagePipeline {
         var fresh: [ArtworkURL.Resolved] = []
         for url in urls where !url.isFileURL {
             let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
-            guard dataInFlight[request.primary] == nil, warmQueued.insert(request.primary).inserted else { continue }
+            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary),
+                  warmQueued.insert(request.primary).inserted else { continue }
             fresh.append(request)
         }
         guard !fresh.isEmpty else { return }
@@ -351,7 +371,7 @@ public actor ImagePipeline {
         while warmRunning < Self.warmConcurrency, !warmQueue.isEmpty {
             let request = warmQueue.removeFirst()
             warmQueued.remove(request.primary)
-            guard dataInFlight[request.primary] == nil else { continue }
+            guard dataInFlight[request.primary] == nil, !isCoolingDown(request.primary) else { continue }
             warmRunning += 1
             let disk = disk, session = prefetchSession
             // Registered like any fetch, so an on-screen decode of the same image joins it.
@@ -362,16 +382,12 @@ public actor ImagePipeline {
             dataInFlight[request.primary] = entry
             let token = ObjectIdentifier(entry)
             Task(priority: .utility) {
-                _ = await entry.task.value
-                self.warmFinished(request.primary, token: token)
+                let data = await entry.task.value
+                self.releaseData(request.primary, token: token, finished: true, failed: data == nil)
+                self.warmRunning -= 1
+                self.startWarming()
             }
         }
-    }
-
-    private func warmFinished(_ url: URL, token: ObjectIdentifier) {
-        warmRunning -= 1
-        if let entry = dataInFlight[url], ObjectIdentifier(entry) == token { dataInFlight[url] = nil }
-        startWarming()
     }
 
     private func release(_ key: Key, token: ObjectIdentifier, finished: Bool) {

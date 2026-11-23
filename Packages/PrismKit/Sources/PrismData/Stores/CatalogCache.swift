@@ -82,7 +82,6 @@ public actor CatalogCache {
         case channels([Channel])
         case movies([Movie])
         case series([Series])
-        case invalid
     }
 
     @concurrent
@@ -91,67 +90,41 @@ public actor CatalogCache {
               let first = segments.first, first.tag == Tag.meta.rawValue,
               let meta = SegmentedArchive.decodeSegment(Meta.self, from: first),
               id == nil || meta.sourceID == id else { return nil }
-        let decoded: [(Int, Decoded)] = await withTaskGroup(of: (Int, Decoded).self) { group in
-            for (index, segment) in segments.dropFirst().enumerated() {
-                group.addTask {
-                    guard !Task.isCancelled else { return (index, .invalid) }
-                    switch Tag(rawValue: segment.tag) {
-                    case .channels: return (index, SegmentedArchive.decodeSegment([Channel].self, from: segment).map(Decoded.channels) ?? .invalid)
-                    case .movies:
-                        guard var movies = SegmentedArchive.decodeSegment([Movie].self, from: segment) else { return (index, .invalid) }
-                        // Catalogues cached before a naming fix get it without a network refresh.
-                        for offset in movies.indices {
-                            let refined = TitleRefinement.refine(movies[offset].title)
-                            if refined != movies[offset].title { movies[offset].title = refined }
-                        }
-                        return (index, .movies(movies))
-                    case .series:
-                        guard var series = SegmentedArchive.decodeSegment([Series].self, from: segment) else { return (index, .invalid) }
-                        for offset in series.indices {
-                            let refined = TitleRefinement.refine(series[offset].title)
-                            if refined != series[offset].title { series[offset].title = refined }
-                        }
-                        return (index, .series(series))
-                    case .meta, nil: return (index, .invalid)
-                    }
-                }
-            }
-            var results: [(Int, Decoded)] = []
-            for await result in group { results.append(result) }
-            return results.sorted { $0.0 < $1.0 }
-        }
-        var counts = (channels: 0, movies: 0, series: 0)
-        for (_, part) in decoded {
+        let empty = SourceCatalog(sourceID: meta.sourceID, categories: meta.categories, account: meta.account, fetchedAt: meta.fetchedAt)
+        guard var catalog = await SegmentedArchive.decodeChunks(segments.dropFirst(), into: empty, decode: decodePart, append: { catalog, part in
             switch part {
-            case .channels(let value): counts.channels += value.count
-            case .movies(let value): counts.movies += value.count
-            case .series(let value): counts.series += value.count
-            case .invalid: return nil
+            case .channels(let value): catalog.channels += value
+            case .movies(let value): catalog.movies += value
+            case .series(let value): catalog.series += value
             }
-        }
-        guard counts.channels == meta.channelCount, counts.movies == meta.movieCount,
-              counts.series == meta.seriesCount else { return nil }
-
-        var channels: [Channel] = []
-        var movies: [Movie] = []
-        var series: [Series] = []
-        channels.reserveCapacity(counts.channels)
-        movies.reserveCapacity(counts.movies)
-        series.reserveCapacity(counts.series)
-        for (_, part) in decoded {
-            switch part {
-            case .channels(let value): channels += value
-            case .movies(let value): movies += value
-            case .series(let value): series += value
-            case .invalid: return nil
-            }
-        }
-        var catalog = SourceCatalog(
-            sourceID: meta.sourceID, categories: meta.categories, channels: channels, movies: movies, series: series,
-            account: meta.account, fetchedAt: meta.fetchedAt
-        )
+        }), catalog.channels.count == meta.channelCount, catalog.movies.count == meta.movieCount,
+            catalog.series.count == meta.seriesCount else { return nil }
         catalog.shareRepeatedValues()
         return catalog
+    }
+
+    private static func decodePart(_ segment: SegmentedArchive.Segment) -> Decoded? {
+        switch Tag(rawValue: segment.tag) {
+        case .channels:
+            return SegmentedArchive.decodeSegment([Channel].self, from: segment).map(Decoded.channels)
+        case .movies:
+            guard var movies = SegmentedArchive.decodeSegment([Movie].self, from: segment) else { return nil }
+            // Catalogues cached before a naming fix get it without a network refresh.
+            for offset in movies.indices {
+                let refined = TitleRefinement.refine(movies[offset].title)
+                if refined != movies[offset].title { movies[offset].title = refined }
+            }
+            return .movies(movies)
+        case .series:
+            guard var series = SegmentedArchive.decodeSegment([Series].self, from: segment) else { return nil }
+            for offset in series.indices {
+                let refined = TitleRefinement.refine(series[offset].title)
+                if refined != series[offset].title { series[offset].title = refined }
+            }
+            return .series(series)
+        case .meta, nil:
+            return nil
+        }
     }
 }
 
@@ -202,21 +175,10 @@ public actor EPGCache {
               let segments = SegmentedArchive.unpack(data, version: version),
               let first = segments.first, first.tag == 0,
               let meta = SegmentedArchive.decodeSegment(Meta.self, from: first), meta.sourceID == id else { return nil }
-        let chunks: [(Int, [EPGProgram]?)] = await withTaskGroup(of: (Int, [EPGProgram]?).self) { group in
-            for (index, segment) in segments.dropFirst().enumerated() {
-                group.addTask { (index, SegmentedArchive.decodeSegment([EPGProgram].self, from: segment)) }
-            }
-            var results: [(Int, [EPGProgram]?)] = []
-            for await result in group { results.append(result) }
-            return results.sorted { $0.0 < $1.0 }
-        }
-        var programs: [EPGProgram] = []
-        programs.reserveCapacity(meta.programCount)
-        for (_, chunk) in chunks {
-            guard let chunk else { return nil }
-            programs += chunk
-        }
-        guard programs.count == meta.programCount else { return nil }
+        guard let programs = await SegmentedArchive.decodeChunks(segments.dropFirst(), into: [EPGProgram](), decode: { segment in
+            guard segment.tag == 1 else { return nil }
+            return SegmentedArchive.decodeSegment([EPGProgram].self, from: segment)
+        }, append: { $0 += $1 }), programs.count == meta.programCount else { return nil }
         return Entry(
             programs: programs,
             channels: meta.channels.map { XMLTVChannel(id: $0.id, displayNames: $0.displayNames, iconURL: $0.iconURL) },

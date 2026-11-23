@@ -66,7 +66,10 @@ struct LiveGuide<ChannelMenu: View>: View {
             }
             DatePicker("Jour du programme", selection: Binding(
                 get: { timeline.interval.start },
-                set: { start = Calendar.current.startOfDay(for: $0) }
+                set: { date in
+                    let calendar = Calendar.current
+                    start = calendar.isDate(date, inSameDayAs: timeline.now) ? nil : calendar.startOfDay(for: date)
+                }
             ), displayedComponents: .date)
             .labelsHidden()
             .datePickerStyle(.compact)
@@ -134,7 +137,7 @@ struct LiveGuide<ChannelMenu: View>: View {
         let programmes = id.map { guide.programs(forEPGID: $0, in: timeline.interval) } ?? []
         let archiveWindow = channel.variants.lazy.compactMap { $0.catchup?.days }.max() ?? 0
         func airingProgramme() -> EPGProgram? {
-            id.flatMap { guide.nowAndNext(forEPGID: $0, at: Date.now).now }
+            id.flatMap { guide.nowAndNext(forEPGID: $0, at: timeline.now).now }
         }
         return HStack(spacing: 0) {
             GuideChannelButton(channel: channel) { onPlay(channel, airingProgramme()) }

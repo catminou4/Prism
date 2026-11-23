@@ -24,6 +24,11 @@ public struct RemoteImage: View {
 
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismScrollActivity) private var scrollActivity
+
+    private var imageFade: Animation? {
+        scrollActivity?.isScrolling == true ? nil : PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)
+    }
     @State private var loaded: Loaded?
     @State private var measuredSize: CGSize = .zero
 
@@ -69,7 +74,7 @@ public struct RemoteImage: View {
         return ImagePipeline.key(url: url, pixelSize: pixels, fitting: fitting, blurRadius: blurRadius)
     }
 
-    func blursArtwork(sized sourceSize: CGSize) -> Self {
+    public func blursArtwork(sized sourceSize: CGSize) -> Self {
         var view = self
         view.blurSourceSize = sourceSize
         return view
@@ -141,6 +146,11 @@ public struct RemoteImage: View {
             loaded = Loaded(key: key, image: cached)
             return
         }
+        if scrollActivity?.isScrolling == true, !progressive {
+            // Briefly passing through a row should not start a batch of image downloads and decodes.
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+        }
         // Full-screen artwork: a lighter copy fills the slot while the full resolution downloads.
         // Whichever arrives first wins; a full image already on disk never waits for the copy.
         if progressive, loaded?.key.showsSameArtwork(as: key) != true, let preview = ImagePipeline.previewKey(for: key) {
@@ -154,7 +164,7 @@ public struct RemoteImage: View {
                         return
                     }
                     if let image = result.image, !Task.isCancelled, loaded?.key != key {
-                        withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) {
+                        withAnimation(imageFade) {
                             loaded = Loaded(key: preview, image: image)
                         }
                     }
@@ -182,7 +192,7 @@ public struct RemoteImage: View {
             loaded = Loaded(key: key, image: image)
             return
         }
-        withAnimation(PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)) {
+        withAnimation(imageFade) {
             loaded = Loaded(key: key, image: image)
         }
     }

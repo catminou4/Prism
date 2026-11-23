@@ -183,6 +183,10 @@ private struct ParserState {
     }
 
     mutating func urlLine(_ b: UnsafePointer<UInt8>, _ start: Int, _ end: Int) {
+        defer {
+            pending = nil
+            if !pendingHeaders.isEmpty { pendingHeaders = [:] }
+        }
         var urlEnd = end
         var pipe = -1
         if let found = memchr(b + start, 0x7C, end - start) {
@@ -208,13 +212,11 @@ private struct ParserState {
             var group = info.attributes["group-title"]
             if group?.isEmpty ?? true { group = pendingGroup }
             let attributes = info.attributes
-            if attributes.count > 4 {
-                for key in M3UBytes.userAgentKeys where headers["User-Agent"] == nil {
-                    if let ua = attributes[key], !ua.isEmpty { headers["User-Agent"] = ua }
-                }
-                for key in M3UBytes.refererKeys where headers["Referer"] == nil {
-                    if let ref = attributes[key], !ref.isEmpty { headers["Referer"] = ref }
-                }
+            for key in M3UBytes.userAgentKeys where headers["User-Agent"] == nil {
+                if let ua = attributes[key], !ua.isEmpty { headers["User-Agent"] = ua }
+            }
+            for key in M3UBytes.refererKeys where headers["Referer"] == nil {
+                if let ref = attributes[key], !ref.isEmpty { headers["Referer"] = ref }
             }
             let name = info.name.isEmpty ? M3UBytes.fallbackName(url) : info.name
             entry = M3UEntry(name: name, url: url, duration: info.duration, attributes: attributes, group: group, headers: headers)
@@ -222,8 +224,6 @@ private struct ParserState {
             entry = M3UEntry(name: M3UBytes.fallbackName(url), url: url, duration: -1, attributes: [:], group: pendingGroup, headers: headers)
         }
         entries.append(entry)
-        pending = nil
-        if !pendingHeaders.isEmpty { pendingHeaders = [:] }
     }
 
     /// Parses `-1 tvg-id="…" group-title="…",Name` → duration + index of the name.

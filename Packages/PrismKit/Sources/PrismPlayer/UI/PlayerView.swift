@@ -494,10 +494,10 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
             if !isRepeat { controller.togglePlayPause() }
             return .handled
         case .leftArrow:
-            controller.skip(by: -10)
+            if !isRepeat { controller.skip(by: -10) }
             return .handled
         case .rightArrow:
-            controller.skip(by: 10)
+            if !isRepeat { controller.skip(by: 10) }
             return .handled
         case .upArrow:
             if let onChannelUp {

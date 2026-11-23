@@ -1,4 +1,16 @@
+import Observation
 import SwiftUI
+
+/// Updated at the start and end of a scroll, without changing the enclosing environment value.
+@Observable public final class ScrollActivity {
+    public var isScrolling = false
+
+    public init() {}
+}
+
+extension EnvironmentValues {
+    @Entry public var prismScrollActivity: ScrollActivity? = nil
+}
 
 extension View {
     /// Apple TV hover affordance: scale + soft shadow on pointer hover, spring-animated.

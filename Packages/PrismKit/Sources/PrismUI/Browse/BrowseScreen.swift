@@ -49,19 +49,31 @@ struct BrowseScreen: View {
                     curatedShelves(feed)
                     if !feed.genres.isEmpty {
                         GenreTileShelf(tiles: feed.genres, kind: kind)
-                            .rowEntrance()
                     }
-                    if let kind { providerShelves(kind).rowEntrance() }
+                    if let kind { providerShelves(kind) }
                 }
                 .padding(.bottom, 48)
+                .environment(\.prismScrollActivity, motion.scrollActivity)
                 // A new composition (first load, languages, a day later) cross-fades row by row
                 // instead of popping.
                 .animation(reduceMotion ? nil : PrismMotion.entrance, value: feed.shelves.map(\.id))
             }
+            .scrollContentBackground(.hidden)
+            .onScrollGeometryChange(for: Bool.self) { scroll in
+                scroll.contentOffset.y + scroll.contentInsets.top <= 1
+            } action: { _, atTop in
+                motion.isAtTop = atTop
+            }
             .onScrollPhaseChange { _, phase in
-                if motion.isScrolling != phase.isScrolling { motion.isScrolling = phase.isScrolling }
+                if motion.scrollActivity.isScrolling != phase.isScrolling {
+                    motion.scrollActivity.isScrolling = phase.isScrolling
+                }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .background(alignment: .top) {
+                BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
+                    .frame(height: heroHeight)
+            }
             .ignoresSafeArea(.container, edges: feed.highlights.isEmpty ? [] : .top)
         }
         .modifier(BrowseFeedRefresh(scope: scope))
@@ -76,7 +88,6 @@ struct BrowseScreen: View {
     @ViewBuilder private func curatedShelves(_ feed: CuratedFeed) -> some View {
         ForEach(feed.shelves) { shelf in
             CuratedShelfView(shelf: shelf)
-                .rowEntrance()
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 18)),
                     removal: .opacity.animation(PrismMotion.quickFade)
@@ -115,28 +126,52 @@ private struct HomeLibraryShelves: View {
     @Environment(NavigationModel.self) private var navigation
 
     var body: some View {
-        let watching = app.library.continueWatching(in: app.catalog, limit: 14)
-        if !watching.isEmpty {
-            Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
-                navigation.push(.collection(.continueWatching))
-            }) { item in
-                ResumeCard(item: item)
+        ContinueWatchingContent(limit: 14) { watching in
+            if let watching, !watching.isEmpty {
+                Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
+                    navigation.push(.collection(.continueWatching))
+                }) { item in
+                    ResumeCard(item: item)
+                }
             }
-            .rowEntrance()
         }
         SportsHomeShelf()
-            .rowEntrance()
         let watchlist = app.library.watchlist.prefix(24).compactMap(app.catalog.title)
         if !watchlist.isEmpty {
             TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
-                .rowEntrance()
         }
     }
 }
 
-/// Only the carousel reads scroll phase, so starting a scroll leaves the shelves alone.
 @Observable private final class BrowseScrollActivity {
-    var isScrolling = false
+    let scrollActivity = ScrollActivity()
+    var isAtTop = true
+    var heroIndex = 0
+}
+
+private struct BrowseOverscrollBackground: View {
+    let highlights: [CuratedHighlight]
+    let motion: BrowseScrollActivity
+
+    var body: some View {
+        if motion.isAtTop, !highlights.isEmpty {
+            let title = highlights[min(max(motion.heroIndex, 0), highlights.count - 1)].title
+            BrowseHeroBackground(title: title)
+        }
+    }
+}
+
+private struct BrowseHeroBackground: View {
+    @Environment(AppModel.self) private var app
+    let title: MediaTitle
+
+    var body: some View {
+        HeroOverscrollBackground(
+            backdropURLs: app.heroArtwork.backdropURLs(for: title),
+            fallbackPosterURLs: app.heroArtwork.posterURLs(for: title), seed: title.id.rawValue
+        )
+        .id(title.id)
+    }
 }
 
 /// Hero carousel of a browse page, with the next page's artwork decoded ahead of time.
@@ -154,13 +189,24 @@ private struct BrowseHero: View {
     let motion: BrowseScrollActivity
 
     var body: some View {
-        let canAnimate = isActive && isVisible && !motion.isScrolling
+        let canAnimate = isActive && isVisible && !motion.scrollActivity.isScrolling
         let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
             items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
             height: height, index: $selected, isInteractive: isActive
         ) { highlight in
             HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
+        }
+        .background(alignment: .leading) {
+            if isActive, isVisible, let title = currentTitle {
+                // The sidebar samples only a static leading strip. Compositing the entire
+                // carousel here would pull its text, transitions and controls into the effect.
+                BrowseHeroBackground(title: title)
+                    .frame(width: artworkSize.width, height: height)
+                    .frame(width: min(artworkSize.width, PrismMetrics.sidebarWidth), alignment: .leading)
+                    .clipped()
+                    .backgroundExtensionEffect()
+            }
         }
         .overlay(alignment: .topTrailing) {
             HomeLanguageMenu()
@@ -169,6 +215,7 @@ private struct BrowseHero: View {
                 .padding(.trailing, 18)
         }
         .onScrollVisibilityChange(threshold: 0.15) { isVisible = $0 }
+        .onChange(of: selected, initial: true) { _, index in motion.heroIndex = index ?? 0 }
         .task(id: preload, priority: .utility) {
             guard let preload else { return }
             // Give visible artwork first use of network and decode slots after a gesture.
@@ -182,6 +229,11 @@ private struct BrowseHero: View {
     }
 
     private var pixelSize: CGSize { RemoteImage.pixelSize(forPointSize: artworkSize, scale: scale) }
+
+    private var currentTitle: MediaTitle? {
+        guard !highlights.isEmpty else { return nil }
+        return highlights[min(max(selected ?? 0, 0), highlights.count - 1)].title
+    }
 
     private struct Preload: Equatable {
         let title: MediaTitle
@@ -354,7 +406,7 @@ private struct HighlightPage: View {
             HeroBackdrop(
                 backdropURLs: app.heroArtwork.backdropURLs(for: title), seed: title.id.rawValue,
                 fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
-                leadingScrim: 0.72, extendsUnderSidebar: true, artSize: size
+                leadingScrim: 0.72, artSize: size
             )
             VStack(alignment: .leading, spacing: 10) {
                 if let label = highlight.label { LabelPill(label).staggeredReveal(revealed, order: 0) }
@@ -454,6 +506,7 @@ struct BrowseHeading: View {
 }
 
 struct TitleShelf: View {
+    @Environment(\.isPageActive) private var isActive
     let title: String
     var subtitle: String? = nil
     let items: [MediaTitle]
@@ -461,7 +514,8 @@ struct TitleShelf: View {
 
     var body: some View {
         if !items.isEmpty {
-            Shelf(title: title, subtitle: subtitle, items: items, onHeaderTap: action) { item in
+            Shelf(title: title, subtitle: subtitle, items: items, posterCaptionHeight: PrismMetrics.posterCaptionHeight, onHeaderTap: action,
+                  posterArtwork: isActive ? \.posterURL : nil) { item in
                 BrowsePoster(item: item)
             }
         }
@@ -470,6 +524,7 @@ struct TitleShelf: View {
 
 /// Apple TV "Top 10" row: posters with large rank numerals.
 struct RankedTitleShelf: View {
+    @Environment(\.isPageActive) private var isActive
     let title: String
     var subtitle: String? = nil
     let items: [MediaTitle]
@@ -479,13 +534,14 @@ struct RankedTitleShelf: View {
         let rank: Int
         let title: MediaTitle
         var id: TitleID { title.id }
+        var posterURL: URL? { title.posterURL }
     }
 
     var body: some View {
         Shelf(
             title: title, subtitle: subtitle,
             items: items.prefix(10).enumerated().map { Entry(rank: $0.offset + 1, title: $0.element) },
-            onHeaderTap: action
+            posterCaptionHeight: 0, onHeaderTap: action, posterArtwork: isActive ? \.posterURL : nil
         ) { entry in
             BrowsePoster(item: entry.title, rank: entry.rank)
         }

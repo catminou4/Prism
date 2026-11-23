@@ -221,6 +221,7 @@ private struct EditSourceSheet: View {
     @State private var password = ""
     @State private var guideURL = ""
     @State private var userAgent = ""
+    @State private var saveFailed = false
 
     private func httpURL(_ value: String) -> URL? {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -257,6 +258,11 @@ private struct EditSourceSheet: View {
             }
             .formStyle(.grouped)
             SourceSheetFooter {
+                if app.isImporting(source.id) {
+                    Text("Actualisation en cours…")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("Annuler", role: .cancel) { dismiss() }
                     .buttonStyle(.glass)
@@ -267,18 +273,25 @@ private struct EditSourceSheet: View {
                     source.epgURL = httpURL(guideURL)
                     source.username = source.username?.trimmingCharacters(in: .whitespacesAndNewlines)
                     source.userAgent = userAgent.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                    app.update(source, password: password.nilIfEmpty)
-                    dismiss()
+                    if app.update(source, password: password.nilIfEmpty) {
+                        dismiss()
+                    } else {
+                        saveFailed = true
+                    }
                 }
                 .buttonStyle(.glassProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(source.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                .disabled(app.isImporting(source.id) ||
+                          source.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                           (source.kind != .m3uFile && httpURL(server) == nil) ||
                           (source.kind == .xtream && source.username?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false) ||
                           (!guideURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && httpURL(guideURL) == nil))
             }
         }
         .frame(width: 552, height: 490)
+        .alert("Impossible d’enregistrer la source", isPresented: $saveFailed) {
+            Button("OK", role: .cancel) {}
+        }
         .onAppear {
             server = source.serverURL?.absoluteString ?? ""
             guideURL = source.epgURL?.absoluteString ?? ""

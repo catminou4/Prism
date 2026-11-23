@@ -131,8 +131,9 @@ struct CardContainer<Content: View, MenuContent: View>: View {
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotHover) private var forcedHover
+    @Environment(\.prismScrollActivity) private var scrollActivity
 
-    private var isHovered: Bool { hovering || forcedHover }
+    private var isHovered: Bool { forcedHover || (hovering && scrollActivity?.isScrolling != true) }
 
     init(
         accessibilityLabel: Text,
@@ -164,7 +165,9 @@ struct CardContainer<Content: View, MenuContent: View>: View {
             }
         }
         .environment(\.prismCardLifted, isHovered)
-        .onHover { hovering = $0 }
+        .onHover { inside in
+            if !inside || scrollActivity?.isScrolling != true { hovering = inside }
+        }
         .modifier(OptionalContextMenu(menu: menu))
         .focusEffectDisabled()
         .accessibilityElement(children: .combine)

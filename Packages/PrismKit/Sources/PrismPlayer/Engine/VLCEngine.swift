@@ -40,6 +40,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var lastTimeMs: Int32 = -1
     private var lastTimeChange = Date.distantPast
     private var lastVideoSize: CGSize = .zero
+    private var nextTimeUpdate: ContinuousClock.Instant?
     private var nextMetadataPoll: ContinuousClock.Instant?
     private var bufferingCheck: Task<Void, Never>?
     private var trackSignature = ""
@@ -74,6 +75,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         lastState = nil
         lastTimeMs = -1
         lastVideoSize = .zero
+        nextTimeUpdate = nil
         nextMetadataPoll = nil
         trackSignature = ""
         isStopped = false
@@ -399,6 +401,9 @@ final class VLCEngine: NSObject, PlaybackEngine {
 
     fileprivate func handleTimeChange() {
         guard !isStopped else { return }
+        let now = ContinuousClock.now
+        let publishesTime = nextTimeUpdate.map { now >= $0 } ?? true
+        guard publishesTime || !didReportFirstFrame else { return }
         let ms = player.time.intValue
         if ms != lastTimeMs {
             lastTimeMs = ms
@@ -412,9 +417,11 @@ final class VLCEngine: NSObject, PlaybackEngine {
             eventHandler?(.ready(duration: reportedDuration))
         }
         let seconds = TimeInterval(ms) / 1000
-        eventHandler?(.time(current: seconds, buffered: seconds))
+        if publishesTime {
+            nextTimeUpdate = now.advanced(by: .milliseconds(250))
+            eventHandler?(.time(current: seconds, buffered: seconds))
+        }
 
-        let now = ContinuousClock.now
         if nextMetadataPoll.map({ now >= $0 }) ?? true {
             // Track changes also arrive via the state delegate. Poll as a fallback
             // for adaptive streams and for resolution changes without a state event.

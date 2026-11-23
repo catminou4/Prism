@@ -66,7 +66,9 @@ public final class AppModel {
     /// Signals behind the curated shelves; rebuilt in the background after each catalogue.
     @ObservationIgnored public private(set) var curationIndex = CurationIndex.empty
     public private(set) var curationRevision = 0
-    private var curatedFeeds: [CurationScope: CuratedResult] = [:]
+    private let curatedFeeds: [CurationScope: CuratedFeedState] = [
+        .home: CuratedFeedState(), .movies: CuratedFeedState(), .series: CuratedFeedState()
+    ]
     /// TMDB weekly charts matched to the catalogue (only with a TMDB key).
     @ObservationIgnored private var trendingIDs: [MediaKind: [TitleID]] = [:]
     private var trendingRevision = 0
@@ -170,9 +172,13 @@ public final class AppModel {
         if !isEphemeral { settings.homeAudioLanguages = languages }
     }
 
-    private struct CuratedResult {
+    fileprivate struct CuratedResult {
         let request: CurationRequest
         let feed: CuratedFeed
+    }
+
+    @Observable fileprivate final class CuratedFeedState {
+        var result: CuratedResult?
     }
 
     /// What the curated shelves know about the user (local only).
@@ -195,16 +201,16 @@ public final class AppModel {
 
     /// The latest feed composed for `scope`. A stale feed stays visible while its replacement is built.
     public func feed(for scope: CurationScope) -> CuratedFeed {
-        curatedFeeds[scope]?.feed ?? .empty
+        curatedFeeds[scope]?.result?.feed ?? .empty
     }
 
     /// `false` until a first feed exists for `scope` (the page then shows a placeholder).
     public func hasFeed(for scope: CurationScope) -> Bool {
-        curatedFeeds[scope] != nil
+        curatedFeeds[scope]?.result != nil
     }
 
     public func refreshFeed(_ request: CurationRequest) async {
-        guard request == curationRequest(for: request.scope), curatedFeeds[request.scope]?.request != request,
+        guard let state = curatedFeeds[request.scope], request == curationRequest(for: request.scope), state.result?.request != request,
               curationIndex.isBuilt, !Task.isCancelled else { return }
         let catalog = self.catalog, index = curationIndex, recommendations = self.recommendations
         let feed = await Curator.feed(
@@ -212,7 +218,7 @@ public final class AppModel {
             languages: request.languages, profile: request.profile, trending: trendingIDs
         )
         guard !Task.isCancelled, request == curationRequest(for: request.scope) else { return }
-        curatedFeeds[request.scope] = CuratedResult(request: request, feed: feed)
+        state.result = CuratedResult(request: request, feed: feed)
         if isMetadataEnabled, trendingTask == nil, trendingIDs.isEmpty { refreshTrending() }
     }
 
@@ -368,14 +374,15 @@ public final class AppModel {
     }
 
     /// Updates a source's settings. Connection changes trigger a refresh.
-    public func update(_ source: Source, password: String? = nil) {
-        guard imports[source.id] == nil else { return }
+    @discardableResult
+    public func update(_ source: Source, password: String? = nil) -> Bool {
+        guard imports[source.id] == nil else { return false }
         if let password {
             do {
                 try credentials.setPassword(password, for: source.id)
             } catch {
                 errors[source.id] = error.localizedDescription
-                return
+                return false
             }
         }
         let previous = self.source(source.id)
@@ -394,6 +401,7 @@ public final class AppModel {
         if previous?.epgURL != source.epgURL || previous?.epgTimeShiftHours != source.epgTimeShiftHours {
             Task { await refreshGuide(for: source.id) }
         }
+        return true
     }
 
     public func setEnabled(_ enabled: Bool, for id: SourceID) {
@@ -422,6 +430,7 @@ public final class AppModel {
         accounts[id] = nil
         errors[id] = nil
         imports[id] = nil
+        if sources.isEmpty, phase == .ready { restartOnboarding() }
         Task {
             await catalogRepository.forget(id)
             await epgRepository.forget(id)

@@ -24,6 +24,8 @@ nonisolated public enum PrismMetrics {
     /// Minimum poster width used to compute shelf columns (Apple: 6 columns at 920 pt).
     public static let posterMinWidth: CGFloat = 130
     public static let posterAspectRatio: CGFloat = 2.0 / 3.0
+    /// Two lines of poster metadata, including the gap below the art.
+    public static let posterCaptionHeight: CGFloat = 40
     /// Wide card (16:9 artwork + caption band) default width.
     public static let wideCardWidth: CGFloat = 260
     /// Minimum wide-card width used to compute shelf columns (Apple: 4 columns at 920 pt).

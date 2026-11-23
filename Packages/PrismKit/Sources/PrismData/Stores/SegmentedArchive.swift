@@ -1,7 +1,7 @@
 import Foundation
 
 /// Versioned container of independently compressed JSON segments, so that large caches are encoded
-/// and decoded in parallel (one JSONDecoder per segment, all cores busy).
+/// and decoded in parallel (one JSONDecoder per segment).
 ///
 /// Layout: `"PRSG"` magic · format version (UInt32 LE) · segment count (UInt32 LE) ·
 /// per segment: tag (UInt8) + byte length (UInt32 LE) · then the LZFSE-compressed JSON payloads.
@@ -64,6 +64,32 @@ enum SegmentedArchive {
             guard let json = try? (segment.payload as NSData).decompressed(using: .lzfse) as Data else { return nil }
             return try? JSONDecoder().decode(T.self, from: json)
         }
+    }
+
+    /// Expands at most four chunks at a time, then appends them in archive order.
+    static func decodeChunks<Chunk: Sendable, Result>(
+        _ segments: ArraySlice<Segment>, into initial: Result,
+        decode: @escaping @Sendable (Segment) -> Chunk?, append: (inout Result, Chunk) -> Void
+    ) async -> Result? {
+        var result = initial
+        let batchSize = 4
+        for lower in stride(from: segments.startIndex, to: segments.endIndex, by: batchSize) {
+            guard !Task.isCancelled else { return nil }
+            let batch = segments[lower..<min(lower + batchSize, segments.endIndex)]
+            let chunks = await withTaskGroup(of: (Int, Chunk?).self) { group in
+                for (index, segment) in batch.enumerated() {
+                    group.addTask { (index, Task.isCancelled ? nil : decode(segment)) }
+                }
+                var chunks = [Chunk?](repeating: nil, count: batch.count)
+                for await (index, chunk) in group { chunks[index] = chunk }
+                return chunks
+            }
+            for chunk in chunks {
+                guard let chunk else { return nil }
+                append(&result, chunk)
+            }
+        }
+        return result
     }
 
     private struct Chunk<Item: Encodable>: Encodable {

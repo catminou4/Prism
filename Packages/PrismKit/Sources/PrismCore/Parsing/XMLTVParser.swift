@@ -35,7 +35,7 @@ public enum XMLTVError: Error, LocalizedError, Equatable {
 
 /// Streaming (SAX) XMLTV parser. Synchronous: call it from a background task.
 public enum XMLTVParser {
-    /// `data` may be gzip-compressed (magic 1F 8B) — decompressed transparently.
+    /// Gzip and zlib input are decompressed transparently.
     /// Programmes ending before `window.start` or starting after `window.end` are dropped (memory).
     /// `timeShiftHours` is added to every time.
     public static func parse(_ data: Data, window: DateInterval? = nil, timeShiftHours: Double = 0) throws -> XMLTVDocument {
@@ -45,7 +45,7 @@ public enum XMLTVParser {
         let delegate = XMLTVParserDelegate(window: window, shift: timeShiftHours * 3600)
         let parser = XMLParser(data: xml)
         parser.shouldResolveExternalEntities = false
-        parser.shouldProcessNamespaces = false
+        parser.shouldProcessNamespaces = true
         parser.shouldReportNamespacePrefixes = false
         parser.delegate = delegate
         let ok = parser.parse()
@@ -357,18 +357,21 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
         if !missingStop.isEmpty {
             var byChannel: [String: [Int]] = [:]
             for (index, program) in programs.enumerated() { byChannel[program.channelID, default: []].append(index) }
-            var nextStart: [Int: Date] = [:]
-            for (_, indices) in byChannel {
+            let needsStop = Set(missingStop)
+            for indices in byChannel.values {
                 let sorted = indices.sorted { programs[$0].start < programs[$1].start }
-                for k in sorted.indices.dropLast() {
-                    let current = sorted[k]
-                    if let following = sorted[(k + 1)...].first(where: { programs[$0].start > programs[current].start }) {
-                        nextStart[current] = programs[following].start
+                var previousStart: Date?
+                var nextStart: Date?
+                for index in sorted.reversed() {
+                    let start = programs[index].start
+                    if start != previousStart {
+                        nextStart = previousStart
+                        previousStart = start
+                    }
+                    if needsStop.contains(index) {
+                        programs[index].end = nextStart ?? start.addingTimeInterval(3600)
                     }
                 }
-            }
-            for index in missingStop {
-                programs[index].end = nextStart[index] ?? programs[index].start.addingTimeInterval(3600)
             }
         }
         guard let window else { return programs }

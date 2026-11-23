@@ -5,24 +5,15 @@ import PrismDesign
 import SwiftUI
 
 struct SportsFeature: View {
+    @Environment(\.isPageActive) private var isActive
     let fixture: SportsFixture
     let now: Date
     let size: CGSize
 
     var body: some View {
         let broadcasts = fixture.liveBroadcasts(at: now)
-        SportsArtwork(fixture: fixture, size: size, placement: .feature)
-            .overlay {
-                LinearGradient(
-                    stops: [
-                        .init(color: .black.opacity(0.82), location: 0),
-                        .init(color: .black.opacity(0.72), location: 0.31),
-                        .init(color: .black.opacity(0.20), location: 0.65),
-                        .init(color: .clear, location: 1),
-                    ], startPoint: .leading, endPoint: .trailing
-                )
-                .accessibilityHidden(true)
-            }
+        SportsFeatureBackdrop(fixture: fixture, size: size)
+            .backgroundExtensionEffect(isEnabled: isActive)
             .overlay(alignment: .bottomLeading) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 10) {
@@ -62,15 +53,30 @@ struct SportsFeature: View {
                 }
                 .foregroundStyle(.white)
                 .frame(maxWidth: size.width * 0.54, alignment: .leading)
-                .padding(min(32, size.width * 0.04))
-            }
-            .clipShape(.rect(cornerRadius: 24))
-            .overlay {
-                RoundedRectangle(cornerRadius: 24)
-                    .strokeBorder(.white.opacity(0.13), lineWidth: 1)
-                    .allowsHitTesting(false)
+                .padding(.horizontal, PrismMetrics.contentMargin)
+                .padding(.vertical, 32)
             }
             .accessibilityElement(children: .contain)
+    }
+}
+
+struct SportsFeatureBackdrop: View {
+    let fixture: SportsFixture
+    let size: CGSize
+
+    var body: some View {
+        SportsArtwork(fixture: fixture, size: size, placement: .feature)
+            .overlay {
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.82), location: 0),
+                        .init(color: .black.opacity(0.72), location: 0.31),
+                        .init(color: .black.opacity(0.20), location: 0.65),
+                        .init(color: .clear, location: 1),
+                    ], startPoint: .leading, endPoint: .trailing
+                )
+            }
+            .accessibilityHidden(true)
     }
 }
 
