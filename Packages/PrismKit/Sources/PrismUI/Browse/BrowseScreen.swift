@@ -3,13 +3,19 @@ import SwiftUI
 import PrismCore
 import PrismData
 import PrismDesign
+import PrismPlayer
 
 struct BrowseScreen: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
     @State private var motion = BrowseScrollActivity()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(HomeSections.hero) private var homeHero = true
+    @AppStorage(HomeSections.recommendations) private var homeRecommendations = true
+    @AppStorage(HomeSections.genres) private var homeGenres = true
     let kind: MediaKind?
+
+    private var showsHero: Bool { kind != nil || homeHero }
 
     private var scope: CurationScope {
         switch kind {
@@ -26,9 +32,9 @@ struct BrowseScreen: View {
             let artworkSize = CGSize(width: max(1, geometry.size.width), height: heroHeight)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: PrismMetrics.shelfSpacing) {
-                    if !feed.highlights.isEmpty {
+                    if showsHero && !feed.highlights.isEmpty {
                         // The carousel owns its page index: advancing it must not re-evaluate every shelf.
-                        BrowseHero(highlights: feed.highlights, height: heroHeight, artworkSize: artworkSize, motion: motion)
+                        BrowseHero(highlights: feed.highlights, scope: scope, height: heroHeight, artworkSize: artworkSize, motion: motion)
                     } else {
                         HStack(alignment: .firstTextBaseline) {
                             BrowseHeading(title: kind?.sectionTitle ?? "Accueil")
@@ -46,8 +52,8 @@ struct BrowseScreen: View {
                         CurationPlaceholder()
                             .transition(.opacity)
                     }
-                    curatedShelves(feed)
-                    if !feed.genres.isEmpty {
+                    if kind != nil || homeRecommendations { curatedShelves(feed) }
+                    if (kind != nil || homeGenres) && !feed.genres.isEmpty {
                         GenreTileShelf(tiles: feed.genres, kind: kind)
                     }
                     if let kind { providerShelves(kind) }
@@ -68,20 +74,20 @@ struct BrowseScreen: View {
             .scrollEdgeEffectHidden(kind == nil, for: .top)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(alignment: .top) {
-                if reduceMotion {
+                if reduceMotion && showsHero {
                     BrowseOverscrollBackground(highlights: feed.highlights, motion: motion)
                         .frame(height: heroHeight)
                 }
             }
-            .ignoresSafeArea(.container, edges: feed.highlights.isEmpty ? [] : .top)
+            .ignoresSafeArea(.container, edges: showsHero && !feed.highlights.isEmpty ? .top : [])
         }
         .modifier(BrowseFeedRefresh(scope: scope))
     }
 
     /// Apple TV keeps the hero cinematic: most of the window on wide screens, never a letterbox.
     static func heroHeight(for size: CGSize, home: Bool) -> CGFloat {
-        let ratio: CGFloat = home ? 0.66 : 0.7
-        return min(max(size.height * ratio, 420, size.width * 0.36), 760)
+        let ratio: CGFloat = home ? 0.82 : 0.78
+        return min(max(size.height * ratio, 460, size.width * 0.36), 860)
     }
 
     @ViewBuilder private func curatedShelves(_ feed: CuratedFeed) -> some View {
@@ -123,21 +129,28 @@ private struct BrowseFeedRefresh: ViewModifier {
 private struct HomeLibraryShelves: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
+    @AppStorage(HomeSections.continueWatching) private var showsContinueWatching = true
+    @AppStorage(HomeSections.sport) private var showsSport = true
+    @AppStorage(HomeSections.watchlist) private var showsWatchlist = true
 
     var body: some View {
-        ContinueWatchingContent(limit: 14) { watching in
-            if let watching, !watching.isEmpty {
-                Shelf(title: "Reprendre", items: watching, sizing: .wide, onHeaderTap: {
-                    navigation.push(.collection(.continueWatching))
-                }) { item in
-                    ResumeCard(item: item)
+        if showsContinueWatching {
+            ContinueWatchingContent(limit: 14) { watching in
+                if let watching, !watching.isEmpty {
+                    Shelf(title: "Reprendre", items: watching, sizing: .columns(minWidth: 260), onHeaderTap: {
+                        navigation.push(.collection(.continueWatching))
+                    }) { item in
+                        ResumeCard(item: item)
+                    }
                 }
             }
         }
-        SportsHomeShelf()
-        let watchlist = app.library.watchlist.prefix(24).compactMap(app.catalog.title)
-        if !watchlist.isEmpty {
-            TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
+        if showsSport { SportsHomeShelf() }
+        if showsWatchlist {
+            let watchlist = app.library.watchlist.prefix(24).compactMap(app.catalog.title)
+            if !watchlist.isEmpty {
+                TitleShelf(title: "Ma liste", items: watchlist, action: { navigation.push(.collection(.watchlist)) })
+            }
         }
     }
 }
@@ -145,7 +158,7 @@ private struct HomeLibraryShelves: View {
 @Observable private final class BrowseScrollActivity {
     let scroll = ScrollActivity()
     var isAtTop = true
-    var heroIndex = 0
+    var heroTitle: MediaTitle?
 }
 
 private struct BrowseOverscrollBackground: View {
@@ -154,7 +167,7 @@ private struct BrowseOverscrollBackground: View {
 
     var body: some View {
         if motion.isAtTop, !highlights.isEmpty {
-            let title = highlights[min(max(motion.heroIndex, 0), highlights.count - 1)].title
+            let title = motion.heroTitle ?? highlights[0].title
             BrowseHeroBackground(title: title)
         }
     }
@@ -176,25 +189,52 @@ private struct BrowseHeroBackground: View {
 /// Hero carousel of a browse page, with the next page's artwork decoded ahead of time.
 private struct BrowseHero: View {
     @Environment(AppModel.self) private var app
+    @Environment(HeroPreviewSession.self) private var previewSession: HeroPreviewSession?
+    @Environment(PrismPlaybackSession.self) private var playbackSession: PrismPlaybackSession?
     @Environment(\.isPageActive) private var isActive
     @Environment(\.displayScale) private var scale
     @Environment(\.appearsActive) private var appearsActive
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismSnapshotRendering) private var snapshotRendering
+    @AppStorage(HomeSections.previews) private var previewsEnabled = true
     @State private var selected: Int? = 0
     @State private var isVisible = true
+    @State private var previewVisible = false
+    @State private var preparingPreview = false
+    @State private var previewOwner = UUID()
+    @State private var previewGeneration = UUID()
+    @State private var previewTimeout: Task<Void, Never>?
+    @State private var previewResolution: Task<PlaybackItem?, Never>?
+    @State private var additional: [CuratedHighlight] = []
+    @State private var pager: HeroRecommendationPager?
+    @State private var loading = false
+    @State private var exhausted = false
+    @State private var generation = UUID()
+    @State private var loadingTask: Task<Void, Never>?
     let highlights: [CuratedHighlight]
+    let scope: CurationScope
     let height: CGFloat
     let artworkSize: CGSize
     let motion: BrowseScrollActivity
 
+    private var items: [CuratedHighlight] { highlights + additional }
+
     var body: some View {
         let canAnimate = isActive && isVisible && !motion.scroll.isScrolling
+        let preview = previewSession?.entry.flatMap { $0.owner == previewOwner ? $0 : nil }
+        let canPreview = previewsEnabled && !reduceMotion && !snapshotRendering && isActive && previewVisible
+            && appearsActive && !motion.scroll.isScrolling && playbackSession?.controller == nil && previewSession != nil
+        let previewKey = PreviewKey(titleID: currentTitle?.id, enabled: canPreview)
         let preload = canAnimate && appearsActive && !reduceMotion ? nextArtwork : nil
         HeroCarousel(
-            items: highlights, interval: canAnimate ? PrismMotion.heroInterval + 2 : 0,
-            height: height, index: $selected, isInteractive: isActive && isVisible
+            items: items, interval: canAnimate && !preparingPreview && preview == nil ? PrismMotion.heroInterval : 0,
+            height: height, index: $selected, isInteractive: isActive && isVisible,
+            canWrapForward: exhausted
         ) { highlight in
-            HighlightPage(highlight: highlight, size: artworkSize, isActive: isActive && isVisible)
+            HighlightPage(
+                highlight: highlight, size: artworkSize, isActive: isActive && isVisible,
+                preview: preview?.titleID == highlight.id ? preview?.player : nil
+            )
         }
         .background {
             if let title = currentTitle {
@@ -218,16 +258,56 @@ private struct BrowseHero: View {
                     .frame(width: min(artworkSize.width, PrismMetrics.sidebarWidth), alignment: .leading)
                     .clipped()
                     .backgroundExtensionEffect()
+                    .heroOverscrollZoom()
             }
         }
         .overlay(alignment: .topTrailing) {
-            HomeLanguageMenu()
-                .environment(\.colorScheme, .dark)
-                .padding(.top, 14)
-                .padding(.trailing, 18)
+            HStack(spacing: 8) {
+                if let player = preview?.player, player.isReady {
+                    GlassCircleButton(
+                        systemName: player.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                        style: .dark, accessibilityLabel: player.isMuted ? "Activer le son de l’aperçu" : "Couper le son de l’aperçu"
+                    ) { player.toggleMute() }
+                }
+                HomeLanguageMenu()
+            }
+            .environment(\.colorScheme, .dark)
+            .padding(.top, 14)
+            .padding(.trailing, 18)
         }
         .onScrollVisibilityChange(threshold: 0.15) { isVisible = $0 }
-        .onChange(of: selected, initial: true) { _, index in motion.heroIndex = index ?? 0 }
+        .onScrollVisibilityChange(threshold: 0.8) { previewVisible = $0 }
+        .onChange(of: selected, initial: true) { _, _ in
+            motion.heroTitle = currentTitle
+            loadMoreIfNeeded()
+        }
+        .onChange(of: items.map(\.id)) { _, _ in motion.heroTitle = currentTitle }
+        .task(id: PagerKey(request: app.curationRequest(for: scope), highlights: highlights.map(\.id))) {
+            let previousID = motion.heroTitle?.id
+            loadingTask?.cancel()
+            generation = UUID()
+            additional = []
+            selected = previousID.flatMap { id in highlights.firstIndex { $0.id == id } } ?? 0
+            exhausted = false
+            loading = false
+            pager = HeroRecommendationPager(
+                scope: scope, catalog: app.catalog, index: app.curationIndex, recommendations: app.recommendations,
+                languages: app.homeAudioLanguages, profile: app.curationProfile
+            )
+            loadMoreIfNeeded()
+        }
+        .onDisappear {
+            loadingTask?.cancel()
+            loading = false
+            previewTimeout?.cancel()
+            previewResolution?.cancel()
+            previewGeneration = UUID()
+            preparingPreview = false
+            previewSession?.stop(owner: previewOwner)
+        }
+        .onAppear { loadMoreIfNeeded() }
+        .onChange(of: isVisible) { _, visible in if visible { loadMoreIfNeeded() } }
+        .onChange(of: isActive) { _, active in if active { loadMoreIfNeeded() } }
         .task(id: preload, priority: .utility) {
             guard let preload else { return }
             // Give visible artwork first use of network and decode slots after a gesture.
@@ -238,13 +318,87 @@ private struct BrowseHero: View {
             _ = await ImagePipeline.shared.image(for: url, pixelSize: preload.size, fitting: .landscapeFill)
         }
         .onChange(of: app.homeAudioLanguages) { _, _ in selected = 0 }
+        .task(id: previewKey) { [previewKey] in
+            previewTimeout?.cancel()
+            previewResolution?.cancel()
+            let token = UUID()
+            previewGeneration = token
+            preparingPreview = false
+            previewSession?.stop(owner: previewOwner)
+            guard previewKey.enabled, let title = currentTitle, title.id == previewKey.titleID else { return }
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, token == previewGeneration else { return }
+            preparingPreview = true
+            let resolution = Task { await HeroPreviewSource.resolve(title, app: app) }
+            previewResolution = resolution
+            previewTimeout = Task {
+                try? await Task.sleep(for: .seconds(6))
+                guard !Task.isCancelled, token == previewGeneration else { return }
+                // A slow provider must not leave the carousel waiting indefinitely.
+                previewGeneration = UUID()
+                preparingPreview = false
+                resolution.cancel()
+            }
+            let item = await resolution.value
+            guard !Task.isCancelled, !resolution.isCancelled, token == previewGeneration else { return }
+            previewTimeout?.cancel()
+            previewTimeout = nil
+            previewResolution = nil
+            preparingPreview = false
+            guard playbackSession?.controller == nil, !motion.scroll.isScrolling else { return }
+            if let item { previewSession?.start(item, titleID: title.id, owner: previewOwner) }
+        }
     }
 
     private var pixelSize: CGSize { RemoteImage.pixelSize(forPointSize: artworkSize, scale: scale) }
 
     private var currentTitle: MediaTitle? {
-        guard !highlights.isEmpty else { return nil }
-        return highlights[min(max(selected ?? 0, 0), highlights.count - 1)].title
+        guard !items.isEmpty else { return nil }
+        return items[min(max(selected ?? 0, 0), items.count - 1)].title
+    }
+
+    private struct PagerKey: Hashable {
+        let scope: CurationScope
+        let catalogRevision: Int
+        let curationRevision: Int
+        let languages: Set<HomeAudioLanguage>
+        let dismissed: Set<TitleID>
+        let highlights: [TitleID]
+
+        init(request: CurationRequest, highlights: [TitleID]) {
+            scope = request.scope
+            catalogRevision = request.catalogRevision
+            curationRevision = request.curationRevision
+            languages = request.languages
+            dismissed = request.profile.dismissed
+            self.highlights = highlights
+        }
+    }
+
+    private struct PreviewKey: Hashable {
+        let titleID: TitleID?
+        let enabled: Bool
+    }
+
+    private func loadMoreIfNeeded() {
+        guard isActive, isVisible, let pager, !loading, !exhausted,
+              (selected ?? 0) >= items.count - 5 else { return }
+        loading = true
+        let token = generation
+        let excluded = Set(items.map(\.id))
+        loadingTask = Task {
+            let batch = await pager.next(excluding: excluded)
+            guard !Task.isCancelled, generation == token else { return }
+            loading = false
+            guard !batch.isEmpty else { exhausted = true; return }
+            additional.append(contentsOf: batch)
+            // Preserve a short backwards history while bounding the retained title models.
+            let removable = max(0, min(additional.count - 64, (selected ?? 0) - highlights.count - 6))
+            if removable > 0 {
+                additional.removeFirst(removable)
+                selected = max(0, (selected ?? 0) - removable)
+            }
+        }
     }
 
     private struct Preload: Equatable {
@@ -258,9 +412,9 @@ private struct BrowseHero: View {
     }
 
     private var nextArtwork: Preload? {
-        guard highlights.count > 1 else { return nil }
-        let current = min(max(selected ?? 0, 0), highlights.count - 1)
-        let next = highlights[(current + 1) % highlights.count].title
+        guard items.count > 1 else { return nil }
+        let current = min(max(selected ?? 0, 0), items.count - 1)
+        let next = items[(current + 1) % items.count].title
         return Preload(title: next, size: pixelSize, enrichment: app.isMetadataEnabled)
     }
 }
@@ -391,6 +545,7 @@ private struct HighlightPage: View {
     let highlight: CuratedHighlight
     let size: CGSize
     let isActive: Bool
+    let preview: HeroPreviewPlayer?
     /// Copy settles shortly after the artwork, one line after the other.
     @State private var revealed = false
 
@@ -423,6 +578,28 @@ private struct HighlightPage: View {
                     fallbackPosterURLs: app.heroArtwork.posterURLs(for: title),
                     leadingScrim: 0.72, artSize: size
                 )
+                .overlay {
+                    if let preview {
+                        ZStack {
+                            HeroPreviewPlayerView(player: preview)
+                            LinearGradient(
+                                stops: [.init(color: .black.opacity(0.72), location: 0),
+                                        .init(color: .black.opacity(0.30), location: 0.33),
+                                        .init(color: .clear, location: 0.64)],
+                                startPoint: .leading, endPoint: .trailing
+                            )
+                            LinearGradient(
+                                stops: [.init(color: .clear, location: 0.42),
+                                        .init(color: .black.opacity(0.30), location: 0.76),
+                                        .init(color: .black.opacity(0.70), location: 1)],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        }
+                        .opacity(preview.isReady ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.8), value: preview.isReady)
+                        .allowsHitTesting(false)
+                    }
+                }
                 .heroOverscrollZoom()
                 .contentShape(.rect)
             }
@@ -655,9 +832,9 @@ struct ResumeCard: View {
     let item: ContinueWatchingItem
 
     var body: some View {
-        WideCard(imageURL: item.episode?.stillURL ?? item.title.backdropURL ?? item.title.posterURL,
-                 caption: app.recommendations.named(item.title).title, metadata: metadata, progress: item.progress?.fraction,
-                 action: resume) {
+        ResumeWideCard(imageURL: item.title.backdropURL ?? item.episode?.stillURL ?? item.title.posterURL,
+                       title: app.recommendations.named(item.title).title, metadata: metadata,
+                       progress: item.progress?.fraction, action: resume) {
             Button("Voir la fiche") { navigation.push(.title(item.title.id)) }
         }
     }

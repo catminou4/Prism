@@ -88,6 +88,73 @@ struct CurationTests {
         #expect(!shown.contains { $0.id == dismissed.id })
     }
 
+    @Test func heroRecommendationsPageWithoutDuplicatesAndCycleAfterExhaustion() async throws {
+        let library = await Library.make()
+        let initial = await library.feed(.movies).highlights
+        let dismissed = try #require(library.catalog.movies.first { !initial.map(\.id).contains($0.id) })
+        let pager = HeroRecommendationPager(
+            scope: .movies, catalog: library.catalog, index: library.index, recommendations: library.recommendations,
+            languages: HomeAudioLanguage.defaults, profile: CurationProfile(dismissed: [dismissed.id])
+        )
+        var seen = Set(initial.map(\.id))
+        var collected: [CuratedHighlight] = []
+        while true {
+            let batch = await pager.next(excluding: seen, limit: 4)
+            if batch.isEmpty { break }
+            #expect(batch.count <= 4)
+            #expect(batch.allSatisfy { $0.title.kind == .movie && $0.id != dismissed.id && !seen.contains($0.id) })
+            seen.formUnion(batch.map(\.id))
+            collected.append(contentsOf: batch)
+        }
+        #expect(collected.count > 6, "the carousel can go beyond its original six entries")
+        let nextCycle = await pager.next(excluding: Set(initial.map(\.id)), limit: 4)
+        #expect(!nextCycle.isEmpty)
+        #expect(nextCycle.allSatisfy { seen.contains($0.id) && $0.id != dismissed.id })
+    }
+
+    @Test func heroRecommendationsRespectAudioLanguage() async {
+        let source = Fixture.a
+        var french = Fixture.movie(source, "fr", "Lumiere du Nord", year: 2020, poster: "fr.jpg", rating: 8)
+        var english = Fixture.movie(source, "en", "Northern Lights", year: 2021, poster: "en.jpg", rating: 8)
+        french.tags = ["VF"]
+        english.tags = ["EN"]
+        let catalog = await Fixture.build([Fixture.source(source)], [SourceCatalog(sourceID: source, movies: [french, english])])
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        let pager = HeroRecommendationPager(
+            scope: .movies, catalog: catalog, index: index, recommendations: recommendations,
+            languages: [.french], profile: CurationProfile()
+        )
+        let results = await pager.next(excluding: [], limit: 10)
+        #expect(results.map(\.title.title) == [french.title])
+    }
+
+    @Test func heroPagerKeepsFindingNewTitlesBeyondTheRetainedWindow() async {
+        let source = Fixture.a
+        let movies = (0..<100).map { number in
+            Fixture.movie(source, "item-\(number)", "Voyage numero \(number)", year: 2020,
+                          poster: "poster-\(number).jpg", rating: 8)
+        }
+        let catalog = await Fixture.build([Fixture.source(source)], [SourceCatalog(sourceID: source, movies: movies)])
+        let recommendations = await RecommendationBuilder.build(for: catalog)
+        let index = await CurationIndex.build(catalog: catalog, recommendations: recommendations, now: Fixture.reference)
+        let pager = HeroRecommendationPager(
+            scope: .movies, catalog: catalog, index: index, recommendations: recommendations,
+            languages: HomeAudioLanguage.defaults, profile: CurationProfile()
+        )
+        var window: [TitleID] = []
+        var seen: Set<TitleID> = []
+        for _ in 0..<7 {
+            let batch = await pager.next(excluding: Set(window), limit: 12)
+            #expect(batch.count == 12)
+            #expect(batch.allSatisfy { !seen.contains($0.id) })
+            seen.formUnion(batch.map(\.id))
+            window.append(contentsOf: batch.map(\.id))
+            if window.count > 24 { window.removeFirst(window.count - 24) }
+        }
+        #expect(seen.count == 84)
+    }
+
     @Test func historyPersonalisesTheFeed() async throws {
         let library = await Library.make()
         let comedy = try #require(library.catalog.movies.first { $0.title == Library.comedies[0] })

@@ -12,7 +12,9 @@ private struct HeroOverscrollZoom: ViewModifier {
             let pull = max(0, proxy.frame(in: .scrollView(axis: .vertical)).minY)
             let zoom = shouldReduceMotion ? 1 : 1 + pull / max(1, proxy.size.height)
             return effect
-                .scaleEffect(zoom, anchor: .bottom)
+                // Keep the leading edge fixed: expanding around the centre lets the
+                // sharp artwork spill underneath the sidebar's separate glass backdrop.
+                .scaleEffect(zoom, anchor: .bottomLeading)
                 .opacity(onlyWhenExposed && (pull <= 0 || shouldReduceMotion) ? 0 : 1)
         }
     }

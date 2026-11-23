@@ -305,7 +305,7 @@ private struct EditSourceSheet: View {
 }
 
 struct PrismSettingsView: View {
-    enum Page: Hashable { case general, player, services }
+    enum Page: Hashable { case general, home, player, services }
 
     @Environment(AppModel.self) private var app
     @State private var page: Page
@@ -326,6 +326,7 @@ struct PrismSettingsView: View {
     var body: some View {
         TabView(selection: $page) {
             Tab("Général", systemImage: "gearshape", value: .general) { catalogPreferences }
+            Tab("Accueil", systemImage: "house", value: .home) { HomePreferences() }
             Tab("Lecteur", systemImage: "play.rectangle", value: .player) { playerPreferences }
             Tab("Services", systemImage: "network", value: .services) { services }
         }
@@ -472,6 +473,39 @@ struct PrismSettingsView: View {
         } catch {
             sportsKeyError = error.localizedDescription
         }
+    }
+}
+
+private struct HomePreferences: View {
+    @AppStorage(HomeSections.hero) private var hero = true
+    @AppStorage(HomeSections.continueWatching) private var continueWatching = true
+    @AppStorage(HomeSections.sport) private var sport = true
+    @AppStorage(HomeSections.watchlist) private var watchlist = true
+    @AppStorage(HomeSections.recommendations) private var recommendations = true
+    @AppStorage(HomeSections.genres) private var genres = true
+    @AppStorage(HomeSections.previews) private var previews = true
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Grandes recommandations", isOn: $hero)
+                Toggle("Reprendre la lecture", isOn: $continueWatching)
+                Toggle("Sport", isOn: $sport)
+                Toggle("Ma liste", isOn: $watchlist)
+                Toggle("Sélections et recommandations", isOn: $recommendations)
+                Toggle("Genres", isOn: $genres)
+            } header: {
+                Text("Sections de l’accueil")
+            } footer: {
+                Text("Choisissez les sections affichées sur la page Accueil.")
+            }
+            Section {
+                Toggle("Aperçus vidéo automatiques", isOn: $previews)
+            } footer: {
+                Text("Les aperçus démarrent sans son et peuvent utiliser le flux de votre source.")
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

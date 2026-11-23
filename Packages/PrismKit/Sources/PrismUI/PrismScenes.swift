@@ -15,6 +15,7 @@ public struct PrismScenes: Scene {
 
     @State private var model = AppModel()
     @State private var playback = PrismPlaybackSession()
+    @State private var heroPreview = HeroPreviewSession()
 
     public init() { _ = Self.memoryPressurePurge }
 
@@ -22,10 +23,13 @@ public struct PrismScenes: Scene {
         Window("Prism", id: "main") {
             PrismRootView(playback: playback)
                 .environment(model)
+                .environment(heroPreview)
+                .environment(playback)
                 .frame(minWidth: 1100, minHeight: 700)
                 .task { await model.bootstrap() }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     playback.close()
+                    heroPreview.stop()
                     model.flush()
                 }
         }
@@ -50,6 +54,7 @@ struct PrismRootView: View {
     @Environment(AppModel.self) private var app
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(HeroPreviewSession.self) private var heroPreview
     let playback: PrismPlaybackSession
 
     var body: some View {
@@ -66,6 +71,7 @@ struct PrismRootView: View {
             }
         }
         .environment(\.playPrismItem, PrismPlaybackAction(owner: playback) { item, target, contentID, seriesEditionID in
+            heroPreview.stop()
             playback.open(item, target: target, contentID: contentID, app: app, seriesEditionID: seriesEditionID)
             openWindow(id: PrismPlaybackSession.windowID)
         })

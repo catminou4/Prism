@@ -9,12 +9,14 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
     private let showsDots: Bool
     private let isInteractive: Bool
     private let extendsUnderSidebar: Bool
+    private let canWrapForward: Bool
     private let content: (Item) -> Content
     @Binding private var externalIndex: Int?
 
     @State private var index = 0
     @State private var visibleID: Item.ID?
     @State private var direction: Edge = .trailing
+    @State private var transitionOrder: Double = 0
     @State private var hovering = false
     @State private var isWindowVisible = true
     @State private var scrollHitRegion = HeroScrollHitRegion()
@@ -29,6 +31,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         index: Binding<Int?> = .constant(nil),
         isInteractive: Bool = true,
         extendsUnderSidebar: Bool = false,
+        canWrapForward: Bool = true,
         @ViewBuilder content: @escaping (Item) -> Content
     ) {
         self.items = items
@@ -37,6 +40,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
         self.showsDots = showsDots
         self.isInteractive = isInteractive
         self.extendsUnderSidebar = extendsUnderSidebar
+        self.canWrapForward = canWrapForward
         self.content = content
         _externalIndex = index
         let initial = min(max(index.wrappedValue ?? 0, 0), max(items.count - 1, 0))
@@ -71,6 +75,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
                 let item = items[currentIndex]
                 content(item)
                     .id(item.id)
+                    .zIndex(transitionOrder)
                     .transition(pageTransition)
             }
         }
@@ -104,7 +109,7 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
             guard isAutoAdvancing else { return }
             try? await Task.sleep(for: .seconds(interval))
             guard !Task.isCancelled else { return }
-            go(to: currentIndex + 1, automatic: true)
+            go(to: currentIndex + 1)
         }
         .onChange(of: externalIndex) { _, newValue in
             if let newValue, newValue != currentIndex { go(to: newValue) }
@@ -132,20 +137,25 @@ public struct HeroCarousel<Item: Identifiable, Content: View>: View {
 
     private var pageTransition: AnyTransition {
         if reduceMotion { return .opacity }
-        let shift: CGFloat = 24
-        let insertion = AnyTransition.opacity.combined(with: .offset(x: direction == .trailing ? shift : -shift))
-        let removal = AnyTransition.opacity.combined(with: .offset(x: direction == .trailing ? -shift * 0.5 : shift * 0.5))
+        let shift: CGFloat = 14
+        let insertion = AnyTransition.opacity
+            .combined(with: .scale(scale: 1.015))
+            .combined(with: .offset(x: direction == .trailing ? shift : -shift))
+        // Keep the old artwork underneath until the incoming one has covered it.
+        let removal = AnyTransition.opacity.animation(.linear(duration: 0.01).delay(0.70))
         return .asymmetric(insertion: insertion, removal: removal)
     }
 
-    private func go(to target: Int, automatic: Bool = false) {
+    private func go(to target: Int) {
         guard canPage else { return }
+        if target >= items.count && !canWrapForward { return }
         let wrapped = (target % items.count + items.count) % items.count
         guard wrapped != currentIndex else { return }
         let forward = target > currentIndex
         direction = forward ? .trailing : .leading
-        let animation: Animation = reduceMotion ? .easeOut(duration: 0.16) : automatic ? PrismMotion.heroFade : .smooth(duration: 0.32)
+        let animation: Animation = reduceMotion ? .easeOut(duration: 0.16) : PrismMotion.heroFade
         withAnimation(animation) {
+            transitionOrder += 1
             index = wrapped
             visibleID = items[wrapped].id
         }

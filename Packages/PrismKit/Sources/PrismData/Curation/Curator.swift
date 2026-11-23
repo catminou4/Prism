@@ -98,6 +98,11 @@ public struct CuratedHighlight: Identifiable, Sendable, Hashable {
     public let title: MediaTitle
     public let label: String?
     public var id: TitleID { title.id }
+
+    public init(title: MediaTitle, label: String? = nil) {
+        self.title = title
+        self.label = label
+    }
 }
 
 /// A browse tile: one canonical genre with the artwork of its best title.
