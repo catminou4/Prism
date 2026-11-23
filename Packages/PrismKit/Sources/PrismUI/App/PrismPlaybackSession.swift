@@ -95,7 +95,11 @@ final class PrismPlaybackSession {
 
     func updateProgramme(app: AppModel) {
         guard let controller, controller.isLive, let target else { return }
-        controller.liveProgramme = currentProgramme(for: target, app: app)
+        // The 25 s poll exists for programme *changes*; rewriting an identical
+        // value would still republish `liveProgramme` and re-evaluate the whole
+        // player body for nothing (programmes last tens of minutes).
+        let programme = currentProgramme(for: target, app: app)
+        if controller.liveProgramme != programme { controller.liveProgramme = programme }
     }
 
     func close() {

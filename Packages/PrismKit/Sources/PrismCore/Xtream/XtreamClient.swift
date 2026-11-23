@@ -8,12 +8,19 @@ public actor XtreamClient {
     private let http: HTTPClient
     /// Native category IDs flagged adult, per kind (filled by `categories(_:)`).
     private var adultCategories: [MediaKind: Set<String>] = [:]
-    /// In-flight `categories(_:)` fetch per kind so concurrent `adultIDs` calls share one request.
+    /// In-flight `categories(_:)` fetch per resolved kind so concurrent callers share one request.
+    private var categoryFetches: [MediaKind: CategoryFetch] = [:]
+    /// In-flight `adultIDs` category lookups per kind so concurrent list endpoints share one request.
     private var adultFetches: [MediaKind: Fetch] = [:]
 
     private struct Fetch {
         let id = UUID()
         let task: Task<Void, Never>
+    }
+
+    private struct CategoryFetch {
+        let id = UUID()
+        let task: Task<[Category], any Error>
     }
 
     public init(credentials: XtreamCredentials, sourceID: SourceID, userAgent: String? = nil, session: URLSession? = nil) {
@@ -28,7 +35,24 @@ public actor XtreamClient {
     }
 
     /// live/movie/series → get_live_categories / get_vod_categories / get_series_categories.
+    /// Concurrent callers share one in-flight fetch per kind (the refresh's category pass and
+    /// `adultIDs` inside the list endpoints would otherwise duplicate the same request).
     public func categories(_ kind: MediaKind) async throws -> [Category] {
+        let resolvedKind: MediaKind = kind == .episode ? .series : kind
+        let fetch: CategoryFetch
+        if let running = categoryFetches[resolvedKind] {
+            fetch = running
+        } else {
+            fetch = CategoryFetch(task: Task { try await self.performCategories(kind) })
+            categoryFetches[resolvedKind] = fetch
+        }
+        defer {
+            if categoryFetches[resolvedKind]?.id == fetch.id { categoryFetches[resolvedKind] = nil }
+        }
+        return try await fetch.task.value
+    }
+
+    private func performCategories(_ kind: MediaKind) async throws -> [Category] {
         let action: String
         switch kind {
         case .live: action = "get_live_categories"
@@ -43,27 +67,40 @@ public actor XtreamClient {
     }
 
     /// `streamURL` = m3u8 when `preferHLS` and the account allows it (or lists no format), `alternateStreamURL` = ts.
+    /// The category lookup only feeds the `isAdult` flag, so it runs concurrently with the
+    /// (much longer) list download instead of serializing in front of it.
     public func liveStreams(preferHLS: Bool, account: XtreamAccount?) async throws -> [Channel] {
-        let adult = await adultIDs(.live)
+        async let adult = adultIDs(.live)
         let data = try await get(action: "get_live_streams", timeout: Self.listTimeout, retries: Self.listRetries)
-        return try await decode {
-            try XtreamDecoder.liveStreams(
-                data, sourceID: self.sourceID, credentials: self.credentials, preferHLS: preferHLS,
-                allowedFormats: account?.allowedOutputFormats ?? [], adultCategoryIDs: adult
-            )
+        let resolvedAdult = await adult
+        let formats = account?.allowedOutputFormats ?? []
+        let credentials = self.credentials
+        let sourceID = self.sourceID
+        return try await decodeList(data) { items in
+            XtreamDecoder.liveStreams(items, sourceID: sourceID, credentials: credentials, preferHLS: preferHLS,
+                                      allowedFormats: formats, adultCategoryIDs: resolvedAdult)
         }
     }
 
     public func vodStreams() async throws -> [Movie] {
-        let adult = await adultIDs(.movie)
+        async let adult = adultIDs(.movie)
         let data = try await get(action: "get_vod_streams", timeout: Self.listTimeout, retries: Self.listRetries)
-        return try await decode { try XtreamDecoder.vodStreams(data, sourceID: self.sourceID, credentials: self.credentials, adultCategoryIDs: adult) }
+        let resolvedAdult = await adult
+        let credentials = self.credentials
+        let sourceID = self.sourceID
+        return try await decodeList(data) { items in
+            XtreamDecoder.vodStreams(items, sourceID: sourceID, credentials: credentials, adultCategoryIDs: resolvedAdult)
+        }
     }
 
     public func series() async throws -> [Series] {
-        let adult = await adultIDs(.series)
+        async let adult = adultIDs(.series)
         let data = try await get(action: "get_series", timeout: Self.listTimeout, retries: Self.listRetries)
-        return try await decode { try XtreamDecoder.series(data, sourceID: self.sourceID, adultCategoryIDs: adult) }
+        let resolvedAdult = await adult
+        let sourceID = self.sourceID
+        return try await decodeList(data) { items in
+            XtreamDecoder.series(items, sourceID: sourceID, adultCategoryIDs: resolvedAdult)
+        }
     }
 
     /// `get_vod_info&vod_id=`
@@ -100,6 +137,57 @@ public actor XtreamClient {
         }.value
     }
 
+    /// Parses the JSON once off-actor, then maps the elements in parallel slices when the list
+    /// is large. Per-item mapping costs ~50-130 µs (normalization, field coercion, URL building),
+    /// so a 100k-item `get_vod_streams` spends ~10 s on a single core; six workers cut that to
+    /// ~2 s while the other endpoints are still downloading. Output order is always preserved.
+    /// `nonisolated` so the task-group workers below inherit the generic executor: actor-
+    /// isolated children would run the CPU-bound `map` back on this actor.
+    private nonisolated func decodeList<T: Sendable>(
+        _ data: Data,
+        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+    ) async throws -> [T] {
+        try Task.checkCancellation()
+        let parsed = try await Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return ParsedElements(value: try XtreamDecoder.elements(data))
+        }.value
+        let count = parsed.value.count
+        guard count >= Self.parallelDecodeThreshold else {
+            return try await Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
+                return map(parsed.value[...])
+            }.value
+        }
+        let workers = min(
+            Self.maxDecodeWorkers,
+            ProcessInfo.processInfo.activeProcessorCount,
+            (count + Self.decodeSliceTarget - 1) / Self.decodeSliceTarget
+        )
+        let sliceSize = (count + workers - 1) / workers
+        let chunks: [(Int, [T])] = await withTaskGroup(of: (Int, [T]).self) { group in
+            for worker in 0..<workers {
+                let lower = worker * sliceSize
+                let upper = min(lower + sliceSize, count)
+                guard lower < upper else { break }
+                group.addTask {
+                    (worker, map(parsed.value[lower..<upper]))
+                }
+            }
+            var collected: [(Int, [T])] = []
+            collected.reserveCapacity(workers)
+            for await chunk in group { collected.append(chunk) }
+            return collected
+        }
+        try Task.checkCancellation()
+        var result: [T] = []
+        result.reserveCapacity(count)
+        for (_, chunk) in chunks.sorted(by: { $0.0 < $1.0 }) {
+            result.append(contentsOf: chunk)
+        }
+        return result
+    }
+
     private func adultIDs(_ kind: MediaKind) async -> Set<String> {
         if let cached = adultCategories[kind] { return cached }
         let fetch: Fetch
@@ -119,6 +207,13 @@ public actor XtreamClient {
     /// everything. A wide timeout plus a single retry beats three stacked 30 s attempts.
     private static let listTimeout: TimeInterval = 120
     private static let listRetries = 1
+
+    /// Below this many elements the per-item mapping is fast enough on one core.
+    private static let parallelDecodeThreshold = 12_000
+    /// Target elements per decode worker; combined with the worker cap this bounds slice count.
+    private static let decodeSliceTarget = 8_000
+    /// Hard cap: the three lists can decode at once, so per-list workers stay modest.
+    private static let maxDecodeWorkers = 6
 
     private func get(action: String?, extra: [URLQueryItem] = [], timeout: TimeInterval = 30, retries: Int = 2) async throws -> Data {
         let url = XtreamURLBuilder.api(credentials, action: action, extra: extra)
@@ -151,4 +246,10 @@ public actor XtreamClient {
             throw XtreamError.network(error.localizedDescription)
         }
     }
+}
+
+/// The JSONSerialization tree is immutable once parsed: sharing it read-only across decode
+/// tasks is safe even though `[Any]` is not `Sendable`.
+private struct ParsedElements: @unchecked Sendable {
+    let value: [Any]
 }

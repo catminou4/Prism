@@ -96,7 +96,7 @@ struct EPGGuideTests {
     }
 
     @Test func nameIndexParallelOrdering() {
-        // > 8 192 channels with programmes makes `makeNameIndex` take the partitioned
+        // > 1 024 channels with programmes makes `makeNameIndex` take the partitioned
         // path. Contested keys must still resolve exactly like the serial version:
         // smallest channel id wins, display names before stripped ids.
         var programs: [EPGProgram] = []

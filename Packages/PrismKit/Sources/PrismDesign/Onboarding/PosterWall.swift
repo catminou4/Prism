@@ -34,7 +34,7 @@ nonisolated extension Array where Element == PosterWallTile {
 /// occluded or the app inactive — the drift clock freezes in place, so resuming never jumps
 /// and never pays a re-raster while hidden.
 public struct PosterWall: View {
-    private let tiles: [PosterWallTile]
+    private let tileStorage: PosterWallTileStorage
     private let tileWidth: CGFloat
     private let spacing: CGFloat
     private let angle: Angle
@@ -62,7 +62,8 @@ public struct PosterWall: View {
         isAnimating: Bool = true,
         startTime: Double = 0
     ) {
-        self.tiles = tiles.isEmpty ? .procedural(count: 30) : tiles
+        let resolvedTiles = tiles.isEmpty ? [PosterWallTile].procedural(count: 30) : tiles
+        tileStorage = PosterWallTileStorage(resolvedTiles)
         self.tileWidth = tileWidth
         self.spacing = spacing
         self.angle = angle
@@ -119,7 +120,7 @@ public struct PosterWall: View {
         let fraction = travel - CGFloat(rowShift) * pitch.height
         let grid = gridSize
         return PosterWallGrid(
-            tiles: tiles, columns: grid.columns, rows: grid.rows, rowShift: rowShift,
+            tileStorage: tileStorage, columns: grid.columns, rows: grid.rows, rowShift: rowShift,
             tileWidth: tileWidth, spacing: spacing
         )
         .equatable()
@@ -158,9 +159,16 @@ private final class DriftClock {
     }
 }
 
+/// Reference box for a `PosterWall`'s tile list: the grid struct is rebuilt every timeline
+/// tick and `Equatable` compares it — identity is O(1) where comparing ~60 tiles per frame was not.
+private final class PosterWallTileStorage {
+    let tiles: [PosterWallTile]
+    init(_ tiles: [PosterWallTile]) { self.tiles = tiles }
+}
+
 /// Static grid; equatable so it only re-renders (and re-rasterises) when a row scrolls by.
 private struct PosterWallGrid: View, Equatable {
-    let tiles: [PosterWallTile]
+    let tileStorage: PosterWallTileStorage
     let columns: Int
     let rows: Int
     let rowShift: Int
@@ -168,8 +176,11 @@ private struct PosterWallGrid: View, Equatable {
     let spacing: CGFloat
 
     nonisolated static func == (lhs: PosterWallGrid, rhs: PosterWallGrid) -> Bool {
-        lhs.rowShift == rhs.rowShift && lhs.columns == rhs.columns && lhs.rows == rhs.rows
-            && lhs.tileWidth == rhs.tileWidth && lhs.spacing == rhs.spacing && lhs.tiles == rhs.tiles
+        guard lhs.rowShift == rhs.rowShift, lhs.columns == rhs.columns, lhs.rows == rhs.rows,
+              lhs.tileWidth == rhs.tileWidth, lhs.spacing == rhs.spacing else { return false }
+        // Same wall → same storage → O(1). A recreated `PosterWall` gets a fresh storage:
+        // fall back to the value compare so equal tiles still skip the re-raster.
+        return lhs.tileStorage === rhs.tileStorage || lhs.tileStorage.tiles == rhs.tileStorage.tiles
     }
 
     var body: some View {
@@ -193,6 +204,7 @@ private struct PosterWallGrid: View, Equatable {
 
     /// Deterministic tile for an absolute grid position (rows wrap through the tile list).
     private func tile(column: Int, row: Int) -> PosterWallTile {
+        let tiles = tileStorage.tiles
         let count = tiles.count
         let index = ((column * 7 + row * 3) % count + count) % count
         return tiles[index]

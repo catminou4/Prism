@@ -506,4 +506,74 @@ struct XtreamClientTests {
         #expect(urls.contains { $0.contains("action=get_series_info&series_id=301") })
         #expect(urls.contains { $0.contains("action=get_short_epg&stream_id=101&limit=4") })
     }
+
+    @Test func concurrentCategoryCallsShareOneRequest() async throws {
+        let host = "cats-dedup.test"
+        StubURLProtocol.register(host: host, action: "get_live_categories", body: try Fixture.data("xtream_live_categories", "json"))
+        let client = client(host: host)
+        // Both callers reach the actor while the first fetch is still in flight: the second
+        // must join it instead of issuing a duplicate get_live_categories.
+        async let first = client.categories(.live)
+        async let second = client.categories(.live)
+        let (a, b) = try await (first, second)
+        #expect(a == b)
+        let categoryRequests = StubURLProtocol.recordedRequests(host: host).filter {
+            $0.url?.absoluteString.contains("action=get_live_categories") == true
+        }
+        #expect(categoryRequests.count == 1)
+    }
+
+    @Test func listEndpointReusesInFlightCategoryFetch() async throws {
+        let host = "cats-share.test"
+        StubURLProtocol.register(host: host, action: "get_live_categories", body: try Fixture.data("xtream_live_categories", "json"))
+        StubURLProtocol.register(host: host, action: "get_live_streams", body: try Fixture.data("xtream_live_streams", "json"))
+        let client = client(host: host)
+        // The refresh's category pass and liveStreams' adult-ID lookup hit the same endpoint
+        // concurrently: one request must serve both.
+        async let categories = client.categories(.live)
+        async let channels = client.liveStreams(preferHLS: true, account: nil)
+        _ = try await (categories, channels)
+        let categoryRequests = StubURLProtocol.recordedRequests(host: host).filter {
+            $0.url?.absoluteString.contains("action=get_live_categories") == true
+        }
+        #expect(categoryRequests.count == 1)
+    }
+
+    @Test func gzippedJSONWithoutContentEncodingDecodes() throws {
+        // Panels behind misconfigured proxies can emit gzip bodies with no Content-Encoding:
+        // URLSession then delivers raw deflate bytes and the decoder must inflate them.
+        let compressed = try Fixture.data("xtream_vod_streams", "json.gz")
+        #expect(Gzip.isCompressed(compressed))
+        let credentials = XtreamCredentials(server: URL(string: "http://gz.test")!, username: "u", password: "p")
+        let movies = try XtreamDecoder.vodStreams(compressed, sourceID: SourceID("xt1"), credentials: credentials)
+        let plain = try XtreamDecoder.vodStreams(try Fixture.data("xtream_vod_streams", "json"), sourceID: SourceID("xt1"), credentials: credentials)
+        #expect(movies == plain)
+        #expect(!movies.isEmpty)
+    }
+
+    /// Above `parallelDecodeThreshold` the client maps JSON elements in parallel slices:
+    /// output must stay identical (and in order) to the sequential decoder.
+    @Test func largeListDecodePreservesOrderAndContent() async throws {
+        let count = 13_000 // just over the 12 000 chunking threshold → 2 decode workers
+        var payload = Data("[".utf8)
+        for i in 0..<count {
+            if i > 0 { payload.append(0x2C) }
+            payload.append(contentsOf: """
+            {"stream_id":\(200000 + i),"name":"Film \(i) 2024","cover":"https://img.example.com/\(i).jpg","genre":"Action, Drame","rating":"7.5","container_extension":"mkv","category_id":"\(i % 25)","added":"2024-01-15","is_adult":"0"}
+            """.utf8)
+        }
+        payload.append(0x5D)
+        let host = "chunked.test"
+        StubURLProtocol.register(host: host, action: "get_vod_streams", body: payload)
+        StubURLProtocol.register(host: host, action: "get_vod_categories", body: Data("[]".utf8))
+        let client = client(host: host)
+        let movies = try await client.vodStreams()
+        #expect(movies.count == count)
+        #expect(movies.first?.nativeID == "200000")
+        #expect(movies.last?.nativeID == "\(200000 + count - 1)")
+        // Same input through the sequential decoder must produce the identical array.
+        let credentials = XtreamCredentials(server: URL(string: "http://\(host):8080")!, username: "demo", password: "secret")
+        let reference = try XtreamDecoder.vodStreams(payload, sourceID: SourceID("xt1"), credentials: credentials)
+        #expect(movies == reference)
+    }
 }

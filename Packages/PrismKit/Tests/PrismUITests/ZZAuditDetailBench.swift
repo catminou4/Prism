@@ -6,7 +6,7 @@ import PrismCore
 
 /// ZZAudit — offscreen measurements for the detail-page performance audit.
 /// Prints timings; assertions are sanity checks only.
-@Suite("ZZAudit detail perf")
+@Suite("ZZAudit detail perf", .disabled(if: ProcessInfo.processInfo.environment["ZZAUDIT"] == nil))
 struct ZZAuditDetailBench {
 
     /// Cost of rebuilding `editions` ([TitleEdition]) the way TitleDetailView.body does:
@@ -108,5 +108,69 @@ struct ZZAuditDetailBench {
         let elapsed = start.duration(to: clock.now)
         print("ZZAUDIT isInWatchlist(2000 entries): \(elapsed) / \(iterations*2) calls (hit+miss), hits=\(hits)")
         #expect(hits == iterations)
+    }
+
+    /// `QuickPlay.option` on a 60-variant film — the hero re-evaluates it per page eval.
+    /// `rank` used to rebuild a tag Set per sort comparison; it is now scored once per variant.
+    @MainActor @Test func quickPlayOptionCost() async throws {
+        let app = await AppModel.preview()
+        let source = try #require(app.sources.first)
+        let stream = try #require(URL(string: "https://example.invalid/bench.mp4"))
+        var variants: [MediaVariant] = []
+        variants.reserveCapacity(60)
+        for i in 0..<60 {
+            variants.append(.movie(Movie(
+                sourceID: source.id, nativeID: "bench\(i)", title: "Film \(i)",
+                streamURL: stream, quality: .uhd, tags: ["VF", "FR", "4K", "MULTI"]
+            )))
+        }
+        let title = MediaTitle(
+            id: TitleID(rawValue: "bench:film"), kind: .movie, title: "Film", year: nil, variants: variants
+        )
+        for _ in 0..<20 { _ = QuickPlay.option(for: title, app: app) }
+        let clock = ContinuousClock()
+        let iterations = 300
+        var hits = 0
+        let start = clock.now
+        for _ in 0..<iterations {
+            if QuickPlay.option(for: title, app: app) != nil { hits += 1 }
+        }
+        let elapsed = start.duration(to: clock.now)
+        print("ZZAUDIT quickPlay.option(60 variants): \(elapsed) / \(iterations)")
+        #expect(hits == iterations)
+
+        // Replica of the previous comparator — `rank` rebuilt a tag Set per comparison.
+        let frenchTags: Set<String> = ["FR", "FRA", "FRENCH", "VF", "VFF", "VFQ", "VFI", "TRUEFRENCH", "MULTI"]
+        let englishTags: Set<String> = ["EN", "ENG", "ENGLISH", "VO", "VOSTFR", "MULTI"]
+        func oldRank(_ variant: MediaVariant) -> Int {
+            let tags = Set(variant.tags.map { $0.uppercased() })
+            var score = variant.quality.rawValue
+            if !tags.isDisjoint(with: frenchTags) { score += 20 }
+            if !tags.isDisjoint(with: englishTags) { score += 20 }
+            return score
+        }
+        for _ in 0..<10 { _ = variants.sorted { oldRank($0) != oldRank($1) ? oldRank($0) > oldRank($1) : $0.quality > $1.quality } }
+        let oldStart = clock.now
+        for _ in 0..<iterations {
+            _ = variants.sorted { lhs, rhs in
+                let left = oldRank(lhs), right = oldRank(rhs)
+                return left != right ? left > right : lhs.quality > rhs.quality
+            }
+        }
+        print("ZZAUDIT quickPlay rank-per-comparison sort(60 variants): \(oldStart.duration(to: clock.now)) / \(iterations)")
+
+        // The shipped path: score once per variant, then sort.
+        for _ in 0..<10 {
+            _ = variants.map { (score: oldRank($0), variant: $0) }
+                .sorted { $0.score != $1.score ? $0.score > $1.score : $0.variant.quality > $1.variant.quality }
+                .map { $0.variant }
+        }
+        let newStart = clock.now
+        for _ in 0..<iterations {
+            _ = variants.map { (score: oldRank($0), variant: $0) }
+                .sorted { $0.score != $1.score ? $0.score > $1.score : $0.variant.quality > $1.variant.quality }
+                .map { $0.variant }
+        }
+        print("ZZAUDIT quickPlay score-once sort(60 variants): \(newStart.duration(to: clock.now)) / \(iterations)")
     }
 }

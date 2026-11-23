@@ -82,13 +82,21 @@ public enum XtreamDecoder {
         _ data: Data, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
         allowedFormats: [String] = [], adultCategoryIDs: Set<String> = []
     ) throws -> [Channel] {
+        try liveStreams(elements(data)[...], sourceID: sourceID, credentials: credentials, preferHLS: preferHLS,
+                        allowedFormats: allowedFormats, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → channels. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func liveStreams(
+        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
+        allowedFormats: [String] = [], adultCategoryIDs: Set<String> = []
+    ) -> [Channel] {
         let formats = Set(allowedFormats.map { $0.lowercased() })
         let canHLS = formats.isEmpty || formats.contains("m3u8") || formats.contains("hls")
         let canTS = formats.isEmpty || formats.contains("ts") || formats.contains("mpegts")
         let primaryIsHLS = (preferHLS && canHLS) || !canTS
 
-        // Parse first so `data` is dead before the per-item mapping loop.
-        let items = try elements(data)
         var result: [Channel] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -130,7 +138,14 @@ public enum XtreamDecoder {
     public static func vodStreams(
         _ data: Data, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
     ) throws -> [Movie] {
-        let items = try elements(data)
+        try vodStreams(elements(data)[...], sourceID: sourceID, credentials: credentials, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → movies. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func vodStreams(
+        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
+    ) -> [Movie] {
         var result: [Movie] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -171,7 +186,12 @@ public enum XtreamDecoder {
     // MARK: Series
 
     public static func series(_ data: Data, sourceID: SourceID, adultCategoryIDs: Set<String> = []) throws -> [Series] {
-        let items = try elements(data)
+        try series(elements(data)[...], sourceID: sourceID, adultCategoryIDs: adultCategoryIDs)
+    }
+
+    /// Maps already-parsed JSON elements → series. Non-throwing: malformed elements are skipped,
+    /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
+    static func series(_ items: ArraySlice<Any>, sourceID: SourceID, adultCategoryIDs: Set<String> = []) -> [Series] {
         var result: [Series] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -353,7 +373,13 @@ public enum XtreamDecoder {
         }
         do {
             // Some panels prepend whitespace before a UTF-8 BOM.
-            let payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+            var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+            // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
+            // (URLSession only decompresses when the header is present). A failed inflate falls
+            // back to the raw bytes, preserving the previous parse error.
+            if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
+                payload = inflated
+            }
             return try LenientValue.parse(payload)
         } catch {
             let preview = String(decoding: data[first...].prefix(80), as: UTF8.self)

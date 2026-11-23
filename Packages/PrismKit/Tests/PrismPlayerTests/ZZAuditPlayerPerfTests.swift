@@ -7,7 +7,8 @@ import Testing
 @testable import PrismPlayer
 
 /// Temporary audit probes (player performance review). Not part of the suite's contract.
-@Suite(.serialized) struct ZZAuditPlayerPerfTests {
+@Suite(.serialized, .disabled(if: ProcessInfo.processInfo.environment["ZZAUDIT"] == nil))
+struct ZZAuditPlayerPerfTests {
     let defaults: UserDefaults
     let suiteName: String
     let preferences: PlayerPreferences
@@ -99,6 +100,7 @@ import Testing
         counter.track("liveProgramme", controller) { $0.liveProgramme }
         counter.track("audioTracks", controller) { $0.audioTracks }
         counter.track("subtitleTracks", controller) { $0.subtitleTracks }
+        counter.track("upNextVisible", controller) { $0.upNextVisible }
         counter.track("selectedAudioID", controller) { $0.selectedAudioID }
         counter.track("selectedSubtitleID", controller) { $0.selectedSubtitleID }
         counter.track("rate", controller) { $0.rate }
@@ -190,6 +192,32 @@ import Testing
         let pausedCount = events[pausedStart...].filter { if case .time = $0 { true } else { false } }.count
         print("ZZAUDIT avfTimeEventCadence: \(pausedCount) .time events in 2s PAUSED")
         engine.stop()
+    }
+
+    /// VLC emits `.ready` twice (duration arrives late): the second one must not
+    /// republish identical track arrays / selection ids.
+    @Test func duplicateReadyDoesNotRepublishTracks() {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        let engine = factory.last!
+        engine.audioTracks = [MediaTrack(id: "1", name: "French", language: "fr")]
+        engine.subtitleTracks = [MediaTrack(id: "2", name: "English", language: "en")]
+
+        let counter = PropCounter()
+        counter.track("audioTracks", controller) { $0.audioTracks }
+        counter.track("subtitleTracks", controller) { $0.subtitleTracks }
+        counter.track("selectedAudioID", controller) { $0.selectedAudioID }
+        counter.track("selectedSubtitleID", controller) { $0.selectedSubtitleID }
+
+        engine.emit(.ready(duration: 600))
+        counter.reset()
+        engine.emit(.ready(duration: 600))  // late-duration duplicate
+        let report = counter.report()
+        print("ZZAUDIT duplicateReadyDoesNotRepublishTracks: \(report)")
+        #expect(report.isEmpty)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
     }
 
     /// Scrubbing: engine time events must not write currentTime.

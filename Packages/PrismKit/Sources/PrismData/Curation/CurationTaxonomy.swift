@@ -178,24 +178,40 @@ enum CurationTaxonomy {
     }
 
     /// Lowercase, diacritic-free text with separators collapsed to spaces.
+    /// Iterates unicode scalars, not Characters: grapheme breaking costs ~100 ns/cluster and
+    /// dominated `looksLikeEpisode` (~20 µs/title). Scalar-wise output is identical — appended
+    /// content scalars reproduce the same UTF-8 sequence `append(Character)` produced.
     static func normalize(_ text: String) -> String {
         let folded = TextFolding.fold(text)
         var result = ""
         result.reserveCapacity(folded.utf8.count)
-        var lastWasSpace = false
-        for character in folded {
-            let isSeparator = character == "|" || character == "/" || character == "&" || character == ","
-                || character == "(" || character == ")" || character == ":" || character == "_" || character == "."
-                || character.isWhitespace
-            if isSeparator {
-                if !lastWasSpace { result.append(" ") }
-                lastWasSpace = true
+        // Starting "already spaced" makes leading separators collapse into nothing — the same
+        // net result the old `trimmingCharacters` produced. Only a trailing space can remain.
+        var lastWasSpace = true
+        for scalar in folded.unicodeScalars {
+            if isSeparator(scalar) {
+                if !lastWasSpace {
+                    result.unicodeScalars.append(" ")
+                    lastWasSpace = true
+                }
             } else {
-                result.append(character)
+                result.unicodeScalars.append(scalar)
                 lastWasSpace = false
             }
         }
-        return result.trimmingCharacters(in: .whitespaces)
+        if result.hasSuffix(" ") { result.removeLast() }
+        return result
+    }
+
+    /// The separator set of `normalize`: the punctuation list plus every Unicode `White_Space`
+    /// scalar (0009–000D, 0020, 0085, 00A0, 1680, 2000–200A, 2028, 2029, 202F, 205F, 3000).
+    private static func isSeparator(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x7C, 0x2F, 0x26, 0x2C, 0x28, 0x29, 0x3A, 0x5F, 0x2E: return true
+        case 0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000:
+            return true
+        default: return false
+        }
     }
 
     private static func genres(in text: String) -> GenreSet {
@@ -209,7 +225,71 @@ enum CurationTaxonomy {
     /// Titles that are clearly episodes, clips or uploads filed as movies.
     static func looksLikeEpisode(_ title: String) -> Bool {
         let text = " " + normalize(title) + " "
-        return episodeMarkers.contains(where: text.contains)
+        // Every marker is a short ASCII needle: a second-byte-bucketed scan over the UTF-8
+        // storage replaces sixteen `String.contains` calls (~17 µs → ~1 µs per title). ASCII
+        // needles can only match literal bytes — never inside a multi-byte scalar — so the
+        // byte search returns exactly what the string search did. If a marker ever contains
+        // non-ASCII bytes the byte path is skipped entirely (`episodeNeedlesASCIIOnly`).
+        if episodeNeedlesASCIIOnly,
+           let found = text.utf8.withContiguousStorageIfAvailable({ containsNeedle($0) }) {
+            return found
+        }
+        return episodeMarkers.contains { text.contains($0) }
+    }
+
+    /// `false` if any marker is not pure ASCII — the byte search is only exact for ASCII
+    /// needles (a non-ASCII needle could byte-match inside another scalar's UTF-8 sequence).
+    private static let episodeNeedlesASCIIOnly = episodeMarkers.allSatisfy {
+        $0.utf8.allSatisfy { $0 < 0x80 }
+    }
+
+    /// `episodeMarkers` as UTF-8 needles. Every prepared marker starts with a space, so
+    /// first-byte bucketing is useless — bucket by the *second* byte instead (the memcmp
+    /// still verifies the whole needle, so any marker shape stays correct). A first-byte
+    /// gate skips positions that cannot start any needle.
+    private static let episodeNeedles: (pairs: [[[UInt8]]], singles: [[UInt8]], firstBytes: [Bool]) = {
+        var pairs = [[[UInt8]]](repeating: [], count: 256)
+        var singles: [[UInt8]] = []
+        var firstBytes = [Bool](repeating: false, count: 256)
+        for marker in episodeMarkers {
+            let bytes = [UInt8](marker.utf8)
+            if let first = bytes.first { firstBytes[Int(first)] = true }
+            if bytes.count > 1 {
+                pairs[Int(bytes[1])].append(bytes)
+            } else if !bytes.isEmpty {
+                singles.append(bytes)
+            }
+        }
+        return (pairs, singles, firstBytes)
+    }()
+
+    private static func containsNeedle(_ buffer: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard let base = buffer.baseAddress else { return false }
+        let count = buffer.count
+        let (pairs, singles, firstBytes) = episodeNeedles
+        var position = 0
+        while position < count {
+            guard firstBytes[Int(base[position])] else {
+                position += 1
+                continue
+            }
+            for needle in singles where base[position] == needle[0] { return true }
+            // Multi-byte needles are bucketed by their second byte, aligned with
+            // `base[position + 1]`; the memcmp verifies every byte including the first.
+            if position + 1 < count {
+                for needle in pairs[Int(base[position + 1])] {
+                    guard position + needle.count <= count else { continue }
+                    var matched = true
+                    for offset in needle.indices where base[position + offset] != needle[offset] {
+                        matched = false
+                        break
+                    }
+                    if matched { return true }
+                }
+            }
+            position += 1
+        }
+        return false
     }
 
     private static let episodeMarkers = prepared([(0, [

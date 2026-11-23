@@ -4,6 +4,24 @@ import Foundation
 /// strings, `""`/`null` for missing values, booleans as `0/1/"0"/"1"/true`, `[]` instead of `{}`…
 /// Values are only used locally inside decoding functions (not `Sendable`).
 enum LenientValue {
+    /// `trimmingCharacters(in: .whitespacesAndNewlines)` without the copy when the string has
+    /// no leading/trailing whitespace — the common case for JSON payloads. Trimming is only
+    /// needed at the edges, so checking the first and last scalars decides it in ~ns.
+    static func trim(_ s: String) -> String {
+        guard let first = s.unicodeScalars.first, let last = s.unicodeScalars.last,
+              !CharacterSet.whitespacesAndNewlines.contains(first),
+              !CharacterSet.whitespacesAndNewlines.contains(last) else {
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return s
+    }
+
+    /// True when every scalar is whitespace — same result as
+    /// `s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty` without allocating.
+    static func isAllWhitespace(_ s: String) -> Bool {
+        s.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
     static func parse(_ data: Data) throws -> Any {
         var bytes = data
         if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
@@ -17,7 +35,7 @@ enum LenientValue {
     static func string(_ value: Any?) -> String? {
         switch value {
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = trim(s)
             if trimmed.isEmpty || trimmed == "null" { return nil }
             return trimmed
         case let n as NSNumber:
@@ -37,7 +55,7 @@ enum LenientValue {
             guard d.isFinite, abs(d) < 9e15 else { return nil }
             return Int(d)
         case let s as String:
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = trim(s)
             guard !trimmed.isEmpty else { return nil }
             if let i = Int(trimmed) { return i }
             let normalized = trimmed.contains(",") ? trimmed.replacingOccurrences(of: ",", with: ".") : trimmed
@@ -55,7 +73,7 @@ enum LenientValue {
             let d = n.doubleValue
             return d.isFinite ? d : nil
         case let s as String:
-            var trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            var trimmed = trim(s)
             if trimmed.contains(",") { trimmed = trimmed.replacingOccurrences(of: ",", with: ".") }
             guard !trimmed.isEmpty, let d = Double(trimmed), d.isFinite else { return nil }
             return d
@@ -69,7 +87,7 @@ enum LenientValue {
         case let n as NSNumber:
             return n.doubleValue != 0
         case let s as String:
-            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            switch trim(s).lowercased() {
             case "1", "true", "yes", "y", "on": return true
             case "0", "false", "no", "n", "off", "-1": return false
             default: return int(s).map { $0 != 0 }
@@ -259,7 +277,7 @@ struct JSONObject {
     func value(_ keys: [String]) -> Any? {
         for key in keys {
             if let v = raw[key], !(v is NSNull) {
-                if let s = v as? String, s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                if let s = v as? String, LenientValue.isAllWhitespace(s) { continue }
                 return v
             }
         }

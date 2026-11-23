@@ -19,20 +19,7 @@ public struct EPGGuide: Sendable {
     public let programCount: Int
 
     public init(programs: [EPGProgram], channels: [XMLTVChannel] = []) {
-        var grouped: [String: [EPGProgram]] = [:]
-        // Programmes of a channel share the same raw id: normalize each distinct id once.
-        var keys: [String: String] = [:]
-        for program in programs {
-            let id: String
-            if let known = keys[program.channelID] {
-                id = known
-            } else {
-                id = program.channelID.trimmingCharacters(in: .whitespaces).lowercased()
-                keys[program.channelID] = id
-            }
-            guard !id.isEmpty else { continue }
-            grouped[id, default: []].append(program)
-        }
+        let grouped = Self.groupPrograms(programs)
         var cleaned: [String: [EPGProgram]] = Dictionary(minimumCapacity: grouped.count)
         var count = 0
         for (id, list) in grouped {
@@ -159,6 +146,66 @@ public struct EPGGuide: Sendable {
 
     // MARK: - Internals
 
+    /// Groups programmes by normalized channel id. Programmes of a channel share the same raw id:
+    /// normalize each distinct id once per partition. Large feeds group on contiguous partitions
+    /// in parallel; partial maps merge in input order so each channel's list keeps the exact
+    /// serial order (and identical content) — channel ids that span partitions concatenate their
+    /// slices in partition order.
+    private static func groupPrograms(_ programs: [EPGProgram]) -> [String: [EPGProgram]] {
+        guard programs.count >= 16_384 else { return groupProgramsSerial(programs) }
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        let partitions = min(workers, max(1, programs.count / 16_384))
+        let bounds = (0...partitions).map { $0 * programs.count / partitions }
+        let partials: Mutex<[Int: [String: [EPGProgram]]]> = Mutex([:])
+        DispatchQueue.concurrentPerform(iterations: partitions) { partition in
+            var keys: [String: String] = [:]
+            var local: [String: [EPGProgram]] = [:]
+            for index in bounds[partition]..<bounds[partition + 1] {
+                let program = programs[index]
+                let id: String
+                if let known = keys[program.channelID] {
+                    id = known
+                } else {
+                    id = program.channelID.trimmingCharacters(in: .whitespaces).lowercased()
+                    keys[program.channelID] = id
+                }
+                guard !id.isEmpty else { continue }
+                local[id, default: []].append(program)
+            }
+            partials.withLock { $0[partition] = local }
+        }
+        var grouped: [String: [EPGProgram]] = [:]
+        for partition in 0..<partitions {
+            guard let local = partials.withLock({ $0[partition] }) else { continue }
+            for (id, list) in local {
+                if let existing = grouped[id] {
+                    grouped[id] = existing + list
+                } else {
+                    grouped[id] = list
+                }
+            }
+        }
+        return grouped
+    }
+
+    private static func groupProgramsSerial(_ programs: [EPGProgram]) -> [String: [EPGProgram]] {
+        var grouped: [String: [EPGProgram]] = [:]
+        // Programmes of a channel share the same raw id: normalize each distinct id once.
+        var keys: [String: String] = [:]
+        for program in programs {
+            let id: String
+            if let known = keys[program.channelID] {
+                id = known
+            } else {
+                id = program.channelID.trimmingCharacters(in: .whitespaces).lowercased()
+                keys[program.channelID] = id
+            }
+            guard !id.isEmpty else { continue }
+            grouped[id, default: []].append(program)
+        }
+        return grouped
+    }
+
     private func matchingEPGID(_ candidate: String?) -> String? {
         guard let candidate else { return nil }
         let id = candidate.trimmingCharacters(in: .whitespaces).lowercased()
@@ -177,25 +224,45 @@ public struct EPGGuide: Sendable {
     /// Sorted by start; drops empty/duplicate programmes and trims overlaps (earlier programme ends
     /// when the next one starts).
     /// XMLTV feeds emit programmes in time order, so per-channel lists usually arrive already
-    /// sorted: an O(n) check skips the stable re-sort (and its tuple allocations) in the common
-    /// case. An unsorted list takes the exact same stable-sort path as before.
+    /// sorted *and* clean: one O(n) pass checks both invariants and returns the input array
+    /// untouched (no copy) in the common case. Unsorted lists take a keyed sort — 16-byte
+    /// (start, offset) keys move far less data than (offset, EPGProgram) tuples — then `clean`.
     static func normalize(_ programs: [EPGProgram]) -> [EPGProgram] {
+        guard programs.count > 1 else { return clean(programs) }
+        // `clean` keeps the last *appended* programme, this scan tracks the previous element:
+        // they coincide exactly while every element is valid, non-duplicate and non-overlapping,
+        // which is the only state in which the fast path is taken.
         var needsSort = false
-        if programs.count > 1 {
-            for index in programs.indices.dropFirst() where programs[index].start < programs[index - 1].start {
-                needsSort = true
-                break
-            }
+        var isClean = true
+        var previous = programs[programs.startIndex]
+        if !(previous.end > previous.start) { isClean = false }
+        for index in programs.indices.dropFirst() {
+            let program = programs[index]
+            if program.start < previous.start { needsSort = true }
+            if program.end <= program.start || program.start < previous.end { isClean = false }
+            previous = program
+            if needsSort && !isClean { break }
         }
-        let sorted: [EPGProgram]
-        if needsSort {
-            sorted = programs.enumerated().sorted {
-                $0.element.start != $1.element.start ? $0.element.start < $1.element.start : $0.offset < $1.offset
-            }.map(\.element)
-        } else {
-            sorted = programs
+        if !needsSort {
+            return isClean ? programs : clean(programs)
         }
-        return clean(sorted)
+        return clean(sortByStart(programs))
+    }
+
+    /// Same order as the former `enumerated().sorted { start, then offset }`, with 16-byte keys.
+    private static func sortByStart(_ programs: [EPGProgram]) -> [EPGProgram] {
+        var keyed = [(start: Date, offset: Int)]()
+        keyed.reserveCapacity(programs.count)
+        for (offset, program) in programs.enumerated() {
+            keyed.append((program.start, offset))
+        }
+        keyed.sort { $0.start != $1.start ? $0.start < $1.start : $0.offset < $1.offset }
+        var sorted = [EPGProgram]()
+        sorted.reserveCapacity(programs.count)
+        for key in keyed {
+            sorted.append(programs[key.offset])
+        }
+        return sorted
     }
 
     /// Stable merge of two lists sorted by start (`first` wins ties).
@@ -303,15 +370,15 @@ public struct EPGGuide: Sendable {
     ) -> [String: String] {
         guard !ids.isEmpty else { return existing }
         // Below this size the serial loop beats the partition/merge overhead.
-        guard ids.count >= 8_192 else {
+        guard ids.count >= 1_024 else {
             var index = existing
             index.reserveCapacity(existing.count + ids.count * 2)
             collectNameKeys(ids: ids[...], names: names, into: &index)
             return index
         }
-        // ~4k ids per partition, capped at 8 workers: enough parallelism for cold
+        // ~2k ids per partition, capped at 8 workers: enough parallelism for cold
         // name folds without tiny slices paying merge overhead.
-        let partitions = min(8, (ids.count + 4_095) / 4_096)
+        let partitions = min(8, max(2, (ids.count + 1_999) / 2_000))
         let bounds = (0...partitions).map { $0 * ids.count / partitions }
         let partials = Mutex<[Int: [String: String]]>([:])
         DispatchQueue.concurrentPerform(iterations: partitions) { partition in

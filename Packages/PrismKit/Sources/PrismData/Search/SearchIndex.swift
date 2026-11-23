@@ -120,6 +120,7 @@ public final class SearchIndex: Sendable {
 
     @concurrent
     public static func build(from catalog: Catalog, recommendations: Recommendations = .empty) async -> SearchIndex {
+        let buildStart = ContinuousClock.now
         let channels = catalog.channels, movies = catalog.movies, series = catalog.series
         let total = channels.count + movies.count + series.count
         guard total > 0, !Task.isCancelled else { return .empty }
@@ -165,6 +166,8 @@ public final class SearchIndex: Sendable {
             return result.sorted { $0.start < $1.start }
         }
         guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search describe+fold chunks (parallel)", since: buildStart)
+        let mergeStart = ContinuousClock.now
         let baseScores = chunks.flatMap(\.baseScores)
 
         // Names, global word ids (only chunk-unique words hit the shared dictionary).
@@ -204,6 +207,8 @@ public final class SearchIndex: Sendable {
                 entryWordOffsets.append(cursor)
             }
         }
+        BuildProfile.mark("search word-id merge", since: mergeStart)
+        let sortStart = ContinuousClock.now
 
         // Flatten unique words by id, then sort ids bytewise.
         var idBytes: [UInt8] = []
@@ -235,6 +240,8 @@ public final class SearchIndex: Sendable {
         }
         let entryWords = entryWordIDs.map { rankOfID[Int($0)] }
         guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search unique-word sort+rank", since: sortStart)
+        let postingsStart = ContinuousClock.now
 
         // Posting lists (counting sort by rank; entries stay ascending inside each list).
         var counts = [Int32](repeating: 0, count: order.count + 1)
@@ -269,6 +276,7 @@ public final class SearchIndex: Sendable {
             }
             wordMasks[rank] = mask
         }
+        BuildProfile.mark("search postings+masks", since: postingsStart)
 
         return SearchIndex(
             channels: channels, movies: movies, series: series,

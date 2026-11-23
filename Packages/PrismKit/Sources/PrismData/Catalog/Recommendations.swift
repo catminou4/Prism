@@ -143,9 +143,44 @@ public enum RecommendationBuilder {
     @concurrent private static func fallback(
         _ titles: [MediaTitle], choices: [Set<HomeAudioLanguage>], catalog: Catalog, excluding excluded: Set<TitleID>
     ) async -> [Set<HomeAudioLanguage>: [MediaTitle]] {
+        // The per-title audio scan dominates on large catalogs: chunk it like
+        // `CurationIndex.signals` and concatenate chunk results in order so candidate
+        // order (and `topIndices` tie-breaking) is identical to the serial loop.
+        let chunk = 8_192
+        let ranges = stride(from: 0, to: titles.count, by: chunk).map { $0..<min($0 + chunk, titles.count) }
+        var cancelled = false
+        let candidates: [(rank: (score: Double, index: Int32), audio: Set<HomeAudioLanguage>)] =
+            await withTaskGroup(of: (Int, [(rank: (score: Double, index: Int32), audio: Set<HomeAudioLanguage>)]?).self) { group in
+                for (offset, range) in ranges.enumerated() {
+                    group.addTask {
+                        (offset, scanFallback(titles, in: range, catalog: catalog, excluding: excluded))
+                    }
+                }
+                var parts = [[(rank: (score: Double, index: Int32), audio: Set<HomeAudioLanguage>)]?](repeating: nil, count: ranges.count)
+                for await (offset, part) in group {
+                    if part == nil { cancelled = true }
+                    parts[offset] = part ?? []
+                }
+                return parts.flatMap { $0 ?? [] }
+            }
+        // A chunk observing cancellation fails the whole scan, like the serial loop.
+        if cancelled { return [:] }
+        return Dictionary(uniqueKeysWithValues: choices.map { languages in
+            let eligible = candidates.lazy.filter { !$0.audio.isDisjoint(with: languages) }.map(\.rank)
+            let indices = CatalogBuilder.topIndices(eligible, count: 24)
+            return (languages, indices.map { titles[Int($0)] })
+        })
+    }
+
+    /// `nil` when cancelled mid-scan (serial semantics: the whole fallback returns `[:]`).
+    private static func scanFallback(
+        _ titles: [MediaTitle], in range: Range<Int>, catalog: Catalog, excluding excluded: Set<TitleID>
+    ) -> [(rank: (score: Double, index: Int32), audio: Set<HomeAudioLanguage>)]? {
         var candidates: [(rank: (score: Double, index: Int32), audio: Set<HomeAudioLanguage>)] = []
-        for (index, item) in titles.enumerated() {
-            if index.isMultiple(of: 2_048), Task.isCancelled { return [:] }
+        candidates.reserveCapacity(range.count / 4)
+        for index in range {
+            if index.isMultiple(of: 2_048), Task.isCancelled { return nil }
+            let item = titles[index]
             guard let rating = item.rating, (7...10).contains(rating), !item.isAdult,
                   item.$posterURL != nil || item.$backdropURL != nil, !excluded.contains(item.id) else { continue }
             let audio = availableAudio(for: item, original: nil, catalog: catalog)
@@ -153,11 +188,7 @@ public enum RecommendationBuilder {
             let score = rating * 1_000 + (item.$posterURL == nil ? 0 : 10) + Double(min(item.variants.count, 9))
             candidates.append(((score, Int32(index)), audio))
         }
-        return Dictionary(uniqueKeysWithValues: choices.map { languages in
-            let eligible = candidates.lazy.filter { !$0.audio.isDisjoint(with: languages) }.map(\.rank)
-            let indices = CatalogBuilder.topIndices(eligible, count: 24)
-            return (languages, indices.map { titles[Int($0)] })
-        })
+        return candidates
     }
 
     private static func homePlot(for title: MediaTitle) -> String? {
@@ -219,8 +250,16 @@ public enum RecommendationBuilder {
 
     static func hasLatinTitle(_ title: String) -> Bool {
         var hasLetters = false
-        for scalar in title.unicodeScalars where scalar.properties.isAlphabetic {
-            switch scalar.value {
+        for scalar in title.unicodeScalars {
+            let value = scalar.value
+            if value < 0x80 {
+                // ASCII letters are exactly A–Z/a–z, all inside the accepted ranges;
+                // every other ASCII scalar fails `isAlphabetic` and is skipped.
+                if (0x41...0x5A).contains(value) || (0x61...0x7A).contains(value) { hasLetters = true }
+                continue
+            }
+            guard scalar.properties.isAlphabetic else { continue }
+            switch value {
             case 0x41...0x7A, 0xC0...0x24F, 0x1E00...0x1EFF: hasLetters = true
             default: return false
             }

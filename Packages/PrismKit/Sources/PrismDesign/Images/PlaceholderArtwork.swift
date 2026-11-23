@@ -19,13 +19,23 @@ public struct PlaceholderArtwork: View {
     private let title: String?
     private let style: TitleStyle
     private let palette: Palette
+    /// Precomputed `Monogram.initials` for the monogram/channel-logo styles — the `label`
+    /// builder would otherwise re-split the title on every `body` pass of every tile.
+    private let initials: String
 
     public init(seed: String, title: String? = nil, style: TitleStyle = .title) {
-        self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let resolvedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.title = resolvedTitle
         self.style = title == nil ? .none : style
         // Computed once per view instead of on every `body` evaluation (the palette only
         // depends on the seed, which never changes for a given placeholder).
         palette = Palette(seed: seed)
+        switch style {
+        case .monogram, .channelLogo:
+            initials = resolvedTitle.map { Monogram.initials(from: $0) } ?? ""
+        case .title, .none:
+            initials = ""
+        }
     }
 
     public var body: some View {
@@ -71,14 +81,14 @@ public struct PlaceholderArtwork: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 22)
             case .monogram:
-                Text(Monogram.initials(from: title))
+                Text(initials)
                     .font(.system(size: 120, weight: .medium))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .minimumScaleFactor(0.05)
                     .padding(22)
             case .channelLogo:
-                Text(Monogram.initials(from: title))
+                Text(initials)
                     .font(.system(size: 26, weight: .medium))
                     .foregroundStyle(.white.opacity(0.58))
                     .lineLimit(1)

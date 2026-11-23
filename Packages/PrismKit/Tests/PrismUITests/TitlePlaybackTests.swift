@@ -162,6 +162,53 @@ struct TitlePlaybackTests {
         #expect(inventory.nextEpisode(after: candidate, isWatched: { _ in false }) == episodes[2])
     }
 
+    @Test func finishedProgressFallsBackToEarlierUnwatchedWhenTheTailIsWatched() async throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let series = Series(sourceID: source.id, nativeID: "series", title: "Série")
+        let episodes = (1...4).map { number in
+            Episode(
+                seriesID: series.id, sourceID: source.id, nativeID: "e\(number)",
+                season: 1, number: number, title: "Épisode \(number)", streamURL: url
+            )
+        }
+        let inventory = await DetailEpisodeInventory.build(
+            edition: TitleEdition(variant: .series(series), source: source),
+            detail: SeriesDetail(seriesID: series.id, seasons: [Season(number: 1, episodes: episodes)])
+        )
+        // e3 finished, e4 watched: the forward scan fails, so the resume fallback
+        // must still find the earliest unwatched episode before the progress point.
+        let finished = PlaybackProgress(contentID: episodes[2].id, position: 1_800, duration: 1_800)
+        #expect(inventory.nextEpisode(after: finished, isWatched: { $0 == episodes[2].id || $0 == episodes[3].id }) == episodes[0])
+    }
+
+    @Test func finishedProgressFallsBackToASpecialWhenNothingElseIsUnwatched() async throws {
+        let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
+        let source = Source(name: "Source", kind: .m3uURL)
+        let series = Series(sourceID: source.id, nativeID: "series", title: "Série")
+        let special = Episode(
+            seriesID: series.id, sourceID: source.id, nativeID: "special",
+            season: 0, number: 1, title: "Spécial", streamURL: url
+        )
+        let episodes = (1...2).map { number in
+            Episode(
+                seriesID: series.id, sourceID: source.id, nativeID: "e\(number)",
+                season: 1, number: number, title: "Épisode \(number)", streamURL: url
+            )
+        }
+        let inventory = await DetailEpisodeInventory.build(
+            edition: TitleEdition(variant: .series(series), source: source),
+            detail: SeriesDetail(seriesID: series.id, seasons: [
+                Season(number: 0, episodes: [special]),
+                Season(number: 1, episodes: episodes),
+            ])
+        )
+        // Season order puts the special first; with every numbered episode watched the
+        // fallback returns the special rather than the catalogue's first episode.
+        let finished = PlaybackProgress(contentID: episodes[1].id, position: 1_800, duration: 1_800)
+        #expect(inventory.nextEpisode(after: finished, isWatched: { $0 == episodes[0].id || $0 == episodes[1].id }) == special)
+    }
+
     @Test func alternateEditionDiscardsWrongSourcesAndResolvesDuplicatesDeterministically() throws {
         let url = try #require(URL(string: "https://example.invalid/episode.mp4"))
         let source = Source(name: "Source", kind: .xtream)

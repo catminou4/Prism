@@ -41,6 +41,10 @@ final class VLCEngine: NSObject, PlaybackEngine {
     private var lastTimeChange = Date.distantPast
     private var lastVideoSize: CGSize = .zero
     private var nextTimeUpdate: ContinuousClock.Instant?
+    /// Pre-first-frame sampling cadence for `handleTimeChange`: libvlc can fire
+    /// time-changed at video rate while a stream is opening and every run costs
+    /// several libvlc calls on the main thread.
+    private var nextBodySample: ContinuousClock.Instant?
     private var nextMetadataPoll: ContinuousClock.Instant?
     private var nextTrackPoll: ContinuousClock.Instant?
     private var bufferingCheck: Task<Void, Never>?
@@ -96,6 +100,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         lastTimeChange = .distantPast
         lastVideoSize = .zero
         nextTimeUpdate = nil
+        nextBodySample = nil
         nextMetadataPoll = nil
         nextTrackPoll = nil
         trackCountsSignature = ""
@@ -537,7 +542,19 @@ final class VLCEngine: NSObject, PlaybackEngine {
         guard !isStopped else { return }
         let now = ContinuousClock.now
         let publishesTime = nextTimeUpdate.map { now >= $0 } ?? true
-        guard publishesTime || !didReportFirstFrame else { return }
+        // Before the first frame libvlc can fire time-changed at video rate and every
+        // run below costs several libvlc calls on the main thread (time, isPlaying,
+        // hasVideoOut, track counts…): sample the playhead at ~100 ms — ready,
+        // first-frame and stall detection don't need frame granularity. Once the
+        // first frame lands, the 250 ms emit gate already bounds the work.
+        let bodyDue: Bool
+        if didReportFirstFrame {
+            bodyDue = publishesTime
+        } else {
+            bodyDue = nextBodySample.map { now >= $0 } ?? true
+            if bodyDue { nextBodySample = now.advanced(by: .milliseconds(100)) }
+        }
+        guard bodyDue else { return }
         let ms = player.time.intValue
         if ms != lastTimeMs {
             lastTimeMs = ms

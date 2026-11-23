@@ -174,7 +174,16 @@ public actor ImagePipeline {
     public nonisolated func warm(_ urls: [URL], pixelSize: CGSize, fitting: Fitting = .fill) {
         guard !urls.isEmpty, let probe = Self.key(url: urls[0], pixelSize: pixelSize, fitting: fitting, blurRadius: 0) else { return }
         let target = probe.target
-        Task(priority: .utility) { await self.enqueueWarm(urls, target: target, fitting: fitting) }
+        Task(priority: .utility) {
+            // URL → provider-URL resolution is pure parsing (~4 µs per URL): keep it off the
+            // pipeline actor, which also serves on-screen `image(for:)` calls.
+            var requests: [ArtworkURL.Resolved] = []
+            requests.reserveCapacity(urls.count)
+            for url in urls where !url.isFileURL {
+                requests.append(ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false))
+            }
+            await self.enqueueWarm(requests)
+        }
     }
 
     /// Kept for API compatibility: prefetching now means warming the encoded bytes
@@ -442,10 +451,9 @@ public actor ImagePipeline {
             || (request.fallbackIsLarger && request.fallback.map { disk.contains($0) } ?? false)
     }
 
-    private func enqueueWarm(_ urls: [URL], target: CGSize, fitting: Fitting) {
+    private func enqueueWarm(_ requests: [ArtworkURL.Resolved]) {
         var fresh: [ArtworkURL.Resolved] = []
-        for url in urls where !url.isFileURL {
-            let request = ArtworkURL.resolve(url, target: target, fitting: fitting, fillsForBlur: false)
+        for request in requests {
             // Bytes already on disk make the warm-up pure churn (a detached task plus a
             // ~40 µs mmap read per URL on every scroll stop).
             guard dataInFlight[request.primary] == nil,

@@ -511,6 +511,82 @@ final class MockFactory {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
+    @Test func upNextVisibilityFollowsTheLast30Seconds() async throws {
+        let factory = MockFactory()
+        let controller = makeController(Self.vod, factory: factory)
+        controller.start()
+        factory.last?.start(duration: 600)
+        #expect(!controller.upNextVisible)
+
+        // Enters the last-30 s window on a regular time tick.
+        factory.last?.emit(.time(current: 575, buffered: 600))
+        #expect(controller.upNextVisible)
+        // Leaves it again (seek back / replay).
+        factory.last?.emit(.time(current: 560, buffered: 600))
+        #expect(!controller.upNextVisible)
+
+        // A seek publishes the flag synchronously, before the engine lands.
+        controller.seek(to: 580)
+        #expect(controller.upNextVisible)
+        try await waitForState { factory.last?.completedSeeks.contains(580) == true }
+        controller.seek(to: 100)
+        #expect(!controller.upNextVisible)
+        try await waitForState { factory.last?.completedSeeks.contains(100) == true }
+
+        // Playhead at the exact end while still "playing" hides the card
+        // (remaining == 0 only counts once the engine reports .ended).
+        controller.seek(to: 599)
+        try await waitForState { factory.last?.completedSeeks.contains(599) == true }
+        #expect(controller.upNextVisible)
+        factory.last?.emit(.time(current: 600, buffered: 600))
+        #expect(!controller.upNextVisible)
+        factory.last?.emit(.ended)
+        #expect(controller.phase == .ended)
+        #expect(controller.upNextVisible)
+
+        // Short films never show it, live never shows it.
+        let short = PlaybackItem(id: "short", url: URL(string: "http://h/m/u/p/2.mkv")!, title: "Court")
+        let shortController = PlayerController(
+            item: short, preferences: preferences, engineFactory: factory.make,
+            loadTimeout: .seconds(30), reconnectPolicy: .standard,
+            uptime: { ProcessInfo.processInfo.systemUptime })
+        shortController.start()
+        factory.last?.emit(.ready(duration: 45))
+        factory.last?.emit(.state(.playing))
+        factory.last?.emit(.firstFrame)
+        factory.last?.emit(.time(current: 40, buffered: 45))
+        #expect(!shortController.upNextVisible)
+        shortController.stop()
+
+        let liveController = makeController(Self.live, factory: factory)
+        liveController.start()
+        factory.last?.start(duration: nil)
+        factory.last?.emit(.time(current: 100, buffered: 100))
+        #expect(!liveController.upNextVisible)
+        liveController.stop()
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    @Test func upNextVisibleOnResumeNearEnd() {
+        // Resuming inside the last 30 s of a >60 s item shows the card as soon
+        // as the duration is known (.ready), without waiting for a time tick.
+        let item = PlaybackItem(
+            id: "resume", url: URL(string: "http://h/m/u/p/3.mkv")!, title: "Long",
+            startPosition: 580)
+        let factory = MockFactory()
+        let controller = PlayerController(
+            item: item, preferences: preferences, engineFactory: factory.make,
+            loadTimeout: .seconds(30), reconnectPolicy: .standard,
+            uptime: { ProcessInfo.processInfo.systemUptime })
+        controller.start()
+        #expect(controller.currentTime == 580)
+        factory.last?.emit(.ready(duration: 600))
+        #expect(controller.upNextVisible)
+        controller.stop()
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
     @Test func controlsStayVisibleWhilePausedAndStopReleasesEngines() {
         let factory = MockFactory()
         let controller = makeController(Self.vod, factory: factory)

@@ -172,9 +172,10 @@ struct FeedBuilder {
     /// extend a scan instead of re-filtering the whole ranking.
     private var candidateScans: [CandidateKey: CandidateScan] = [:]
     /// Per-kind scan context, built once per feed: the ranking positions that can still produce
-    /// candidates (language and dismissal filters are fixed for the builder's lifetime) and the
-    /// daily rotation noise of every title. Facet scans neither re-filter nor re-hash elements.
-    private var kindContexts: [MediaKind: KindContext] = [:]
+    /// candidates (language and dismissal filters are fixed for the builder's lifetime).
+    /// Facet scans neither re-filter nor re-hash elements. Facet membership bitmaps come from
+    /// `CurationIndex` (`facetMask`), precomputed once per catalogue.
+    private var kindPools: [MediaKind: [Int32]] = [:]
 
     init(
         catalog: Catalog, index: CurationIndex, recommendations: Recommendations, languages: Set<HomeAudioLanguage>,
@@ -194,7 +195,8 @@ struct FeedBuilder {
 
     private var currentYear: Int { index.currentYear }
     /// Demo, a single M3U list: too few titles for distribution or release-year signals to mean much.
-    private var isSmall: Bool { index.movieRanking.count + index.seriesRanking.count < 400 }
+    /// Delegates to the index so facet masks and facet scores can never disagree on the threshold.
+    private var isSmall: Bool { index.isSmallCatalog }
     /// Small catalogues still deserve full shelves.
     private var minimumShelf: Int { isSmall ? 4 : 8 }
 
@@ -459,15 +461,6 @@ struct FeedBuilder {
         }
     }
 
-    /// What every facet scan of one kind shares: `pool` holds the ranking's catalogue indices in
-    /// ranking order after the builder-constant language/dismissal filters; `jitters` the daily
-    /// rotation noise of each catalogue index, filled on the first jitter-using facet scan
-    /// (only pool positions are filled, empty until then).
-    private struct KindContext {
-        var pool: [Int32]
-        var jitters: [Float] = []
-    }
-
     /// Ranked catalogue positions matching a query, before presentation.
     /// Scans are memoized per (kind set, facet) and extended lazily to the depth each limit
     /// needs; results are identical to rescanning because nothing but `limit` varies between
@@ -494,27 +487,31 @@ struct FeedBuilder {
 
         // Extend each kind's filtered scan to the depth this request needs (or to exhaustion
         // for facets that do not follow the general ranking). The pool already applied the
-        // language/dismissal filters, so every visited element only needs its facet score.
+        // language/dismissal filters; the facet bitmap skips elements `member` would reject,
+        // so every visited element only needs its facet score.
+        let usesJitter = query.facet.usesJitter
         for kindIndex in scan.kinds.indices {
             let target = followsGeneral ? poolLimit : Int.max
             guard !scan.kinds[kindIndex].exhausted,
                   scan.kinds[kindIndex].candidates.count < target else { continue }
             let kind = scan.kinds[kindIndex].kind
-            var context = kindContext(for: kind)
-            if query.facet.usesJitter, context.jitters.isEmpty {
-                context.jitters = jitterTable(kind: kind, pool: context.pool, signalCount: index.signals(kind).count)
-                kindContexts[kind] = context
-            }
-            let pool = context.pool
-            let jitters = context.jitters
+            let pool = kindPool(for: kind)
+            let mask = index.facetMask(kind: kind, facet: query.facet)
             let signals = index.signals(kind)
             while scan.kinds[kindIndex].rankPosition < pool.count,
                   scan.kinds[kindIndex].candidates.count < target {
                 let titleIndex = pool[scan.kinds[kindIndex].rankPosition]
                 scan.kinds[kindIndex].rankPosition += 1
+                if let mask {
+                    let bit = Int(titleIndex)
+                    guard mask[bit >> 6] & (UInt64(1) << UInt64(bit & 63)) != 0 else { continue }
+                }
+                // Daily rotation noise is a pure hash: computing it inline beats a random
+                // access into a catalog-sized Float table (and its allocation) per feed.
                 guard let facetScore = score(
                     signals[Int(titleIndex)], kind: kind, index: titleIndex,
-                    jitter: jitters.isEmpty ? 0 : jitters[Int(titleIndex)], for: query.facet, seed: seed
+                    jitter: usesJitter ? noise(kind: kind, index: titleIndex) * 0.035 : 0,
+                    for: query.facet, seed: seed
                 ) else { continue }
                 scan.kinds[kindIndex].candidates.append(Candidate(score: facetScore, kind: kind, index: titleIndex))
             }
@@ -546,9 +543,11 @@ struct FeedBuilder {
         return scored
     }
 
-    /// Ranking context of one kind, built on first use and shared by every facet scan.
-    private mutating func kindContext(for kind: MediaKind) -> KindContext {
-        if let context = kindContexts[kind] { return context }
+    /// Ranking context of one kind, built on first use and shared by every facet scan:
+    /// the ranking's catalogue indices in ranking order after the builder-constant
+    /// language/dismissal filters.
+    private mutating func kindPool(for kind: MediaKind) -> [Int32] {
+        if let pool = kindPools[kind] { return pool }
         let ranking = index.ranking(kind)
         let signals = index.signals(kind)
         // Dismissed titles as catalogue indices: `TitleID` lookups happen once per kind instead
@@ -574,19 +573,8 @@ struct FeedBuilder {
                     && !(dismissed?.contains(titleIndex) ?? false)
             }
         }
-        let context = KindContext(pool: pool)
-        kindContexts[kind] = context
-        return context
-    }
-
-    /// Daily rotation noise of every pool position, computed once per kind on the first
-    /// jitter-using facet scan instead of once per element per facet.
-    private func jitterTable(kind: MediaKind, pool: [Int32], signalCount: Int) -> [Float] {
-        var jitters = [Float](repeating: 0, count: signalCount)
-        for titleIndex in pool {
-            jitters[Int(titleIndex)] = noise(kind: kind, index: titleIndex) * 0.035
-        }
-        return jitters
+        kindPools[kind] = pool
+        return pool
     }
 
     /// Top `limit` candidates across the per-kind pools, best first. Equivalent to running
@@ -619,102 +607,73 @@ struct FeedBuilder {
         return top
     }
 
-    /// Facet-specific score, or `nil` when the title does not belong to the facet. `jitter` is the
-    /// title's daily rotation noise, precomputed once per kind in `kindContext`.
+    /// Facet membership: every rejection condition of the former `score`. Signal-only facets
+    /// delegate to `CurationIndex.facetMember` — the same guard its precomputed bitmaps encode,
+    /// so a bit test can never disagree with what `score` would return.
+    private func member(
+        _ signal: TitleSignals, kind: MediaKind, index titleIndex: Int32,
+        for facet: CurationQuery.Facet,
+        seed: (id: TitleID, kind: MediaKind, signals: TitleSignals)?
+    ) -> Bool {
+        switch facet {
+        case .forYou:
+            let isGeneral = signal.flags.isDisjoint(with: [.kids, .regional])
+            guard isGeneral, !affinity.isEmpty, !affinity.known.contains(titleKey(kind, titleIndex)) else { return false }
+            return affinity.match(signal) > 0.15
+        case .because:
+            guard let seed, seed.kind == kind, seed.id != titleAt(kind, titleIndex).id,
+                  signal.flags.contains(.kids) == seed.signals.flags.contains(.kids), !signal.flags.contains(.regional)
+            else { return false }
+            return Self.similarity(seed.signals, signal) > 0.25
+        default:
+            return index.facetMember(signal, kind: kind, facet: facet)
+        }
+    }
+
+    /// Facet-specific score, or `nil` when the title does not belong to the facet (`member` holds
+    /// every rejection condition). `jitter` is the title's daily rotation noise, computed inline
+    /// by the caller for jitter-using facets.
     private func score(
         _ signal: TitleSignals, kind: MediaKind, index titleIndex: Int32, jitter: Float,
         for facet: CurationQuery.Facet,
         seed: (id: TitleID, kind: MediaKind, signals: TitleSignals)?
     ) -> Float? {
-        let isGeneral = signal.flags.isDisjoint(with: [.kids, .regional])
+        guard member(signal, kind: kind, index: titleIndex, for: facet, seed: seed) else { return nil }
         let year = Int(signal.year)
         switch facet {
         case .top:
-            // A chart is about reach first: international distribution, then quality and freshness.
-            guard isGeneral, isSmall || (year >= currentYear - 2 && signal.editions >= 3) else { return nil }
-            let reach = min(log2(1 + Float(signal.editions)) / 4, 1)
             let quality = min(max((signal.quality - 5.6) / 2.8, 0), 1)
             let freshness: Float = year >= currentYear ? 1 : (year == currentYear - 1 ? 0.75 : (year == currentYear - 2 ? 0.45 : 0.2))
-            return 0.55 * reach + 0.3 * quality + 0.15 * freshness
-        case .newReleases:
-            let isRecent = year >= currentYear - 1 || (signal.flags.contains(.newRelease) && year >= currentYear - 2)
-            // Small lists have few recent releases: what the provider added this month is the news.
-            let justAdded = isSmall && signal.addedDay > 0 && index.catalogDay - signal.addedDay <= 30
-            guard isGeneral, isRecent || justAdded else { return nil }
+            return 0.55 * reach(signal) + 0.3 * quality + 0.15 * freshness
+        case .newReleases, .platform, .french, .franchise, .uhd, .asian, .discover:
             return signal.score + jitter
         case .forYou:
-            guard isGeneral, !affinity.isEmpty, !affinity.known.contains(titleKey(kind, titleIndex)) else { return nil }
-            let match = affinity.match(signal)
-            guard match > 0.15 else { return nil }
-            return signal.score * 0.6 + match * 0.5 + jitter
+            // `member` applied the > 0.15 gate; `match` is pure, so recomputing gives the same value.
+            return signal.score * 0.6 + affinity.match(signal) * 0.5 + jitter
         case .because:
-            guard let seed, seed.kind == kind, seed.id != titleAt(kind, titleIndex).id,
-                  signal.flags.contains(.kids) == seed.signals.flags.contains(.kids), !signal.flags.contains(.regional)
-            else { return nil }
+            guard let seed else { return nil } // unreachable: `member` verified the seed
             let similarity = Self.similarity(seed.signals, signal)
-            guard similarity > 0.25 else { return nil }
             return similarity * 0.65 + signal.score * 0.45
-        case .genre(let genre):
-            guard signal.genres.contains(genre), !signal.flags.contains(.regional) else { return nil }
-            if signal.flags.contains(.kids), genre != .family, genre != .animation { return nil }
+        case .genre:
             // Titles whose genre list is short are the genre's purest representatives.
             let purity = 1 / Float(max(signal.genres.count, 1))
             return signal.score + 0.05 * purity + jitter
-        case .platform(let platform):
-            guard signal.platforms.contains(platform), isGeneral else { return nil }
-            return signal.score + jitter
         case .acclaimed:
-            guard !signal.flags.contains(.regional), !signal.flags.contains(.kids) else { return nil }
             let isCanon = signal.flags.contains(.canon)
-            guard isCanon || (signal.quality >= 7.0 && signal.editions >= 2
-                  && (signal.flags.contains(.acclaimed) || signal.isEditorial || (signal.quality >= 7.8 && signal.editions >= 10)))
-            else { return nil }
-            // Recognised works lead; provider "Top IMDb" sections fill in behind them.
             return signal.quality / 10 + 0.2 * reach(signal) + (isCanon ? 0.25 : 0) + (signal.isEditorial ? 0.08 : 0) + jitter
         case .classics:
-            guard isGeneral, year > 0, year <= currentYear - 25,
-                  signal.quality >= 6.9 || signal.flags.contains(.canon) else { return nil }
             return signal.quality / 10 + 0.35 * reach(signal) + (signal.flags.contains(.canon) ? 0.2 : 0)
                 + (signal.flags.contains(.classic) ? 0.04 : 0) + jitter
-        case .french:
-            guard signal.flags.contains(.frenchOrigin) || (signal.isEditorial && recommendations.editorialCopy[titleAt(kind, titleIndex).id]?.originalLanguage == .french),
-                  !signal.flags.contains(.kids) else { return nil }
-            return signal.score + jitter
         case .hiddenGems:
-            // Well rated but not everywhere. Near-perfect provider ratings are a handful of votes,
-            // and seasonal TV films are not what anyone means by a gem.
-            guard isGeneral, signal.quality >= 7.0, (2...6).contains(signal.editions), year >= currentYear - 20,
-                  (70...90).contains(signal.rating10), !signal.flags.contains(.christmas), !signal.flags.contains(.canon),
-                  !signal.genres.contains(.family) || signal.genres.contains(.animation) else { return nil }
             return signal.quality / 10 + 0.05 * reach(signal) + jitter
         case .popular:
-            guard isGeneral, isSmall || signal.editions >= 4 || signal.flags.contains(.canon) else { return nil }
             let quality = min(max((signal.quality - 5.6) / 2.8, 0), 1)
             return 0.55 * reach(signal) + 0.3 * quality + (signal.flags.contains(.canon) ? 0.22 : 0) + jitter
         case .topRated:
-            // Provider ratings come without vote counts. Averages above 9 for films, and above 9 for
-            // series (rounded to whole points), are nearly always a handful of votes.
-            let plausible: ClosedRange<UInt8> = kind == .series ? 80...90 : 72...89
-            guard isGeneral, isSmall || signal.editions >= 3 || signal.flags.contains(.canon),
-                  signal.quality >= 7.2 || signal.flags.contains(.canon), plausible.contains(signal.rating10) else { return nil }
             return signal.quality / 10 + 0.15 * reach(signal) + (signal.flags.contains(.canon) ? (kind == .series ? 0.2 : 0.1) : 0) + jitter
-        case .decade(let start):
-            guard isGeneral, year >= start, year < start + 10 else { return nil }
+        case .decade:
             let quality = min(max((signal.quality - 5.6) / 2.8, 0), 1)
             return 0.5 * quality + 0.4 * reach(signal) + (signal.flags.contains(.canon) ? 0.15 : 0) + jitter
-        case .franchise:
-            guard isGeneral, signal.flags.contains(.franchise) else { return nil }
-            return signal.score + jitter
-        case .uhd:
-            guard isGeneral, signal.flags.contains(.uhd) else { return nil }
-            return signal.score + jitter
-        case .asian:
-            guard signal.flags.contains(.asian) || signal.genres.contains(.anime) && kind == .movie,
-                  !signal.flags.contains(.kids), !signal.flags.contains(.regional) else { return nil }
-            return signal.score + jitter
-        case .discover:
-            guard !signal.flags.contains(.regional) else { return nil }
-            return signal.score + jitter
         }
     }
 

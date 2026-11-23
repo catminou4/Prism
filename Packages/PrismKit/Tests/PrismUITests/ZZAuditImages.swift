@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 
 /// ZZAudit — offscreen measurements for the REMAINING image-pipeline issues.
 /// Prints timings; assertions are sanity checks only.
-@Suite("ZZAudit images")
+@Suite("ZZAudit images", .disabled(if: ProcessInfo.processInfo.environment["ZZAUDIT"] == nil))
 struct ZZAuditImages {
 
     // MARK: Fixture helpers (same style as ImagePipelineTests)

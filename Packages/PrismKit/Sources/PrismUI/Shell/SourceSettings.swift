@@ -78,6 +78,10 @@ struct SourceDetailView: View {
                 .padding(.vertical, 24)
             }
             .prismScrollPhase()
+            // Les comptages par source sont calculés à la demande (une passe
+            // @concurrent sur tout le catalogue) : cette fiche est leur seule
+            // lectrice, on les prépare à l'ouverture et après chaque republication.
+            .task(id: app.catalogRevision) { app.prepareSourceCounts() }
             .sheet(isPresented: $editing) { EditSourceSheet(source: source) }
             .sheet(isPresented: $filteringCategories) {
                 SourceCategorySheet(

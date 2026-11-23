@@ -64,6 +64,34 @@ struct StoreTests {
         #expect(await cache.load(F.a) == nil)
     }
 
+    /// Archives flagged `titlesRefined` skip the per-title migration pass on decode;
+    /// archives written before the flag existed (no key → `nil`) still get it.
+    @Test func catalogCacheTitleRefinementFlag() async throws {
+        let rawTitle = "Narcos SPANISH MULTI SUB"
+        let catalog = SourceCatalog(sourceID: F.a, movies: [F.movie(F.a, "1", rawTitle)])
+
+        // New archives carry the flag: the stored title round-trips untouched.
+        let flagged = try await CatalogCache.encode(catalog, version: CatalogCache.formatVersion)
+        let flaggedSegments = try #require(SegmentedArchive.unpack(flagged, version: CatalogCache.formatVersion))
+        let flaggedMeta = try #require(SegmentedArchive.decodeSegment(CatalogCache.Meta.self, from: flaggedSegments[0]))
+        #expect(flaggedMeta.titlesRefined == true)
+        let decodedFlagged = try #require(await CatalogCache.decode(flagged, version: CatalogCache.formatVersion))
+        #expect(decodedFlagged.movies.first?.title == rawTitle)
+
+        // Legacy archive: same payload, meta without the flag → decode refines once.
+        let legacyMeta = CatalogCache.Meta(
+            sourceID: F.a, categories: [], account: nil, fetchedAt: F.reference,
+            channelCount: 0, movieCount: 1, seriesCount: 0, titlesRefined: nil
+        )
+        let metaSegment = try SegmentedArchive.encodeSegment(legacyMeta, tag: 0)
+        let movieSegments = try await SegmentedArchive.encodeChunks(
+            catalog.movies, tag: CatalogCache.Tag.movies.rawValue, chunkSize: CatalogCache.chunkSize
+        )
+        let legacy = SegmentedArchive.pack([metaSegment] + movieSegments, version: CatalogCache.formatVersion)
+        let decodedLegacy = try #require(await CatalogCache.decode(legacy, version: CatalogCache.formatVersion))
+        #expect(decodedLegacy.movies.first?.title == "Narcos")
+    }
+
     @Test func corruptedCacheIsIgnored() async throws {
         let directories = AppDirectories.temporary()
         defer { try? FileManager.default.removeItem(at: directories.root.deletingLastPathComponent()) }

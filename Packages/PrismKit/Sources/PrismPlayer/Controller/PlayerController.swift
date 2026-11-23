@@ -71,6 +71,10 @@ public final class PlayerController {
     public private(set) var subtitleStyle: SubtitleStyle
     /// Programme airing on the live channel (progress in the scrubber, top title).
     public var liveProgramme: LiveProgramme?
+    /// Whether the "Épisode suivant" card should be on screen: last 30 s of a VOD item
+    /// (or the ended state). Published as a Bool so the up-next host doesn't subscribe
+    /// to the 4 Hz clock for a card that is hidden almost all of the time.
+    public private(set) var upNextVisible = false
 
     public let preferences: PlayerPreferences
     /// AVPlayer of the current engine, for the AirPlay route picker (nil with VLC).
@@ -443,9 +447,12 @@ public final class PlayerController {
         switch event {
         case .ready(let engineDuration):
             attemptReady = true
-            if !item.isLive, let engineDuration, engineDuration > 0 { duration = engineDuration }
+            if !item.isLive, let engineDuration, engineDuration > 0, duration != engineDuration {
+                duration = engineDuration
+            }
             if !playRequested { loadTimeoutTask?.cancel() }
             refreshTracks()
+            refreshUpNextVisibility()
         case .time(let current, let buffered):
             handleTime(current: current, buffered: buffered)
         case .state(let state):
@@ -510,6 +517,7 @@ public final class PlayerController {
            let duration, progressThrottle.shouldReport(at: now) {
             onProgress?(currentTime, duration)
         }
+        refreshUpNextVisibility()
     }
 
     private func handleState(_ state: EnginePlaybackState) {
@@ -641,11 +649,17 @@ public final class PlayerController {
 
     private func refreshTracks() {
         guard let engine else { return }
-        audioTracks = engine.audioTracks
-        subtitleTracks = engine.subtitleTracks
+        // `.ready` can fire twice on VLC (the duration arrives late): only publish
+        // real changes so menus and pickers don't re-render on identical arrays.
+        let audio = engine.audioTracks
+        if audioTracks != audio { audioTracks = audio }
+        let subtitles = engine.subtitleTracks
+        if subtitleTracks != subtitles { subtitleTracks = subtitles }
         applyAutoSelectionIfNeeded()
-        selectedAudioID = engine.selectedAudioID
-        selectedSubtitleID = engine.selectedSubtitleID
+        let audioID = engine.selectedAudioID
+        if selectedAudioID != audioID { selectedAudioID = audioID }
+        let subtitleID = engine.selectedSubtitleID
+        if selectedSubtitleID != subtitleID { selectedSubtitleID = subtitleID }
     }
 
     private func applyAutoSelectionIfNeeded() {
@@ -715,6 +729,8 @@ public final class PlayerController {
     }
 
     public func seek(to seconds: TimeInterval) {
+        // NaN/∞ would poison `currentTime` (every comparison downstream goes false).
+        guard seconds.isFinite else { return }
         _ = beginSeek(target: clampedSeekTarget(seconds))
     }
 
@@ -727,6 +743,7 @@ public final class PlayerController {
     private func beginSeek(target: TimeInterval) -> Bool {
         guard canSeek, let engine else { return false }
         currentTime = target
+        refreshUpNextVisibility()
         if phase == .ended { setPhase(.paused) }
         reportProgress()
         seekTask?.cancel()
@@ -959,6 +976,23 @@ public final class PlayerController {
         let playing = playRequested && (newPhase == .playing || newPhase == .buffering)
         autoHide.setPlaying(playing, at: uptime())
         applyControlsVisibility()
+        refreshUpNextVisibility()
+    }
+
+    /// Mirrors `PlayerUpNextHost`'s visibility rule: the "Épisode suivant" card owns
+    /// the last 30 s of a VOD item (or the ended state). Recomputed wherever its
+    /// inputs change — `currentTime` ticks, phase transitions, seeks, duration/ready.
+    private func refreshUpNextVisibility() {
+        let visible: Bool
+        if item.isLive {
+            visible = false
+        } else if let duration, duration > 60 {
+            let remaining = max(0, duration - currentTime)
+            visible = remaining <= 30 && (remaining > 0 || phase == .ended)
+        } else {
+            visible = false
+        }
+        if upNextVisible != visible { upNextVisible = visible }
     }
 
     // MARK: - Feedback & progress
@@ -1086,6 +1120,7 @@ extension PlayerController {
             controller.feedbackCounter += 1
             controller.feedback = PlayerFeedback(id: controller.feedbackCounter, kind: feedback)
         }
+        controller.refreshUpNextVisibility()
         return controller
     }
 }

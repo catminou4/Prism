@@ -528,7 +528,24 @@ public final class LibraryStore {
     }
 
     private func pruneProgressIfNeeded() {
-        guard progress.count > Self.maxProgressEntries else { return }
+        let overflow = progress.count - Self.maxProgressEntries
+        guard overflow > 0 else { return }
+        // Mutations past the cap overflow by one entry at a time: a full sort of
+        // thousands of values ran on the main actor on EVERY playback tick. Drop the
+        // few oldest entries with linear scans instead (updatedAt ties were already
+        // arbitrary — `sorted` is not stable); large overflows (disk apply) still sort.
+        if overflow <= 8 {
+            for _ in 0..<overflow {
+                var oldest: (key: ContentID, updatedAt: Date)?
+                for (key, value) in progress {
+                    guard let current = oldest else { oldest = (key, value.updatedAt); continue }
+                    if value.updatedAt < current.updatedAt { oldest = (key, value.updatedAt) }
+                }
+                guard let drop = oldest else { break }
+                progress[drop.key] = nil
+            }
+            return
+        }
         let keep = progress.values.sorted { $0.updatedAt > $1.updatedAt }.prefix(Self.maxProgressEntries)
         progress = Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
     }
@@ -536,7 +553,26 @@ public final class LibraryStore {
     /// `watched` has no timestamps: entries without a progress entry are the oldest (progress
     /// itself keeps only the 3 000 most recent), then the oldest resume points go first.
     private func pruneWatchedIfNeeded() {
-        guard watched.count > Self.maxWatched else { return }
+        let overflow = watched.count - Self.maxWatched
+        guard overflow > 0 else { return }
+        // Same small-overflow fast path as `pruneProgressIfNeeded`: the drop candidate is
+        // the smallest progress-updatedAt (distantPast when absent), then — matching the
+        // sort's ascending rawValue tiebreak — the largest rawValue.
+        if overflow <= 8 {
+            for _ in 0..<overflow {
+                var oldest: (id: ContentID, date: Date)?
+                for id in watched {
+                    let date = progress[id]?.updatedAt ?? .distantPast
+                    guard let current = oldest else { oldest = (id, date); continue }
+                    if date < current.date || (date == current.date && id.rawValue > current.id.rawValue) {
+                        oldest = (id, date)
+                    }
+                }
+                guard let drop = oldest else { break }
+                watched.remove(drop.id)
+            }
+            return
+        }
         let ordered = watched.sorted { lhs, rhs in
             let l = progress[lhs]?.updatedAt ?? .distantPast
             let r = progress[rhs]?.updatedAt ?? .distantPast

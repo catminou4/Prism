@@ -100,6 +100,8 @@ public final class AppModel {
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var sourceCountsTask: Task<Void, Never>?
+    /// `catalogRevision` that produced the current `sourceCounts`, `nil` while stale.
+    @ObservationIgnored private var sourceCountsRevision: Int?
     @ObservationIgnored private var didBootstrap = false
     /// Guide refreshes in flight, one per source: concurrent requests for the same
     /// source share the task instead of downloading the XMLTV twice.
@@ -734,14 +736,12 @@ public final class AppModel {
         searchTask?.cancel()
         searchTask = nil
         // Comptages par source pour les fiches Sources : un seul passage sur le
-        // catalogue par publication, au lieu de 3 scans O(catalogue) par page.
+        // catalogue, mais seulement quand une fiche de source est ouverte
+        // (`prepareSourceCounts`) — plus de scan à chaque publication pour un
+        // écran que l'utilisateur ne visite pas toujours.
         sourceCountsTask?.cancel()
-        let countsRevision = catalogRevision
-        sourceCountsTask = Task { [weak self] in
-            let counts = await Self.countsBySource(in: built)
-            guard !Task.isCancelled, let self, self.catalogRevision == countsRevision else { return }
-            self.sourceCounts = counts
-        }
+        sourceCountsTask = nil
+        sourceCountsRevision = nil
     }
 
     /// One pass over the catalogue: how many grouped items offer a variant per
@@ -784,6 +784,22 @@ public final class AppModel {
             guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
             self.searchIndex = index
             self.searchTask = nil
+        }
+    }
+
+    /// Warm the per-source grouped counts when a source page opens — their only
+    /// reader (`SourceDetailView`). One background pass per catalog publish;
+    /// `sourceCounts` keeps the previous snapshot until the new one lands.
+    func prepareSourceCounts() {
+        guard sourceCountsTask == nil, sourceCountsRevision != catalogRevision else { return }
+        let catalog = self.catalog
+        let revision = catalogRevision
+        sourceCountsTask = Task(priority: .utility) { [weak self] in
+            let counts = await Self.countsBySource(in: catalog)
+            guard !Task.isCancelled, let self, self.catalogRevision == revision else { return }
+            self.sourceCounts = counts
+            self.sourceCountsRevision = revision
+            self.sourceCountsTask = nil
         }
     }
 

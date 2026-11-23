@@ -54,7 +54,8 @@ struct SearchScreen: View {
                     TitleShelf(title: "Films", items: result.movies)
                     TitleShelf(title: "Séries", items: result.series)
                     if !result.channels.isEmpty {
-                        Shelf(title: "Chaînes", items: result.channels, sizing: .wide) { channel in
+                        Shelf(title: "Chaînes", items: result.channels, sizing: .wide,
+                              posterArtwork: isActive ? \.logoURL : nil) { channel in
                             SearchChannelCard(channel: channel)
                         }
                     }
