@@ -3,6 +3,9 @@ import PrismDesign
 import SwiftUI
 
 struct DetailEpisodeTile: View {
+    /// Hover lift of the card (the playback overlay starts from the lifted card).
+    static let hoverScale: CGFloat = 1.025
+
     @Environment(\.prismCardWidth) private var cardWidth
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var plot: String?
@@ -11,6 +14,9 @@ struct DetailEpisodeTile: View {
     let artwork: URL?
     let progress: PlaybackProgress?
     let watched: Bool
+    /// Synopsis to show before the async resolution (the copy drawn by the playback overlay must
+    /// match the on-screen card from its first frame).
+    var initialPlot: String? = nil
     let onPlay: () -> Void
 
     private var title: String { metadata?.title ?? episode.title }
@@ -57,7 +63,7 @@ struct DetailEpisodeTile: View {
             }
             .contentShape(.rect)
         }
-        .buttonStyle(CardButtonStyle(hoverScale: 1.025))
+        .buttonStyle(CardButtonStyle(hoverScale: Self.hoverScale))
         .accessibilityLabel(accessibleName)
         .accessibilityValue(watched ? "Vu" : progress.map { $0.fraction.formatted(.percent.precision(.fractionLength(0))) + " regardé" } ?? "")
         .accessibilityHint("Afficher l’épisode et les options de lecture")
@@ -78,7 +84,7 @@ struct DetailEpisodeTile: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
-            Text(plot ?? "")
+            Text(plot ?? initialPlot ?? "")
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.75))
                 .lineLimit(2, reservesSpace: true)

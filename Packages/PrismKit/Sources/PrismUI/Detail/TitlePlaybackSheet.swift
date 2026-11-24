@@ -91,8 +91,15 @@ struct TitlePlaybackSheet: View {
         }
         // Always rubber-band, so pulling down zooms the hero artwork like on the detail page.
         .scrollBounceBehavior(.always)
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            abs(geometry.contentOffset.y + geometry.contentInsets.top) < 1
+        } action: { _, atRest in
+            hostOverlay?.heroAtRest = atRest
+        }
         .frame(width: size.width, height: size.height)
-        .background(PrismColors.pageBackground)
+        // In the overlay, the page colour is its panel's: the flying artwork shows through the
+        // hero band while it stands in for the hero.
+        .background(hostOverlay == nil ? PrismColors.pageBackground : .clear)
         .overlay(alignment: .topTrailing) {
             GlassCircleButton(systemName: "xmark", style: .dark, accessibilityLabel: "Fermer", action: cancel)
                 .keyboardShortcut(.cancelAction)
@@ -121,6 +128,7 @@ struct TitlePlaybackSheet: View {
                 backdropURLs: hero.landscapes, seed: hero.seed, fallbackPosterURLs: [hero.poster].compactMap { $0 },
                 leadingScrim: 0.75, artSize: size, placeholderImage: hostOverlay?.flightArtwork
             )
+            .opacity(hostOverlay?.showsHeroArtwork == false ? 0 : 1)
             .heroOverscrollZoom()
             .allowsHitTesting(false)
             heroInfo(selected: selected, width: min(620, size.width * 0.55))

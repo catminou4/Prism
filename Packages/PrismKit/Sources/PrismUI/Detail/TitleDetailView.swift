@@ -465,11 +465,17 @@ private struct TitleDetailContent: View {
         return DetailEpisodeTile(
             episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched
         ) {
-            choosePlayback(episode: episode, alwaysShowPicker: true, from: episodeFrames.frames[episode.id])
+            // The overlay opens from an exact copy of this card while the card itself is hidden.
+            let copy = DetailEpisodeTile(
+                episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched,
+                initialPlot: ProviderSynopsis.preferredFrenchOrEnglish(from: [metadata?.overview, episode.plot])
+            ) {}
+            choosePlayback(episode: episode, alwaysShowPicker: true, from: episodeFrames.frames[episode.id], card: copy)
         }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { [episodeFrames] frame in
             episodeFrames.frames[episode.id] = frame
         }
+        .opacity(playbackOverlay?.isShowingSource(episode.id) == true ? 0 : 1)
         .contextMenu {
             Button(watched ? "Marquer comme non vu" : "Marquer comme vu", systemImage: watched ? "circle" : "checkmark.circle") {
                 if watched {
@@ -618,7 +624,9 @@ private struct TitleDetailContent: View {
         }
     }
 
-    private func choosePlayback(episode: Episode?, alwaysShowPicker: Bool = false, from source: CGRect? = nil) {
+    private func choosePlayback(
+        episode: Episode?, alwaysShowPicker: Bool = false, from source: CGRect? = nil, card: DetailEpisodeTile? = nil
+    ) {
         let available = editions
         let options: [TitlePlaybackOption]
         let others: [TitleEdition]
@@ -640,7 +648,11 @@ private struct TitleDetailContent: View {
             )
             if let playbackOverlay {
                 let hero = playbackHero(for: episode)
-                playbackOverlay.present(from: source, artwork: hero.landscapes.first) { container in
+                // A clicked card is hover-lifted.
+                playbackOverlay.present(
+                    from: source, artwork: hero.landscapes.first, sourceID: episode?.id, sourceScale: card == nil ? 1 : DetailEpisodeTile.hoverScale,
+                    sourceView: card.map { $0.environment(\.prismCardWidth, source?.width) }
+                ) { container in
                     playbackSheet(selection, hero: hero, container: container)
                 }
             } else {
