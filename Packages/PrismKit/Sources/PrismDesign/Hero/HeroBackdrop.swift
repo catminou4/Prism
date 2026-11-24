@@ -70,11 +70,14 @@ public struct HeroBackdrop: View {
             if let placeholderImage {
                 // An already-decoded small copy of the artwork (e.g. the card that opened this
                 // hero): the full-resolution image then fades in over the same picture.
-                Image(decorative: placeholderImage, scale: 1)
-                    .resizable()
-                    .interpolation(.medium)
-                    .aspectRatio(contentMode: .fill)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                // Drawn in an overlay so the aspect-filled image never sizes the backdrop.
+                Color.clear
+                    .overlay(alignment: .top) {
+                        Image(decorative: placeholderImage, scale: 1)
+                            .resizable()
+                            .interpolation(.medium)
+                            .aspectRatio(contentMode: .fill)
+                    }
                     .clipped()
             } else {
                 PlaceholderArtwork(seed: seed, style: .none)

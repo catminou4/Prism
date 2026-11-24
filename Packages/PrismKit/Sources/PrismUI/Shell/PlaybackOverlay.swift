@@ -160,7 +160,7 @@ struct PlaybackOverlayHost: View {
 
 /// Draws, for one `progress` value (so every part stays in sync and the animation reverses):
 /// 1. a panel growing from the card to the sheet frame, its colour going from the card's dark
-///    fill to the page background, with a window-space shadow;
+///    fill to the page background, over a pre-rendered shadow scaled with it;
 /// 2. the card artwork flying from the card's image area into the hero band;
 /// 3. the sheet itself, laid out once at its final position, revealed inside the panel and faded
 ///    in on top of the flying artwork (same picture, so the hand-off is invisible).
@@ -184,6 +184,7 @@ private struct SheetTransition: ViewModifier, Animatable {
 
     private static let sheetRadius: CGFloat = 26
     private static let cardFill = Color(white: 0.10)
+    private static let shadowBleed: CGFloat = 64
 
     func body(content: Content) -> some View {
         let p = min(max(progress, 0), 1)
@@ -198,6 +199,21 @@ private struct SheetTransition: ViewModifier, Animatable {
         let reveal = card == nil ? p : Self.smoothstep(flies ? 0.58 : 0.05, flies ? 0.97 : 0.55, p)
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         ZStack(alignment: .topLeading) {
+            // Rasterised once at the final size, then only scaled to follow the panel: a
+            // transform, instead of re-blurring a resizing shape on every frame. The plate sits
+            // under the opaque panel, so only the shadow shows.
+            RoundedRectangle(cornerRadius: Self.sheetRadius, style: .continuous)
+                .fill(PrismColors.pageBackground)
+                .frame(width: target.width - 8, height: target.height - 8)
+                .shadow(color: .black.opacity(0.32), radius: 30, y: 14)
+                .padding(Self.shadowBleed)
+                .drawingGroup()
+                .padding(-Self.shadowBleed)
+                .scaleEffect(x: panel.width / target.width, y: panel.height / target.height, anchor: .topLeading)
+                .offset(x: panel.minX + 4 * panel.width / target.width, y: panel.minY + 4 * panel.height / target.height)
+                .opacity(Self.smoothstep(0, 0.5, p))
+                .allowsHitTesting(false)
+
             ZStack {
                 PrismColors.pageBackground
                 if card != nil {
@@ -206,7 +222,6 @@ private struct SheetTransition: ViewModifier, Animatable {
             }
             .frame(width: panel.width, height: panel.height)
             .clipShape(shape)
-            .background { shape.fill(.black).shadow(color: .black.opacity(0.3 * p), radius: 30, y: 14) }
             .offset(x: panel.minX, y: panel.minY)
             .opacity(panelOpacity)
             .allowsHitTesting(false)
@@ -234,7 +249,6 @@ private struct SheetTransition: ViewModifier, Animatable {
         )
         let to = CGRect(x: target.minX, y: target.minY, width: target.width, height: heroHeight)
         let frame = Self.lerp(from, to, p)
-        let bottomRadius = Self.lerp(PrismMetrics.wideRadius, 0, p)
         return Image(decorative: artwork, scale: 1)
             .resizable()
             .interpolation(.medium)
@@ -251,10 +265,9 @@ private struct SheetTransition: ViewModifier, Animatable {
                 )
                 .opacity(p)
             }
-            .clipShape(UnevenRoundedRectangle(
-                topLeadingRadius: radius, bottomLeadingRadius: bottomRadius,
-                bottomTrailingRadius: bottomRadius, topTrailingRadius: radius, style: .continuous
-            ))
+            // Uniform radius: a plain layer corner radius, not a mask pass. The bottom corners end
+            // under the opaque sheet, so they never need to square off.
+            .clipShape(.rect(cornerRadius: radius, style: .continuous))
             .offset(x: frame.minX, y: frame.minY)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
