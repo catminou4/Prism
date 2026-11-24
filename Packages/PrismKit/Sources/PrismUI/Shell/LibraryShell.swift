@@ -18,6 +18,7 @@ struct LibraryShell: View {
     private static let maxMountedSections = 6
     @State private var visibility = NavigationSplitViewVisibility.all
     @State private var isAddingSource = false
+    @State private var playbackOverlay = PlaybackOverlayModel()
 
     private var mountedSections: [SidebarItem] {
         let selection = navigation.selection
@@ -78,6 +79,10 @@ struct LibraryShell: View {
                 visited.removeAll { $0 == .source(id) }
             }
         }
+        .environment(\.playbackOverlay, playbackOverlay)
+        // The page underneath stays put (no scroll, no clicks) while the playback sheet is up.
+        .allowsHitTesting(!playbackOverlay.isPresented)
+        .overlay { PlaybackOverlayHost(model: playbackOverlay) }
         .background(alignment: .bottomLeading) { sectionShortcuts }
         .sheet(isPresented: $isAddingSource) {
             AddSourceView(onImported: { isAddingSource = false })

@@ -91,6 +91,10 @@ private struct TitleDetailContent: View {
     @State private var retryCount = 0
     @State private var browseEditionID: ContentID?
     @State private var playbackSelection: TitlePlaybackSelection?
+    @Environment(\.playbackOverlay) private var playbackOverlay
+    /// Latest on-screen frame of each episode card, so the playback sheet can grow out of it.
+    /// Not observed: scrolling updates it without re-evaluating the page.
+    @State private var episodeFrames = EpisodeFrames()
     /// Sizes the playback sheet relative to the page it covers.
     @State private var viewportSize = CGSize(width: 1280, height: 860)
 
@@ -278,16 +282,21 @@ private struct TitleDetailContent: View {
             if !Task.isCancelled { related = values }
         }
         .sheet(item: $playbackSelection) { selection in
-            TitlePlaybackSheet(
-                title: title,
-                selection: selection,
-                hero: playbackHero(for: selection.episode),
-                containerSize: viewportSize,
-                repository: app.detailRepository,
-                resumePosition: { position(for: $0, equivalentEpisode: selection.episode) },
-                onPlay: { option, position in play(option, from: position) }
-            )
+            playbackSheet(selection, hero: playbackHero(for: selection.episode), container: viewportSize)
         }
+        .onDisappear { playbackOverlay?.dismiss() }
+    }
+
+    private func playbackSheet(_ selection: TitlePlaybackSelection, hero: PlaybackSheetHero, container: CGSize) -> TitlePlaybackSheet {
+        TitlePlaybackSheet(
+            title: title,
+            selection: selection,
+            hero: hero,
+            containerSize: container,
+            repository: app.detailRepository,
+            resumePosition: { position(for: $0, equivalentEpisode: selection.episode) },
+            onPlay: { option, position in play(option, from: position) }
+        )
     }
 
     private var titleFacts: [String] {
@@ -456,7 +465,10 @@ private struct TitleDetailContent: View {
         return DetailEpisodeTile(
             episode: episode, metadata: metadata, artwork: backdrops.first, progress: progress, watched: watched
         ) {
-            choosePlayback(episode: episode, alwaysShowPicker: true)
+            choosePlayback(episode: episode, alwaysShowPicker: true, from: episodeFrames.frames[episode.id])
+        }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { [episodeFrames] frame in
+            episodeFrames.frames[episode.id] = frame
         }
         .contextMenu {
             Button(watched ? "Marquer comme non vu" : "Marquer comme vu", systemImage: watched ? "circle" : "checkmark.circle") {
@@ -606,7 +618,7 @@ private struct TitleDetailContent: View {
         }
     }
 
-    private func choosePlayback(episode: Episode?, alwaysShowPicker: Bool = false) {
+    private func choosePlayback(episode: Episode?, alwaysShowPicker: Bool = false, from source: CGRect? = nil) {
         let available = editions
         let options: [TitlePlaybackOption]
         let others: [TitleEdition]
@@ -622,10 +634,18 @@ private struct TitleDetailContent: View {
 
         guard let first = options.first else { return }
         if alwaysShowPicker || options.count > 1 || !others.isEmpty {
-            playbackSelection = TitlePlaybackSelection(
+            let selection = TitlePlaybackSelection(
                 options: options, otherEditions: others, episode: episode,
                 preferred: episode == nil ? preferredID : first.id
             )
+            if let playbackOverlay {
+                let hero = playbackHero(for: episode)
+                playbackOverlay.present(from: source) { container in
+                    playbackSheet(selection, hero: hero, container: container)
+                }
+            } else {
+                playbackSelection = selection
+            }
         } else {
             play(first, from: position(for: first))
         }
@@ -811,4 +831,9 @@ private struct TitleDetailContent: View {
             tmdbID == lookup.tmdbID && season == lookup.season
         }
     }
+}
+
+/// Reference box for card frames: written on scroll without invalidating the page.
+private final class EpisodeFrames {
+    var frames: [ContentID: CGRect] = [:]
 }

@@ -17,6 +17,7 @@ struct TitlePlaybackSelection: Identifiable {
 /// background, following the system appearance — the language / edition tiles and info columns.
 struct TitlePlaybackSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.hostingPlaybackOverlay) private var hostOverlay
     let title: MediaTitle
     let selection: TitlePlaybackSelection
     let hero: PlaybackSheetHero
@@ -37,10 +38,10 @@ struct TitlePlaybackSheet: View {
 
     private static let margin = PrismMetrics.contentMargin
 
-    /// Large but still a sheet: inset from the detail page it covers.
-    private static func size(for container: CGSize) -> CGSize {
+    /// Large but still a sheet: inset from the window it covers.
+    static func size(for container: CGSize) -> CGSize {
         CGSize(
-            width: min(1360, max(1000, container.width - 120)).rounded(),
+            width: min(1360, max(1000, container.width - 200)).rounded(),
             height: min(920, max(600, container.height - 110)).rounded()
         )
     }
@@ -460,13 +461,17 @@ struct TitlePlaybackSheet: View {
 
     private func cancel() {
         isClosing = true
-        dismiss()
+        close()
+    }
+
+    private func close() {
+        if let hostOverlay { hostOverlay.dismiss() } else { dismiss() }
     }
 
     private func confirm(_ option: TitlePlaybackOption, position: TimeInterval?) {
         guard !isClosing else { return }
         isClosing = true
-        dismiss()
+        close()
         onPlay(option, position)
     }
 
