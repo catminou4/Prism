@@ -18,7 +18,6 @@ struct TitlePlaybackSelection: Identifiable {
 struct TitlePlaybackSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.hostingPlaybackOverlay) private var hostOverlay
-    @Environment(\.displayScale) private var displayScale
     let title: MediaTitle
     let selection: TitlePlaybackSelection
     let hero: PlaybackSheetHero
@@ -38,6 +37,11 @@ struct TitlePlaybackSheet: View {
     @FocusState private var focusedOption: ContentID?
 
     private static let margin = PrismMetrics.contentMargin
+
+    /// Hero band height for a sheet of `size` (the overlay flies the episode artwork into it).
+    static func heroHeight(for size: CGSize) -> CGFloat {
+        min(620, max(420, (size.height * 0.6).rounded()))
+    }
 
     /// Large but still a sheet: inset from the window it covers.
     static func size(for container: CGSize) -> CGSize {
@@ -73,7 +77,7 @@ struct TitlePlaybackSheet: View {
             ?? visible.first { $0.id == selection.preferred }
             ?? visible.first
         let size = Self.size(for: containerSize)
-        let heroHeight = min(620, max(420, (size.height * 0.6).rounded()))
+        let heroHeight = Self.heroHeight(for: size)
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 heroSection(selected: selected, size: CGSize(width: size.width, height: heroHeight))
@@ -85,7 +89,8 @@ struct TitlePlaybackSheet: View {
                 .padding(.bottom, 44)
             }
         }
-        .scrollBounceBehavior(.basedOnSize)
+        // Always rubber-band, so pulling down zooms the hero artwork like on the detail page.
+        .scrollBounceBehavior(.always)
         .frame(width: size.width, height: size.height)
         .background(PrismColors.pageBackground)
         .overlay(alignment: .topTrailing) {
@@ -97,12 +102,10 @@ struct TitlePlaybackSheet: View {
         }
         .presentationBackground(PrismColors.pageBackground)
         .task(id: hero.synopsisCandidates) {
-            // Settle the first frame before the overlay zooms it in: a synopsis arriving or the
-            // hero artwork swapping preview → full resolution mid-animation reads as a hitch.
-            async let artwork: Void = warmHeroArtwork(CGSize(width: size.width, height: heroHeight))
+            // Resolve the synopsis before the overlay reveals the sheet, so the hero text
+            // never reflows while it fades in.
             let value = await DetailPresentation.synopsis(hero.synopsisCandidates)
             if !Task.isCancelled { synopsis = value }
-            await artwork
             if !Task.isCancelled { hostOverlay?.contentReady() }
         }
         .task(id: loadingRevision) { await resolveEditions() }
@@ -110,29 +113,15 @@ struct TitlePlaybackSheet: View {
 
     // MARK: Hero
 
-    /// Waits (bounded) until the hero artwork `HeroBackdrop` will request is decoded in memory,
-    /// joining its in-flight load rather than starting another.
-    private func warmHeroArtwork(_ artSize: CGSize) async {
-        guard hostOverlay != nil, let url = hero.landscapes.first else { return }
-        let pixels = RemoteImage.pixelSize(forPointSize: artSize, scale: displayScale)
-        let pipeline = ImagePipeline.shared
-        if pipeline.cachedImage(for: url, pixelSize: pixels, fitting: .landscapeFill) != nil { return }
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { _ = await pipeline.image(for: url, pixelSize: pixels, fitting: .landscapeFill) }
-            group.addTask { try? await Task.sleep(for: PlaybackOverlayModel.preparationBudget) }
-            await group.next()
-            group.cancelAll()
-        }
-    }
-
     /// Same construction as the detail masthead: dark artwork + scrims, white text, 30 pt fade
     /// into the page background.
     private func heroSection(selected: TitlePlaybackOption?, size: CGSize) -> some View {
         ZStack(alignment: .bottomLeading) {
             HeroBackdrop(
                 backdropURLs: hero.landscapes, seed: hero.seed, fallbackPosterURLs: [hero.poster].compactMap { $0 },
-                leadingScrim: 0.75, artSize: size
+                leadingScrim: 0.75, artSize: size, placeholderImage: hostOverlay?.flightArtwork
             )
+            .heroOverscrollZoom()
             .allowsHitTesting(false)
             heroInfo(selected: selected, width: min(620, size.width * 0.55))
         }

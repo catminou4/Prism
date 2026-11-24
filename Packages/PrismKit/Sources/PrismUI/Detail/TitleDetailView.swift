@@ -640,7 +640,7 @@ private struct TitleDetailContent: View {
             )
             if let playbackOverlay {
                 let hero = playbackHero(for: episode)
-                playbackOverlay.present(from: source) { container in
+                playbackOverlay.present(from: source, artwork: hero.landscapes.first) { container in
                     playbackSheet(selection, hero: hero, container: container)
                 }
             } else {

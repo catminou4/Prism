@@ -10,6 +10,7 @@ public struct HeroBackdrop: View {
     private let extendsUnderSidebar: Bool
     private let artSize: CGSize?
     private let blurAmount: Double?
+    private let placeholderImage: CGImage?
     @State private var failedBackdrops: Set<URL> = []
     @State private var failedPosters: Set<URL> = []
 
@@ -50,8 +51,10 @@ public struct HeroBackdrop: View {
         extendsUnderSidebar: Bool = false,
         animates: Bool = false,
         artSize: CGSize? = nil,
-        blurAmount: Double? = nil
+        blurAmount: Double? = nil,
+        placeholderImage: CGImage? = nil
     ) {
+        self.placeholderImage = placeholderImage
         self.backdropURLs = Self.unique(backdropURLs)
         self.seed = seed
         self.posterURLs = Self.unique(fallbackPosterURLs.isEmpty ? Array(backdropURLs.prefix(1)) : fallbackPosterURLs)
@@ -64,7 +67,18 @@ public struct HeroBackdrop: View {
 
     public var body: some View {
         ZStack {
-            PlaceholderArtwork(seed: seed, style: .none)
+            if let placeholderImage {
+                // An already-decoded small copy of the artwork (e.g. the card that opened this
+                // hero): the full-resolution image then fades in over the same picture.
+                Image(decorative: placeholderImage, scale: 1)
+                    .resizable()
+                    .interpolation(.medium)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .clipped()
+            } else {
+                PlaceholderArtwork(seed: seed, style: .none)
+            }
             artwork
             if let blurAmount {
                 blurredArtwork.opacity(blurAmount)
