@@ -18,6 +18,7 @@ struct TitlePlaybackSelection: Identifiable {
 struct TitlePlaybackSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.hostingPlaybackOverlay) private var hostOverlay
+    @Environment(\.displayScale) private var displayScale
     let title: MediaTitle
     let selection: TitlePlaybackSelection
     let hero: PlaybackSheetHero
@@ -96,13 +97,33 @@ struct TitlePlaybackSheet: View {
         }
         .presentationBackground(PrismColors.pageBackground)
         .task(id: hero.synopsisCandidates) {
+            // Settle the first frame before the overlay zooms it in: a synopsis arriving or the
+            // hero artwork swapping preview → full resolution mid-animation reads as a hitch.
+            async let artwork: Void = warmHeroArtwork(CGSize(width: size.width, height: heroHeight))
             let value = await DetailPresentation.synopsis(hero.synopsisCandidates)
             if !Task.isCancelled { synopsis = value }
+            await artwork
+            if !Task.isCancelled { hostOverlay?.contentReady() }
         }
         .task(id: loadingRevision) { await resolveEditions() }
     }
 
     // MARK: Hero
+
+    /// Waits (bounded) until the hero artwork `HeroBackdrop` will request is decoded in memory,
+    /// joining its in-flight load rather than starting another.
+    private func warmHeroArtwork(_ artSize: CGSize) async {
+        guard hostOverlay != nil, let url = hero.landscapes.first else { return }
+        let pixels = RemoteImage.pixelSize(forPointSize: artSize, scale: displayScale)
+        let pipeline = ImagePipeline.shared
+        if pipeline.cachedImage(for: url, pixelSize: pixels, fitting: .landscapeFill) != nil { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { _ = await pipeline.image(for: url, pixelSize: pixels, fitting: .landscapeFill) }
+            group.addTask { try? await Task.sleep(for: PlaybackOverlayModel.preparationBudget) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
 
     /// Same construction as the detail masthead: dark artwork + scrims, white text, 30 pt fade
     /// into the page background.
