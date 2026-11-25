@@ -155,6 +155,31 @@ struct RealCatalogBenchTests {
             }
             print("[real-bench] input fingerprint validation hash: \(String(format: "%.2f", hashMS)) ms for \(String(format: "%.1f", Double(sourceCacheBytes) / 1_048_576)) MiB compressed source cache")
 
+            // Meta-only decode probe: what the lazy artifact-hit launch reads instead of the
+            // full raw object graphs (provider categories + account + fetch date per source).
+            var metaWall = 0.0
+            var metaCPU = 0.0
+            var metaCategories = 0
+            var metaBytes = 0
+            for source in sources {
+                guard let data = try? Data(contentsOf: directories.catalogCacheFile(for: source.id), options: [.mappedIfSafe]) else { continue }
+                var best = Double.infinity
+                var bestCPU = Double.infinity
+                for iteration in 0..<5 {
+                    let start = clock.now
+                    let cpu = Self.cpuUserSystem
+                    let meta = CatalogCache.embeddedMeta(in: data, expecting: source.id)
+                    best = min(best, Self.ms(start, clock.now))
+                    let end = Self.cpuUserSystem
+                    bestCPU = min(bestCPU, (end.user + end.system - cpu.user - cpu.system) * 1000)
+                    if iteration == 0 { metaCategories += meta?.categories.count ?? 0 }
+                }
+                if let unpacked = SegmentedArchive.unpack(data), let first = unpacked.segments.first { metaBytes += first.payload.count }
+                metaWall += best
+                metaCPU += bestCPU
+            }
+            print("[real-bench] meta-only decode (lazy launch): min wall \(String(format: "%.2f", metaWall)) ms, min CPU \(String(format: "%.2f", metaCPU)) ms — \(metaCategories) catégories, meta segments \(metaBytes / 1_024) Ko compressed")
+
             var artifactWall: [Double] = []
             var artifactCPU: [Double] = []
             for _ in 0..<5 {
@@ -192,6 +217,12 @@ struct RealCatalogBenchTests {
             }
             print("[real-bench] artifact load: min wall \(String(format: "%.1f", artifactWall.min() ?? 0)) ms, min CPU \(String(format: "%.0f", artifactCPU.min() ?? 0)) ms (\(artifactWall.map { String(format: "%.1f", $0) }.joined(separator: ", ")))")
             print("[real-bench] raw decode+build same-process A/B: min wall \(String(format: "%.1f", rawWall.min() ?? 0)) ms, min CPU \(String(format: "%.0f", rawCPU.min() ?? 0)) ms — decode min \(String(format: "%.1f", rawDecodeWall.min() ?? 0))/\(String(format: "%.0f", rawDecodeCPU.min() ?? 0)) ms, warm build min \(String(format: "%.1f", rebuildWall.min() ?? 0))/\(String(format: "%.0f", rebuildCPU.min() ?? 0)) ms")
+            // Artifact-hit launch A/B, same process: the eager background preload paid the full
+            // raw decode on every launch; the lazy launch pays only the meta reads in sessions
+            // where caches are fresh and no semantic rebuild ever happens.
+            let eagerCPU = (artifactCPU.min() ?? 0) + (rawDecodeCPU.min() ?? 0)
+            let lazyCPU = (artifactCPU.min() ?? 0) + metaCPU
+            print("[real-bench] artifact-hit launch CPU: eager \(String(format: "%.0f", eagerCPU)) ms (artifact + raw preload) vs lazy \(String(format: "%.0f", lazyCPU)) ms (artifact + meta) — saved \(String(format: "%.0f", eagerCPU - lazyCPU)) CPU-ms per fresh-cache launch")
         } catch {
             Issue.record("artifact benchmark setup failed: \(error)")
         }

@@ -58,6 +58,30 @@ public actor CatalogRepository {
         lastCatalogs[id]
     }
 
+    /// Categories, account and fetch date of a source's cached catalog, decoded from the
+    /// small meta segment only — the item payloads (hundreds of thousands of objects, the
+    /// entire cost of a full decode) are never touched. `nil` when the cache is missing or
+    /// unreadable, exactly the cases where a full decode would also produce nothing.
+    ///
+    /// This is what settings (provider categories, subscription expiry), playback (catch-up
+    /// server time zone) and the launch staleness check actually need; the full object graph
+    /// is only required when the merged catalog must be rebuilt.
+    public nonisolated func cachedCatalogMeta(for source: Source) -> CachedCatalogMeta? {
+        if DemoContent.isDemo(source) {
+            // The demo source has no cache file: its deterministic generated content is the
+            // only truth, and it is small enough that building it here costs nothing.
+            let catalog = DemoContent.makeCatalog(fetchedAt: DemoContent.referenceDate)
+            return CachedCatalogMeta(categories: catalog.categories, account: catalog.account, fetchedAt: catalog.fetchedAt)
+        }
+        let url = directories.catalogCacheFile(for: source.id)
+        // Memory-mapped: only the header, segment table and first (meta) segment pages are
+        // ever faulted in — and on the artifact-hit launch path the input fingerprint
+        // validation has already read those same bytes anyway.
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              let meta = CatalogCache.embeddedMeta(in: data, expecting: source.id) else { return nil }
+        return CachedCatalogMeta(categories: meta.categories, account: meta.account, fetchedAt: meta.fetchedAt)
+    }
+
     /// Removes the cached catalog and metadata of a deleted source.
     public func forget(_ id: SourceID) async {
         lastCatalogs[id] = nil
@@ -454,6 +478,20 @@ private final class SniffCollector: NSObject, URLSessionDataDelegate, Sendable {
             return false
         }
         if full { dataTask.cancel() }
+    }
+}
+
+/// The small metadata header of a cached source catalog: everything a settings page, a
+/// catch-up playback or a staleness decision needs without decoding the item payloads.
+public struct CachedCatalogMeta: Sendable {
+    public var categories: [PrismCore.Category]
+    public var account: XtreamAccount?
+    public var fetchedAt: Date
+
+    public init(categories: [PrismCore.Category], account: XtreamAccount?, fetchedAt: Date) {
+        self.categories = categories
+        self.account = account
+        self.fetchedAt = fetchedAt
     }
 }
 

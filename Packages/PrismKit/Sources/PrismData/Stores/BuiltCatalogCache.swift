@@ -52,9 +52,26 @@ public actor BuiltCatalogCache {
               unpacked.segments.count > 1, unpacked.segments[1].tag == Tag.sources.rawValue,
               let sourcePayload = CatalogCache.expandedBinaryPayload(of: unpacked.segments[1]),
               let storedSources = BuiltCatalogBinary.decodeSources(sourcePayload),
-              storedSources == enabled
+              Self.sameInputs(storedSources, enabled)
         else { return nil }
         return await Self.decodeCatalog(unpacked: unpacked, meta: meta, storedSources: storedSources)
+    }
+
+    /// Source-record comparison for artifact validation. `sources.json` persists dates as
+    /// whole-second ISO8601 strings while the artifact binds the exact in-memory values, so
+    /// sub-second precision always differs across a process restart. Neither `createdAt` nor
+    /// `lastRefreshedAt` influences `CatalogBuilder` (only ids, order and enabled state do) —
+    /// they are refresh bookkeeping, and every semantic field still compares exactly.
+    private static func sameInputs(_ stored: [Source], _ enabled: [Source]) -> Bool {
+        guard stored.count == enabled.count else { return false }
+        return zip(stored, enabled).allSatisfy { left, right in
+            var left = left, right = right
+            left.createdAt = .distantPast
+            right.createdAt = .distantPast
+            left.lastRefreshedAt = nil
+            right.lastRefreshedAt = nil
+            return left == right
+        }
     }
 
     private static func validateMeta(_ meta: BuiltCatalogBinary.Meta, enabled: [Source], options: CatalogBuildOptions) -> Bool {

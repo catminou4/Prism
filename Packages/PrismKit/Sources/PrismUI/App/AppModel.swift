@@ -99,13 +99,29 @@ public final class AppModel {
     }
 
     @ObservationIgnored private var sourceCatalogs: [SourceID: SourceCatalog] = [:]
-    /// Change token for the raw-catalog dictionary. On an artifact hit that dictionary fills
-    /// in the background after the first catalog publish, so `sourceCategories` cannot depend
-    /// only on `catalogRevision`.
+    /// Cheap per-source cache metadata (provider categories, Xtream account, fetch date),
+    /// decoded from the small meta segment only after a built-catalog artifact hit. Covers
+    /// settings, catch-up playback and the staleness check without ever decoding the item
+    /// payloads in sessions where the merged catalog is never rebuilt.
+    @ObservationIgnored private var sourceMetas: [SourceID: CachedCatalogMeta] = [:]
+    /// Change token for the raw-catalog/meta dictionaries. On an artifact hit the metas fill
+    /// in the background after the first catalog publish (and the raw catalogs only if a
+    /// rebuild decodes them), so `sourceCategories` cannot depend only on `catalogRevision`.
     public private(set) var sourceCatalogsRevision = 0
-    /// Background warm-up of the raw per-source catalogs after a built-catalog artifact hit.
-    /// Refresh diffing and settings metadata need them, but first content does not.
-    @ObservationIgnored private var rawCatalogPreloadTask: Task<Void, Never>?
+    /// Background decode of the small cache meta segments after a built-catalog artifact hit.
+    @ObservationIgnored private var catalogMetaTask: Task<Void, Never>?
+    /// On-demand decode of the raw per-source catalogs after a built-catalog artifact hit.
+    /// Shared by every consumer (semantic rebuilds, post-import regrouping): concurrent demand
+    /// awaits the same task instead of decoding twice. `nil` while no wave runs.
+    @ObservationIgnored private var rawCatalogsTask: Task<Void, Never>?
+    /// Sources whose cache decode was already tried this session. A source without a readable
+    /// cache never stops missing, so without this marker every rebuild would retry its decode.
+    @ObservationIgnored private var rawCatalogsAttempted: Set<SourceID> = []
+    /// Number of raw-catalog decode waves started this session (test instrumentation: an
+    /// artifact-hit launch with fresh caches must stay at zero).
+    @ObservationIgnored private(set) var rawCatalogDecodeWaves = 0
+    /// Post-`.ready` maintenance (guide decode, staleness refreshes), kept so tests can await it.
+    @ObservationIgnored private(set) var bootstrapMaintenanceTask: Task<Void, Never>?
     @ObservationIgnored private var pendingSources: Set<SourceID> = []
     @ObservationIgnored private var rebuildGeneration = 0
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
@@ -202,10 +218,12 @@ public final class AppModel {
     public var hasCompletedOnboarding: Bool { UserDefaults.standard.bool(forKey: Keys.onboardingDone) }
 
     /// Provider categories come from the full source, including categories filtered from the library.
+    /// After an artifact-hit launch the raw catalog may not be decoded yet (or ever): the cheap
+    /// cache meta carries the same category list and is enough here.
     public func sourceCategories(for id: SourceID) -> [PrismCore.Category] {
         _ = catalogRevision
         _ = sourceCatalogsRevision
-        return sourceCatalogs[id]?.categories ?? []
+        return sourceCatalogs[id]?.categories ?? sourceMetas[id]?.categories ?? []
     }
 
     public func hiddenCategoryIDs(for id: SourceID) -> Set<String> {
@@ -374,7 +392,11 @@ public final class AppModel {
         // is still in flight — a pre-load mutation would otherwise discard it.
         await library.awaitDiskLoad()
         if let built = await artifact {
-            startRawCatalogPreload()
+            // The grouped catalog is publishable as-is; the raw per-source object graphs are
+            // NOT decoded here. Only the small meta segments are read (categories/account —
+            // a few milliseconds), and the full decode waits for a consumer that genuinely
+            // needs it: a semantic rebuild or a completed refresh.
+            startCatalogMetaLoad()
             await rebuildCatalog(prebuilt: built)
         } else {
             // Cache-miss path unchanged: decode every source catalog, then group and index.
@@ -393,17 +415,20 @@ public final class AppModel {
         // les cœurs avec la composition du premier contenu (index de curation) pendant
         // la fenêtre critique. Le guide reste néanmoins disponible rapidement — les pages
         // TV/Guide l'attendent déjà via leurs états vides et `refreshGuide`.
-        Task(priority: .background) { [weak self] in
+        bootstrapMaintenanceTask = Task(priority: .background) { [weak self] in
             guard let self else { return }
             let sources = self.sources
             self.guide = await self.epgRepository.cachedGuide(for: sources)
-            // A hit on the built-catalog artifact intentionally leaves raw catalogs warming
-            // in the background. Staleness decisions and refresh diffing still need them.
-            await self.rawCatalogPreloadTask?.value
+            // Staleness is decided WITHOUT the raw object graphs: a readable cache meta proves
+            // the source has cached content (the artifact-hit validation has already rehashed
+            // those exact cache bytes), and the age comes from the persisted source record.
+            // With fresh caches this task therefore never triggers the raw decode at all.
+            await self.catalogMetaTask?.value
 
             let now = Date.now
             for source in sources where source.isEnabled {
-                let stale = self.sourceCatalogs[source.id] == nil
+                let hasCachedCatalog = self.sourceCatalogs[source.id] != nil || self.sourceMetas[source.id] != nil
+                let stale = !hasCachedCatalog
                     || (source.lastRefreshedAt.map { now.timeIntervalSince($0) > Self.catalogMaxAge } ?? true)
                 if stale { Task { await self.refresh(source.id) } }
             }
@@ -541,6 +566,7 @@ public final class AppModel {
         persistSources()
         try? credentials.setPassword(nil, for: id)
         sourceCatalogs[id] = nil
+        sourceMetas[id] = nil
         accounts[id] = nil
         errors[id] = nil
         importStates[id] = nil
@@ -694,6 +720,11 @@ public final class AppModel {
             state.progress = nil
         }
 
+        // A successful import regroups the merged catalog from the raw inputs of every source:
+        // start their decode now (no-op once they are all in memory) so it overlaps the network
+        // fetch instead of serializing in front of the rebuild. In a fresh-cache session this
+        // first wave is also the only one the session ever pays.
+        ensureRawCatalogsLoading()
         var finished: ImportProgress?
         // `state.progress` n'est lu que par la fiche de la source : chaque écriture
         // ne réévalue plus les badges latéraux ni les autres fiches. On n'écrit
@@ -722,6 +753,7 @@ public final class AppModel {
         guard self.source(id) != nil else { throw CancellationError() }
 
         sourceCatalogs[id] = catalog
+        sourceMetas[id] = CachedCatalogMeta(categories: catalog.categories, account: catalog.account, fetchedAt: catalog.fetchedAt)
         pendingSources.remove(id)
         if let account = catalog.account { accounts[id] = account }
         if var updated = self.source(id) {
@@ -758,21 +790,92 @@ public final class AppModel {
         )
     }
 
-    /// Decode raw catalogs off the launch-critical path after a derived-artifact hit. They are
-    /// still needed soon afterwards for provider-category settings and refresh diffing, but not
-    /// to publish the already grouped catalog.
-    private func startRawCatalogPreload() {
-        rawCatalogPreloadTask?.cancel()
+    /// Decode the small cache meta segments after a derived-artifact hit: provider categories
+    /// and Xtream accounts for settings/playback, plus the cache-presence half of the staleness
+    /// check. This is a few milliseconds of work — unlike the raw item payloads, which only a
+    /// semantic rebuild ever decodes (`requireRawCatalogs`).
+    private func startCatalogMetaLoad() {
+        catalogMetaTask?.cancel()
         let sources = self.sources
         let repository = catalogRepository
-        rawCatalogPreloadTask = Task.detached(priority: .background) { [weak self] in
-            let loaded = await repository.cachedCatalogs(for: sources)
-            await self?.installPreloadedCatalogs(loaded)
+        catalogMetaTask = Task.detached(priority: .utility) { [weak self] in
+            var metas: [SourceID: CachedCatalogMeta] = [:]
+            for source in sources {
+                guard !Task.isCancelled else { return }
+                if let meta = repository.cachedCatalogMeta(for: source) {
+                    metas[source.id] = meta
+                }
+            }
+            await self?.installCatalogMetas(metas)
         }
     }
 
-    private func installPreloadedCatalogs(_ catalogs: [SourceCatalog]) {
+    private func installCatalogMetas(_ metas: [SourceID: CachedCatalogMeta]) {
+        for (id, meta) in metas {
+            guard source(id) != nil else { continue }
+            // A refreshed catalog already in memory is fresher than the disk meta: its own
+            // categories/account won at install time and `sourceCategories` prefers it anyway.
+            if sourceCatalogs[id] == nil { sourceMetas[id] = meta }
+            if accounts[id] == nil, let account = meta.account {
+                accounts[id] = account
+            }
+        }
+        sourceCatalogsRevision &+= 1
+        catalogMetaTask = nil
+    }
+
+    /// Enabled sources the merged rebuild cannot include yet: no in-memory catalog and no
+    /// decode already tried. Disabled sources are excluded because `CatalogBuilder` ignores
+    /// their input entirely. Sources currently importing are deliberately included: until their
+    /// fresh catalog lands, any rebuild (e.g. the one publishing another source's completed
+    /// refresh) still needs their previous content — exactly what the eager decode provided.
+    private func rawCatalogsToDecode() -> [Source] {
+        sources.filter {
+            $0.isEnabled && sourceCatalogs[$0.id] == nil
+                && !rawCatalogsAttempted.contains($0.id)
+        }
+    }
+
+    /// Starts the shared decode of the missing raw catalogs, unless one is already running or
+    /// nothing is missing. Never waits: rebuilds await through `requireRawCatalogs`, imports
+    /// use this to overlap the decode with their network fetch.
+    private func ensureRawCatalogsLoading() {
+        guard rawCatalogsTask == nil else { return }
+        let missing = rawCatalogsToDecode()
+        guard !missing.isEmpty else { return }
+        // Pessimistic bookkeeping: even a failed decode is never retried this session. A source
+        // without a readable cache would otherwise be re-decoded (and re-fail) on every rebuild;
+        // a source whose payload is corrupt gets repaired by the refresh kick below instead.
+        rawCatalogsAttempted.formUnion(missing.map(\.id))
+        rawCatalogDecodeWaves += 1
+        let repository = catalogRepository
+        rawCatalogsTask = Task.detached(priority: .utility) { [weak self] in
+            let loaded = await repository.cachedCatalogs(for: missing)
+            await self?.installDecodedRawCatalogs(loaded, wave: missing.map(\.id))
+        }
+    }
+
+    /// Awaits the shared decode until every enabled source either has its catalog in memory or
+    /// had its cache decode already tried. Semantic rebuilds gate on this: the merged catalog
+    /// can only be grouped from complete inputs. Instant when nothing is missing — which is
+    /// always the case on the cache-miss launch path and after the first decode wave.
+    private func requireRawCatalogs() async {
+        while true {
+            if let task = rawCatalogsTask {
+                // Concurrent demand shares the in-flight wave; the loop then re-checks, because
+                // the wave's snapshot may predate a newly enabled or imported source.
+                await task.value
+                continue
+            }
+            guard !rawCatalogsToDecode().isEmpty else { return }
+            ensureRawCatalogsLoading()
+        }
+    }
+
+    private func installDecodedRawCatalogs(_ catalogs: [SourceCatalog], wave: [SourceID]) {
         for catalog in catalogs {
+            // Never overwrite a fresher in-memory catalog (a refresh may have landed while
+            // this wave was decoding the older disk bytes).
             guard source(catalog.sourceID) != nil, sourceCatalogs[catalog.sourceID] == nil else { continue }
             sourceCatalogs[catalog.sourceID] = catalog
             if accounts[catalog.sourceID] == nil, let account = catalog.account {
@@ -780,7 +883,17 @@ public final class AppModel {
             }
         }
         sourceCatalogsRevision &+= 1
-        rawCatalogPreloadTask = nil
+        rawCatalogsTask = nil
+        // A source whose meta segment decoded but whose item payloads did not is corrupt in a
+        // way the meta-based staleness check cannot see. Repair it with a refresh, exactly like
+        // the eager launch decode used to provoke. (Near-impossible in practice: the artifact
+        // validation rehashes every cache byte at launch, so this covers later external damage.)
+        for id in wave {
+            guard let source = source(id), source.isEnabled,
+                  sourceCatalogs[id] == nil, sourceMetas[id] != nil,
+                  !isImporting(id) else { continue }
+            Task { await self.refresh(id) }
+        }
     }
 
     /// Publish the merged catalog as soon as browsing is possible. Search indexes that snapshot separately.
@@ -795,12 +908,12 @@ public final class AppModel {
         searchTask?.cancel()
         recommendationsTask?.cancel()
         recommendationsTask = nil
-        // On a derived-artifact launch the raw catalogs may still be warming in the background.
-        // Any semantic rebuild (refresh, removal, category visibility…) needs the complete inputs;
-        // only the initial `prebuilt` publication is allowed to bypass them.
+        // On a derived-artifact launch the raw catalogs are decoded lazily. Any semantic rebuild
+        // (refresh, removal, category visibility…) needs the complete inputs; only the initial
+        // `prebuilt` publication is allowed to bypass them. The first such rebuild pays the decode
+        // once per session — unless an import already overlapped it with its network fetch.
         if prebuilt == nil {
-            await rawCatalogPreloadTask?.value
-            rawCatalogPreloadTask = nil
+            await requireRawCatalogs()
         }
         let sources = self.sources
         let catalogs = sources.compactMap { sourceCatalogs[$0.id] }
