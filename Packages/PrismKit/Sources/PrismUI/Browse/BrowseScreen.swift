@@ -52,9 +52,17 @@ struct BrowseScreen: View {
                         CurationPlaceholder()
                             .transition(.opacity)
                     }
-                    if kind != nil || homeRecommendations { curatedShelves(feed) }
-                    if (kind != nil || homeGenres) && !feed.genres.isEmpty {
-                        GenreTileShelf(tiles: feed.genres, kind: kind)
+                    if kind == nil {
+                        if homeRecommendations { curatedShelves(feed.shelves.prefix(2)) }
+                        if homeGenres && !feed.genres.isEmpty {
+                            GenreTileShelf(tiles: feed.genres, kind: nil)
+                        }
+                        if homeRecommendations { curatedShelves(feed.shelves.dropFirst(2)) }
+                    } else {
+                        curatedShelves(feed.shelves[...])
+                        if !feed.genres.isEmpty {
+                            GenreTileShelf(tiles: feed.genres, kind: kind)
+                        }
                     }
                     if let kind { providerShelves(kind) }
                 }
@@ -90,8 +98,8 @@ struct BrowseScreen: View {
         return min(max(size.height * ratio, 460, size.width * 0.36), 860)
     }
 
-    @ViewBuilder private func curatedShelves(_ feed: CuratedFeed) -> some View {
-        ForEach(feed.shelves) { shelf in
+    @ViewBuilder private func curatedShelves(_ shelves: ArraySlice<CuratedShelf>) -> some View {
+        ForEach(shelves) { shelf in
             CuratedShelfView(shelf: shelf)
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 18)),
