@@ -7,7 +7,9 @@ public struct LiveBadge: View {
     private let compact: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(_ title: String = "EN DIRECT", pulsing: Bool = true, compact: Bool = false) {
+    /// `pulsing` defaults to `false`: the perpetual dot animation composites for as long as
+    /// the badge is mounted, so callers opt into it rather than paying it by accident.
+    public init(_ title: String = "EN DIRECT", pulsing: Bool = false, compact: Bool = false) {
         self.title = title
         self.pulsing = pulsing
         self.compact = compact

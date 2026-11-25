@@ -30,6 +30,15 @@ public struct RemoteImage: View {
     private var imageFade: Animation? {
         isScrollingContent ? nil : PrismMotion.respecting(reduceMotion, PrismMotion.imageFade)
     }
+
+    /// How the placeholder leaves once the artwork is in. While the artwork fades in, the
+    /// placeholder stays underneath until the fade has covered it (hence the delay matching
+    /// `PrismMotion.imageFade`). With fades disabled — scrolling, Reduce Motion — the image
+    /// is fully opaque the moment it appears, so the placeholder drops in the same frame
+    /// instead of lingering in the render tree for a hard-coded 250 ms.
+    private var placeholderRemoval: AnyTransition {
+        imageFade != nil ? .opacity.animation(.linear(duration: 0.01).delay(0.25)) : .identity
+    }
     @State private var loaded: Loaded?
     @State private var measuredSize: CGSize = .zero
 
@@ -118,8 +127,7 @@ public struct RemoteImage: View {
                     ZStack(alignment: alignment) {
                         if showsPlaceholder, image == nil {
                             PlaceholderArtwork(seed: placeholderSeed, title: placeholderTitle, style: placeholderStyle)
-                                // Stay underneath until the artwork has faded in, then drop.
-                                .transition(.asymmetric(insertion: .identity, removal: .opacity.animation(.linear(duration: 0.01).delay(0.25))))
+                                .transition(.asymmetric(insertion: .identity, removal: placeholderRemoval))
                         }
                         if let image {
                             Image(decorative: image, scale: displayScale)

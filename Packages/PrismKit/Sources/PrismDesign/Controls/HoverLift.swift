@@ -36,15 +36,30 @@ private struct HoverLiftEffect: ViewModifier {
     }
 }
 
-/// A shadow cast by the content's own pixels. Only for callers that ask for it: cards draw theirs
-/// from their artwork shape instead (see `ArtworkSurface`).
+/// The hover shadow. Only for callers that ask for it: cards draw theirs from their artwork
+/// shape instead (see `ArtworkSurface`). Same pattern as `ArtworkSurface`: the shadow only
+/// exists in the render tree while hovered — a permanent `.shadow` whose colour is merely
+/// transparent still cost a compositing pass on every frame. The caster sits in the
+/// background (the content branch is untouched, so remote-image state is never recreated)
+/// and uses the card corner radius: for the opaque cards this serves, its silhouette is
+/// identical to the content-alpha shadow it replaces, and the black backing never shows
+/// through. The enclosing `HoverLiftEffect` animates the insertion/removal transition.
 private struct ContentShadow: ViewModifier {
     let enabled: Bool
     let isHovered: Bool
 
     func body(content: Content) -> some View {
         if enabled {
-            content.shadow(color: PrismColors.hoverShadow.opacity(isHovered ? 1 : 0), radius: 18, y: 10)
+            content
+                .background {
+                    if isHovered {
+                        RoundedRectangle(cornerRadius: PrismMetrics.wideRadius, style: .continuous)
+                            .fill(.black)
+                            .shadow(color: PrismColors.hoverShadow, radius: 18, y: 10)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
+                }
         } else {
             content
         }

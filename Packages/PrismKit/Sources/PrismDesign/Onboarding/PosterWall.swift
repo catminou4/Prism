@@ -95,9 +95,9 @@ public struct PosterWall: View {
 
     public var body: some View {
         let paused = isPaused
-        // The drift is slow (a few points per second): 60 Hz is plenty and halves the
-        // per-frame timeline work on ProMotion displays.
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: paused)) { context in
+        // The drift is slow (12 pt/s — 0.4 pt per frame): 30 Hz is imperceptible and halves
+        // the per-frame timeline work on ProMotion displays.
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { context in
             driftingWall(at: context.date)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -111,6 +111,13 @@ public struct PosterWall: View {
         .accessibilityHidden(true)
     }
 
+    /// The grid is built at this fraction of its point size, so the `drawingGroup` texture
+    /// rasterises at `rasterScale`² of the pixels (~⅓ at 0.6 — 20 MiB instead of ~56 MiB at
+    /// 1440×900@2x) and is then scaled back up with a pure transform. Effective resolution
+    /// is 1.2× the point size on a Retina display — invisible on a darkened, vignetted,
+    /// moving wall — while remote artwork keeps loading live inside the rasterised tree.
+    private static let rasterScale: CGFloat = 0.6
+
     /// Grid content for one timeline tick. Kept out of the `TimelineView` builder so the
     /// clock mutation stays a plain statement instead of a builder expression.
     private func driftingWall(at date: Date) -> some View {
@@ -119,11 +126,15 @@ public struct PosterWall: View {
         let rowShift = Int(floor(travel / pitch.height))
         let fraction = travel - CGFloat(rowShift) * pitch.height
         let grid = gridSize
+        // Column/row counts are scale-invariant (the upscaled wall covers the same points);
+        // only the rasterised tile pitch shrinks. The upscale is centred like the grid is
+        // inside its frame, and the drift offset stays in full-size points.
         return PosterWallGrid(
             tileStorage: tileStorage, columns: grid.columns, rows: grid.rows, rowShift: rowShift,
-            tileWidth: tileWidth, spacing: spacing
+            tileWidth: tileWidth * Self.rasterScale, spacing: spacing * Self.rasterScale
         )
         .equatable()
+        .scaleEffect(1 / Self.rasterScale)
         .offset(y: -fraction)
         .frame(width: size.width, height: size.height)
         .rotation3DEffect(.degrees(12), axis: (x: 0.2, y: 1, z: 0), perspective: 0.5)

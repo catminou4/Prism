@@ -93,10 +93,16 @@ nonisolated enum ArtworkURL {
         return Int(width.rounded(.up))
     }
 
+    /// TMDB's image CDN. Its masters are always JPEG/PNG — WebP only exists as a
+    /// content-negotiated re-encode — so downloads from these hosts can safely refuse
+    /// WebP/AVIF in their `Accept` header (see `ImagePipeline.download`).
+    static func isTMDBHost(_ url: URL) -> Bool {
+        guard let host = url.host()?.lowercased() else { return false }
+        return host == "image.tmdb.org" || host == "themoviedb.org" || host.hasSuffix(".themoviedb.org")
+    }
+
     private static func parse(_ url: URL) -> (token: SizeToken, file: Substring)? {
-        guard let host = url.host()?.lowercased(),
-              host == "image.tmdb.org" || host == "themoviedb.org" || host.hasSuffix(".themoviedb.org"),
-              url.query() == nil else { return nil }
+        guard isTMDBHost(url), url.query() == nil else { return nil }
         let path = url.path(percentEncoded: true)
         let parts = path.split(separator: "/", maxSplits: 3, omittingEmptySubsequences: true)
         guard parts.count == 4, parts[0] == "t", parts[1] == "p", !parts[3].isEmpty, !parts[3].contains("/"),

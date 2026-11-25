@@ -101,7 +101,9 @@ nonisolated enum ImageDecoder {
     }
 
     /// Alpha-weighted average colour with a light vibrance boost (muddy averages look dull).
-    @concurrent static func averageColor(of image: CGImage) async -> RGBA? {
+    /// Pure CPU work — synchronous; callers route it through a bounded queue, which also
+    /// picks the executor.
+    static func averageColor(of image: CGImage) -> RGBA? {
         let side = 12
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         let drawn: Bool = pixels.withUnsafeMutableBytes { buffer in

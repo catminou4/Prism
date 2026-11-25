@@ -83,7 +83,11 @@ public struct HeroBackdrop: View {
                 PlaceholderArtwork(seed: seed, style: .none)
             }
             artwork
-            if let blurAmount {
+            // The blurred copy is paint-only (the ZStack is sized by the sharp artwork):
+            // at opacity 0 — e.g. the detail page before any scroll — it must not even
+            // start its load. It derives from the sharp decode (see `blursArtwork`), so
+            // when the first scroll step mounts it, the blur is already nearly free.
+            if let blurAmount, blurAmount > 0 {
                 blurredArtwork.opacity(blurAmount)
             }
             scrims
@@ -96,9 +100,11 @@ public struct HeroBackdrop: View {
 
     @ViewBuilder private var blurredArtwork: some View {
         if let url = backdropURLs.first(where: { !failedBackdrops.contains($0) }) {
-            RemoteImage(
-                url: url, alignment: .top, fitting: .landscapeFill, placeholderSeed: seed,
-                blurRadius: 32, showsPlaceholder: false
+            reusingSharpArtwork(
+                RemoteImage(
+                    url: url, alignment: .top, fitting: .landscapeFill, placeholderSeed: seed,
+                    blurRadius: 32, showsPlaceholder: false
+                )
             )
             .id(url)
         } else if let url = posterURLs.first(where: { !failedPosters.contains($0) }) {
@@ -108,6 +114,14 @@ public struct HeroBackdrop: View {
             )
             .id(url)
         }
+    }
+
+    /// Derives the blur from the sharp hero decode when its size is known (it is the exact
+    /// key the sharp copy loads), instead of downloading and decoding a second chain.
+    /// With no explicit size the pipeline still reuses any sharp decode of the same URL
+    /// it finds in memory or in flight.
+    private func reusingSharpArtwork(_ image: RemoteImage) -> RemoteImage {
+        artSize.map { image.blursArtwork(sized: $0) } ?? image
     }
 
     @ViewBuilder private var artwork: some View {
@@ -168,18 +182,22 @@ private struct PosterHeroArtwork: View {
     let onLoadFailure: () -> Void
 
     var body: some View {
-        ZStack {
-            RemoteImage(
-                url: posterURL, fitting: .portraitFit, placeholderSeed: seed,
-                blurRadius: 34, showsPlaceholder: false
-            )
-            .overlay(Color.black.opacity(0.43))
-            GeometryReader { proxy in
-                let height = min(proxy.size.height * 0.78, proxy.size.width * 0.52, 510)
-                let width = height * PrismMetrics.posterAspectRatio
+        GeometryReader { proxy in
+            let height = min(proxy.size.height * 0.78, proxy.size.width * 0.52, 510)
+            let width = height * PrismMetrics.posterAspectRatio
+            let posterSize = CGSize(width: width, height: height)
+            ZStack {
+                // Same URL at the same decode size as the sharp poster: the background blur
+                // is drawn from the sharp decode instead of a second download+decode chain.
+                RemoteImage(
+                    url: posterURL, fitting: .portraitFit, placeholderSeed: seed,
+                    blurRadius: 34, showsPlaceholder: false
+                )
+                .blursArtwork(sized: posterSize)
+                .overlay(Color.black.opacity(0.43))
                 let clip = RoundedRectangle(cornerRadius: PrismMetrics.posterRadius)
                 RemoteImage(
-                    url: posterURL, size: CGSize(width: width, height: height), contentMode: .fit,
+                    url: posterURL, size: posterSize, contentMode: .fit,
                     fitting: .portraitFit, placeholderSeed: seed, showsPlaceholder: false, onLoadFailure: onLoadFailure
                 )
                 .clipShape(clip)

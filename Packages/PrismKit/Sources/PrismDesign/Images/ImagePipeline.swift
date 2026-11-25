@@ -71,27 +71,42 @@ public actor ImagePipeline {
     private let memory: MemoryCache
     private let disk: ImageDiskCache
     private let decoder = ImageDecodeQueue()
+    /// Average-colour sampling, bounded separately from the decode queue so a burst of
+    /// category tiles can never delay artwork that is on screen. Kept small: sampling is
+    /// a 12×12 draw, and only `CategoryTile` ever asks for it.
+    private let sampler = ImageDecodeQueue(limit: 2)
     private lazy var session = Self.makeSession(warming: false)
     /// Background warm-ups use their own small connection pool so they never queue ahead of
     /// artwork that is on screen.
     private lazy var prefetchSession = Self.makeSession(warming: true)
+    /// Consecutive-failure backoff state for one key/URL. The cooldown escalates per
+    /// consecutive failure (2 min → 10 min → 30 min cap) so permanently dead IPTV artwork
+    /// stops being retried every two minutes in long sessions, while a transient failure
+    /// still recovers quickly. The count survives expiry (entries are only dropped by the
+    /// bounded eviction or a success) and resets when a fetch of the URL succeeds — or on
+    /// relaunch, the tables being in-memory.
+    private struct FailureRecord {
+        var expiry: ContinuousClock.Instant
+        var failures: Int
+    }
+
     private var inFlight: [Key: InFlight<CGImage?>] = [:]
     /// Encoded-bytes fetches, shared by every decode of the same URL (sharp + blurred, sizes).
     private var dataInFlight: [URL: InFlight<Data?>] = [:]
-    private var failedRequests: [URL: ContinuousClock.Instant] = [:]
+    private var failedRequests: [URL: FailureRecord] = [:]
     /// Decode-level failures (bytes arrived, thumbnail rejected/undecodable). Deterministic
     /// per key, so a card remounting during a scroll doesn't pay the decode cost again.
     /// Time-boxed like `failedRequests`: cached bytes can be replaced by a later fetch.
-    private var failedDecodes: [Key: ContinuousClock.Instant] = [:]
+    private var failedDecodes: [Key: FailureRecord] = [:]
     private var averageColors: [URL: RGBA?] = [:]
     /// Byte warm-ups waiting for a slot, most recent request first.
     private var warmQueue: [ArtworkURL.Resolved] = []
     private var warmQueued: Set<URL> = []
     private var warmRunning = 0
     /// Warm-path-only failures: a background-priority timeout must not poison the
-    /// foreground 120 s cooldown (`failedRequests`) for a URL that would succeed
+    /// foreground cooldown (`failedRequests`) for a URL that would succeed
     /// interactively. Warm enqueues check both tables.
-    private var warmFailedRequests: [URL: ContinuousClock.Instant] = [:]
+    private var warmFailedRequests: [URL: FailureRecord] = [:]
     private static let warmConcurrency = 3
 
     public init(memoryCapacity: Int = 160 << 20, diskCapacity: Int = 1 << 30, diskDirectory: URL? = nil) {
@@ -107,11 +122,8 @@ public actor ImagePipeline {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil // the disk cache below stores the encoded bytes
         configuration.waitsForConnectivity = false
-        // No WebP/AVIF: TMDB's CDN serves WebP to any Accept naming it (q-values ignored), and
-        // ImageIO decodes WebP in software — measured on the same w342 posters, JPEG decodes
-        // ~31 % faster (2.6 vs 3.8 ms) for ~36 % more bytes. Bytes are fetched once into the
-        // disk cache; decodes repeat on every memory-cache miss.
-        configuration.httpAdditionalHeaders = ["Accept": "image/jpeg,image/png,image/*;q=0.8"]
+        // No session-level `Accept`: the right value depends on the host (see `download`),
+        // so every request carries its own.
         if warming { configuration.networkServiceType = .background }
         // `download` drives its tasks manually: the async `URLSession` APIs bypass session
         // delegates entirely, so the 2xx/MIME/size checks and the byte cap live in the delegate.
@@ -141,7 +153,7 @@ public actor ImagePipeline {
         if let existing = inFlight[key] {
             entry = existing
         } else {
-            entry = InFlight(task: makeTask(for: key, blurredFrom: source))
+            entry = InFlight(task: makeTask(for: key, blurredFrom: source ?? sharpSource(for: key)))
             inFlight[key] = entry
         }
         entry.waiters += 1
@@ -208,27 +220,37 @@ public actor ImagePipeline {
 
     /// Average colour as plain components (for gradients/tinting maths).
     ///
-    /// Reuses the decode a visible card already runs for the same URL (any size/fitting) —
-    /// decoded images feed `averageColors` — so no second download or decode is needed.
-    /// Falls back to a tiny 64 px decode only when nothing is in flight.
+    /// Sampled lazily — only `CategoryTile` ever reads this, so decodes no longer pay the
+    /// 12×12 downsample draw up front. The sample reuses, in order of cost: a sharp decode
+    /// of the same URL already in the memory cache (any size/fitting), a decode already in
+    /// flight, or — last resort — a tiny 64 px decode whose bytes are almost always a disk
+    /// hit when the artwork is on screen elsewhere. Sampling runs on a small bounded queue,
+    /// never on the decode→display path.
     public func averageRGBA(for url: URL) async -> RGBA? {
         if let cached = averageColors[url] { return cached }
+        if let sharp = memory.smallestSharpEntry(forURL: url) {
+            return await storeSampledAverage(url, of: sharp.image)
+        }
         let candidates = inFlight.compactMap { $0.key.url == url && $0.key.blur == 0 ? $0.value : nil }
         for entry in candidates {
             if let image = await entry.task.value {
-                // A finished decode already stored its own sample (see `makeTask`); reuse it
-                // instead of drawing the 12 px average a second time. The fallback covers a
-                // decode that returned an image without memoizing (cancelled mid-store).
-                if let rgba = averageColors[url] { return rgba }
-                return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
+                guard !Task.isCancelled else { return nil }
+                return await storeSampledAverage(url, of: image)
             }
         }
-        // A same-URL decode may have memoized while the in-flight ones were awaited.
+        // A same-URL caller may have memoized while the in-flight ones were awaited.
         if let cached = averageColors[url] { return cached }
         guard let image = await image(for: url, maxPixelSize: 64) else { return nil }
-        // Same reuse: the 64 px decode memoizes too unless it was a memory-cache hit.
-        if let rgba = averageColors[url] { return rgba }
-        return storeAverageColor(url, await ImageDecoder.averageColor(of: image))
+        return await storeSampledAverage(url, of: image)
+    }
+
+    /// Bounded-queue sampling + memoization shared by every `averageRGBA` source.
+    private func storeSampledAverage(_ url: URL, of image: CGImage) async -> RGBA? {
+        let sampled: RGBA? = await sampler.decode { ImageDecoder.averageColor(of: image) }
+        // The queue also yields nil for a cancelled wait: that nil must not be memoized —
+        // the memo has no expiry and would permanently mean "no colour" for a live URL.
+        guard !Task.isCancelled else { return nil }
+        return storeAverageColor(url, sampled)
     }
 
     /// Memoizes a sampled colour (a `nil` sample is memoized too) and keeps the table bounded.
@@ -254,11 +276,20 @@ public actor ImagePipeline {
 
     // MARK: Internals
 
-    private static let pixelBuckets = [32, 64, 96, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 2048, 2560, 3072]
+    /// Widths/heights at or below 1024 px bucket to 16 px steps; above that the sparse ladder
+    /// takes over. The old sparse ladder (…320/384/448/512/640…) rounded common card sizes up
+    /// by 10–30 % in each dimension — a 2:3 poster at 304×456 px decoded at 341×512 (~26 %
+    /// pixel overhead), a 16:9 wide card at 520×296 at 640×360 (~52 %). Decode time, memory
+    /// occupancy and texture upload all scale with those pixels. 16 px steps keep every
+    /// card within 8 px of its ideal size while still collapsing sizes that differ by a few
+    /// pixels (the 8 px input quantization already collapses live-resize noise, so the finer
+    /// buckets add no fragmentation for fixed-size cards, which dominate).
+    private static let largePixelBuckets = [1280, 1536, 2048, 2560, 3072]
 
     private nonisolated static func bucket(for pixels: CGFloat) -> Int {
         let value = Int(min(4096, pixels.rounded(.up)))
-        for step in pixelBuckets where value <= step {
+        if value <= 1024 { return max(32, (value + 15) / 16 * 16) }
+        for step in largePixelBuckets where value <= step {
             return step
         }
         return 4096
@@ -274,6 +305,28 @@ public actor ImagePipeline {
         return Key(url: url, width: width, height: height, fitting: fitting, blur: blur)
     }
 
+    /// A sharp decode of the same artwork a blurred variant can derive from instead of
+    /// running its own download + decode chain: already-decoded pixels in memory first
+    /// (instant), then the smallest in-flight sharp decode of the same URL. `nil` when
+    /// nothing qualifies — the blur then loads its own chain, as before. Cross-fitting
+    /// reuse is intended: a blur cares about the artwork's pixels, not the decode crop.
+    private func sharpSource(for key: Key) -> Key? {
+        guard key.blur > 0 else { return nil }
+        if let cached = memory.smallestSharpEntry(forURL: key.url) {
+            return cached.key
+        }
+        var best: Key?
+        var bestPixels = Int.max
+        for candidate in inFlight.keys where candidate.url == key.url && candidate.blur == 0 {
+            let pixels = candidate.width * candidate.height
+            if pixels < bestPixels {
+                best = candidate
+                bestPixels = pixels
+            }
+        }
+        return best
+    }
+
     private func makeTask(for key: Key, blurredFrom source: Key?) -> Task<CGImage?, Never> {
         let memory = memory
         let decoder = decoder
@@ -281,29 +334,34 @@ public actor ImagePipeline {
         let target = key.target
         return Task.detached(priority: .userInitiated) {
             var reachedDecode = false
-            let image: CGImage?
-            if blur > 0, let source {
-                guard let sharp = await self.image(for: source) else { return nil }
+            var image: CGImage?
+            // A blur with a sharp source needs no download and no second decode of the
+            // encoded bytes: the blur is drawn from the sharp pixels directly. When the
+            // derivation is unavailable (sharp rejected, dead bytes), the blur falls back
+            // to its own small chain below — exactly what it would do without reuse.
+            if blur > 0, let source, !Task.isCancelled,
+               let sharp = await self.image(for: source), !Task.isCancelled {
                 reachedDecode = true
                 image = await decoder.decode {
-                    return ImageDecoder.blurred(sharp, radius: blur * 0.25, target: target)
+                    ImageDecoder.blurred(sharp, radius: blur * 0.25, target: target)
                 }
-            } else if key.url.isFileURL {
-                reachedDecode = true
-                image = await decoder.decode {
-                    let thumbnail = ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
-                    return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
+            }
+            if image == nil, !Task.isCancelled {
+                if key.url.isFileURL {
+                    reachedDecode = true
+                    image = await decoder.decode {
+                        let thumbnail = ImageDecoder.decode(fileURL: key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+                        return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
+                    }
+                } else if let data = await self.sharedData(
+                    for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+                ) {
+                    reachedDecode = true
+                    image = await decoder.decode {
+                        let thumbnail = ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
+                        return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
+                    }
                 }
-            } else if let data = await self.sharedData(
-                for: ArtworkURL.resolve(key.url, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
-            ) {
-                reachedDecode = true
-                image = await decoder.decode {
-                    let thumbnail = ImageDecoder.decode(data, target: target, fitting: key.fitting, fillsForBlur: blur > 0)
-                    return thumbnail.flatMap { blur > 0 ? ImageDecoder.blurred($0, radius: blur * 0.25) : $0 }
-                }
-            } else {
-                image = nil
             }
             // The decode queue only yields nil without running the work when the task was
             // cancelled — a live task plus a nil means the bytes were fine but the thumbnail
@@ -313,18 +371,10 @@ public actor ImagePipeline {
             }
             if let image, !Task.isCancelled {
                 memory.insert(image, for: key)
-                // Feed the colour memo from the decode that already happened: `averageRGBA`
-                // then never needs a second download for artwork on screen. Blurred variants
-                // would tint the sample, so only sharp decodes count. Sampling is ~40 µs–19 ms
-                // nobody waits for (only CategoryTile reads the memo) — keep it off the
-                // decode→display path.
-                if key.blur == 0 {
-                    let url = key.url
-                    Task { [image] in
-                        let rgba = await ImageDecoder.averageColor(of: image)
-                        await self.storeAverageColor(url, rgba)
-                    }
-                }
+                // No colour sampling here: only `CategoryTile` ever reads the average, so it
+                // is computed lazily in `averageRGBA` — reusing this very decode through the
+                // memory cache when it is asked for the same URL.
+                await self.clearDecodeFailure(key)
             }
             return image
         }
@@ -355,32 +405,51 @@ public actor ImagePipeline {
         return data
     }
 
-    /// `true` while `key` is inside its failure cooldown; drops the entry once it expires.
-    private func isCoolingDown<K: Hashable>(_ key: K, in table: inout [K: ContinuousClock.Instant]) -> Bool {
-        guard let expiry = table[key] else { return false }
-        if expiry > ContinuousClock.now { return true }
-        table[key] = nil
-        return false
+    /// `true` while `key` is inside its failure cooldown. Expired entries are left in place:
+    /// their consecutive-failure count must survive the cooldown for the backoff to escalate.
+    private func isCoolingDown<K: Hashable>(_ key: K, in table: inout [K: FailureRecord]) -> Bool {
+        guard let record = table[key] else { return false }
+        return record.expiry > ContinuousClock.now
     }
 
-    /// Records a failure for `key`, bounded like the request table: expired entries go first,
-    /// then the soonest-to-expire ones if the table is still full.
-    private func noteFailure<K: Hashable>(_ table: inout [K: ContinuousClock.Instant], _ key: K) {
+    /// Cooldown for the n-th consecutive failure: 2 min, then 10 min, then a 30 min cap.
+    private nonisolated static func failureCooldown(failures: Int) -> Duration {
+        switch failures {
+        case ...1: .seconds(120)
+        case 2: .seconds(600)
+        default: .seconds(1_800)
+        }
+    }
+
+    /// Records a failure for `key`, escalating the cooldown per consecutive failure. Bounded
+    /// like before: expired entries go first, then the soonest-to-expire ones if the table is
+    /// still full (only then is backoff state lost).
+    private func noteFailure<K: Hashable>(_ table: inout [K: FailureRecord], _ key: K) {
         if table.count >= 2_048 {
             let now = ContinuousClock.now
-            table = table.filter { $0.value > now }
+            table = table.filter { $0.value.expiry > now }
             if table.count >= 2_048 {
                 // Evict the entries closest to expiry: they are the least valuable.
-                for (k, _) in table.sorted(by: { $0.value < $1.value }).prefix(128) {
+                for (k, _) in table.sorted(by: { $0.value.expiry < $1.value.expiry }).prefix(128) {
                     table[k] = nil
                 }
             }
         }
-        table[key] = ContinuousClock.now.advanced(by: .seconds(120))
+        let failures = (table[key]?.failures ?? 0) + 1
+        table[key] = FailureRecord(
+            expiry: ContinuousClock.now.advanced(by: Self.failureCooldown(failures: failures)),
+            failures: failures
+        )
     }
 
     private func noteDecodeFailure(_ key: Key) {
         noteFailure(&failedDecodes, key)
+    }
+
+    /// Decode success restarts the key's backoff — the bytes behind the URL may have been
+    /// replaced, so earlier rejections must not escalate forever. Almost always a no-op.
+    private func clearDecodeFailure(_ key: Key) {
+        failedDecodes[key] = nil
     }
 
     private func releaseData(_ url: URL, token: ObjectIdentifier, finished: Bool, failed: Bool = false) {
@@ -389,6 +458,13 @@ public actor ImagePipeline {
             dataInFlight[url] = nil
             if failed, !entry.task.isCancelled, !entry.warmOwned {
                 noteFailure(&failedRequests, url)
+            }
+            if !failed, !entry.task.isCancelled {
+                // Bytes arrived (network or disk): the URL is alive — restart its backoff
+                // in both tables. A success can only happen outside a cooldown, so these
+                // removals almost always hit nothing.
+                failedRequests[url] = nil
+                warmFailedRequests[url] = nil
             }
             return
         }
@@ -422,6 +498,17 @@ public actor ImagePipeline {
         return await download(fallback, disk: disk, session: session, storeUndecodable: true)
     }
 
+    /// No WebP/AVIF from TMDB: its CDN serves WebP to any Accept naming it (q-values ignored),
+    /// and ImageIO decodes WebP in software — measured on the same w342 posters, JPEG decodes
+    /// ~31 % faster (2.6 vs 3.8 ms) for ~36 % more bytes. Bytes are fetched once into the
+    /// disk cache; decodes repeat on every memory-cache miss. TMDB masters are always
+    /// JPEG/PNG (WebP is only a negotiated re-encode), so asking its hosts for jpeg/png can
+    /// never break artwork. Other providers keep the wildcard: an IPTV host may serve
+    /// WebP-only artwork, and a slow decode beats a broken image.
+    private nonisolated static func acceptHeader(for url: URL) -> String {
+        ArtworkURL.isTMDBHost(url) ? "image/jpeg,image/png" : "image/jpeg,image/png,image/*;q=0.8"
+    }
+
     /// Downloads through a manually driven `URLSessionDataTask`: `ImageDownloadDelegate`
     /// rejects bad statuses, non-image MIME types and oversized `Content-Length` before the
     /// body starts, then accumulates chunks with memcpy and cancels the moment the running
@@ -429,7 +516,12 @@ public actor ImagePipeline {
     /// cost tens of ns per byte (~0.3–0.8 s of CPU for a 10 MB backdrop).
     @concurrent private nonisolated static func download(_ url: URL, disk: ImageDiskCache, session: URLSession, storeUndecodable: Bool) async -> Data? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        let task = session.dataTask(with: url)
+        // An explicit request: the Accept header is per-host, and the request mirrors the
+        // session's timeouts/cache policy because a `URLRequest`'s own values win over the
+        // configuration's.
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        request.setValue(acceptHeader(for: url), forHTTPHeaderField: "Accept")
+        let task = session.dataTask(with: request)
         let data = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 downloadDelegate.begin(task, continuation)
@@ -498,8 +590,9 @@ public actor ImagePipeline {
             Task(priority: .utility) {
                 let data = await entry.task.value
                 // Warm failures cool the warm path only — a throttled background timeout
-                // must not mark the URL dead for on-screen loads (`failedRequests`).
-                self.releaseData(request.primary, token: token, finished: true, failed: false)
+                // must not mark the URL dead for on-screen loads (`failedRequests`); the
+                // `warmOwned` flag inside `releaseData` is what keeps it that way.
+                self.releaseData(request.primary, token: token, finished: true, failed: data == nil)
                 if data == nil, !entry.task.isCancelled {
                     self.noteFailure(&self.warmFailedRequests, request.primary)
                 }
@@ -596,11 +689,15 @@ private final class ImageDownloadDelegate: NSObject, URLSessionDataDelegate, @un
 /// Bound expensive ImageIO work even when multiple shelves become visible at once.
 /// Cancelled jobs leave the queue before they allocate decoded pixels.
 private actor ImageDecodeQueue {
-    private let limit = 6
+    private let limit: Int
     private var running = 0
     private var waiting: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
 
-    func decode(_ work: @Sendable () -> CGImage?) async -> CGImage? {
+    init(limit: Int = 6) { self.limit = limit }
+
+    /// Runs `work` off the actor once a slot is free. A `nil` result either comes from
+    /// the work itself or means the task was cancelled before or during the wait.
+    func decode<T: Sendable>(_ work: @Sendable () -> T?) async -> T? {
         guard !Task.isCancelled, await acquire() else { return nil }
         defer { release() }
         guard !Task.isCancelled else { return nil }
@@ -639,7 +736,7 @@ private actor ImageDecodeQueue {
         }
     }
 
-    @concurrent private nonisolated static func perform(_ work: @Sendable () -> CGImage?) async -> CGImage? {
+    @concurrent private nonisolated static func perform<T: Sendable>(_ work: @Sendable () -> T?) async -> T? {
         autoreleasepool(invoking: work)
     }
 }
@@ -688,6 +785,20 @@ nonisolated final class MemoryCache: @unchecked Sendable {
             }
             state.bytes += bytes
             evict(&state)
+        }
+    }
+
+    /// The least memory-heavy sharp (unblurred) entry cached for `url`, if any — used to
+    /// derive average colours and blurred variants from artwork already decoded. Bounded by
+    /// the count limit; a scan is a few µs and does not refresh recency (derivations are a
+    /// bonus reuse, not a reason to keep artwork alive).
+    func smallestSharpEntry(forURL url: URL) -> (key: ImagePipeline.Key, image: CGImage)? {
+        state.withLock { state in
+            var best: (key: ImagePipeline.Key, entry: Entry)?
+            for (key, entry) in state.entries where key.url == url && key.blur == 0 {
+                if best == nil || entry.bytes < best!.entry.bytes { best = (key, entry) }
+            }
+            return best.map { ($0.key, $0.entry.image) }
         }
     }
 

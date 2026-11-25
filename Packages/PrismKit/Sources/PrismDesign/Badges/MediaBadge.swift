@@ -48,7 +48,10 @@ public struct MediaBadge: View {
                 case .outlined: shape.strokeBorder(.foreground, lineWidth: 1)
                 }
             }
-            .compositingGroup()
+            // No `.compositingGroup()`: nothing applies a group effect after it, and the
+            // rasterisation cost one badge may seem trivial but is paid per badge per frame
+            // in every tech line. The text is fully opaque over the fill, so flattening
+            // would not change the output even mid-fade.
             .accessibilityLabel(accessibilityText)
     }
 

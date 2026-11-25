@@ -1,13 +1,25 @@
 import SwiftUI
 
 /// Subtle skeleton block with a slow highlight sweep (loading shelves/grids).
+///
+/// The sweep only animates while it can be seen: pages keep their skeletons mounted at
+/// opacity 0 (page stacks) or in unselected sections, and without gating the perpetual
+/// `PhaseAnimator` composites forever offscreen. Same signals as the hero/poster wall:
+/// Reduce Motion, app/scene activity, page visibility and window occlusion.
 public struct ShimmerPlaceholder: View {
     private let cornerRadius: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.appearsActive) private var appearsActive
+    @Environment(\.isPageActive) private var isPageActive
+    @State private var isWindowVisible = true
 
     public init(cornerRadius: CGFloat = PrismMetrics.wideRadius) {
         self.cornerRadius = cornerRadius
+    }
+
+    private var animates: Bool {
+        !reduceMotion && appearsActive && isPageActive && isWindowVisible
     }
 
     public var body: some View {
@@ -15,7 +27,7 @@ public struct ShimmerPlaceholder: View {
         shape
             .fill(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.06))
             .overlay {
-                if !reduceMotion {
+                if animates {
                     PhaseAnimator([false, true]) { phase in
                         LinearGradient(
                             colors: [.clear, Color.primary.opacity(colorScheme == .dark ? 0.07 : 0.05), .clear],
@@ -29,6 +41,9 @@ public struct ShimmerPlaceholder: View {
                     }
                     .clipShape(shape)
                 }
+            }
+            .background {
+                WindowOcclusionReader(isVisible: $isWindowVisible)
             }
             .accessibilityLabel("Chargement")
     }

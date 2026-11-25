@@ -103,7 +103,7 @@ struct ZZAuditImages {
         var sink: RGBA?
         let start = clock.now
         for _ in 0..<30 {
-            sink = await ImageDecoder.averageColor(of: hero)
+            sink = ImageDecoder.averageColor(of: hero)
         }
         let per = (start.duration(to: clock.now)) / .microseconds(1) / 30
         print("ZZAUDIT averageColor(hero \(hero.width)×\(hero.height)): \(String(format: "%.0f", per)) µs each")
@@ -113,7 +113,7 @@ struct ZZAuditImages {
         let card = try #require(ImageDecoder.decode(data, target: cardTarget, fitting: .fill, fillsForBlur: false))
         let start2 = clock.now
         for _ in 0..<60 {
-            sink = await ImageDecoder.averageColor(of: card)
+            sink = ImageDecoder.averageColor(of: card)
         }
         let per2 = start2.duration(to: clock.now) / .microseconds(1) / 60
         print("ZZAUDIT averageColor(card \(card.width)×\(card.height)): \(String(format: "%.0f", per2)) µs each")

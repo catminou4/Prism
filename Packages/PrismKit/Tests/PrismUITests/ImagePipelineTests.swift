@@ -257,11 +257,18 @@ struct ImagePipelineTests {
     }
 
     @Test func keyBucketsCollapseNearbySizes() throws {
-        // 300×450 px and 304×456 px must share one cache entry (bucketed to 320×512).
+        // 300×450 px and 304×456 px must share one cache entry (bucketed to 304×464 —
+        // 16 px steps stay within a few pixels of the ideal decode size).
         let a = try makeKey("https://example.com/p.jpg", 300, 450, .fill)
         let b = try makeKey("https://example.com/p.jpg", 304, 456, .fill)
         #expect(a == b)
-        #expect(a.width == 320 && a.height == 512)
+        #expect(a.width == 304 && a.height == 464)
+        // Bucketing never shrinks the target and stays within one 16 px step of it.
+        for (input, expected) in [(300.0, 304.0), (450.0, 464.0), (520.0, 528.0), (96.0, 96.0), (1100.0, 1280.0)] {
+            let key = try makeKey("https://example.com/p.jpg", input, input, .fill)
+            #expect(key.width == Int(expected), "\(input) px buckets to \(expected)")
+            #expect(key.width >= Int(input))
+        }
         // Blur requests collapse to the fixed 96 px blurred variant.
         let blur = try makeKey("https://example.com/p.jpg", 999, 999, .fill, blur: 24)
         #expect(blur.width == 96 && blur.height == 96 && blur.blur == 24)
