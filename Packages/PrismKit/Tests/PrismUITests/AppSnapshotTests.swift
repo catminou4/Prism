@@ -67,6 +67,27 @@ struct AppSnapshotTests {
         )
     }
 
+    /// Every settings page, both appearances. Faster iteration than `mainSurfaces`.
+    @Test func settingsPages() async throws {
+        let app = await AppModel.preview()
+        // A registered sports key exercises the destructive « Retirer la clé » row of Services.
+        try? app.setSportsAPIKey("snapshot-key")
+        for (page, label) in [
+            (PrismSettingsView.Page.general, "general"),
+            (.home, "accueil"),
+            (.player, "lecteur"),
+            (.services, "services"),
+        ] {
+            for scheme in [ColorScheme.light, .dark] {
+                try await write(
+                    PrismSettingsView(initialPage: page).environment(app),
+                    label: "reglages-\(label)\(scheme == .light ? "-light" : "")",
+                    size: CGSize(width: 600, height: 560), scheme: scheme
+                )
+            }
+        }
+    }
+
     @Test func mainSurfaces() async throws {
         let app = await AppModel.preview()
         let movie = try #require(app.catalog.movies.first { $0.variants.count > 1 })
@@ -87,11 +108,11 @@ struct AppSnapshotTests {
         )
         try await write(
             PrismSettingsView().environment(app),
-            label: "reglages", size: CGSize(width: 560, height: 470), scheme: .light
+            label: "reglages", size: CGSize(width: 600, height: 470), scheme: .light
         )
         try await write(
             PrismSettingsView(initialPage: .services).environment(app),
-            label: "reglages-services", size: CGSize(width: 560, height: 470)
+            label: "reglages-services", size: CGSize(width: 600, height: 470)
         )
         try await write(
             LibraryShell().environment(demo),
