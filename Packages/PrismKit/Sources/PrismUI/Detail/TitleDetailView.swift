@@ -159,7 +159,10 @@ private struct TitleDetailContent: View {
            inventory.contains(titleLatest.contentID) {
             latest = titleLatest
         } else {
-            latest = inventory.latestProgress(in: library.progress)
+            // Fallback for entries whose titleID was never recorded. Per-content
+            // lookups: this subtree subscribes to the progress cells of this edition's
+            // episodes only, not to the whole progress table's writes.
+            latest = inventory.latestProgress(progressFor: { library.progress(for: $0) })
         }
         return inventory.nextEpisode(after: latest, isWatched: library.isWatched)
     }

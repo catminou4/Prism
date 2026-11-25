@@ -31,13 +31,21 @@ nonisolated struct DetailEpisodeInventory: Sendable {
     }
 
     func latestProgress(in progress: [ContentID: PlaybackProgress]) -> PlaybackProgress? {
-        let older: (PlaybackProgress, PlaybackProgress) -> Bool = { first, second in
-            first.updatedAt == second.updatedAt ? first.contentID < second.contentID : first.updatedAt < second.updatedAt
-        }
         if progress.count < orderedEpisodes.count {
-            return progress.values.lazy.filter { episodeIndices[$0.contentID] != nil }.max(by: older)
+            return progress.values.lazy.filter { episodeIndices[$0.contentID] != nil }.max(by: Self.older)
         }
-        return orderedEpisodes.lazy.compactMap { progress[$0.id] }.max(by: older)
+        return orderedEpisodes.lazy.compactMap { progress[$0.id] }.max(by: Self.older)
+    }
+
+    /// Same maximum as `latestProgress(in:)`, resolved through per-content lookups:
+    /// a view body reading progress this way subscribes only to the progress cells of
+    /// this edition's episodes — an unrelated playback tick never reaches the page.
+    func latestProgress(progressFor resolve: @escaping (ContentID) -> PlaybackProgress?) -> PlaybackProgress? {
+        orderedEpisodes.lazy.compactMap { resolve($0.id) }.max(by: Self.older)
+    }
+
+    private static func older(_ first: PlaybackProgress, _ second: PlaybackProgress) -> Bool {
+        first.updatedAt == second.updatedAt ? first.contentID < second.contentID : first.updatedAt < second.updatedAt
     }
 
     /// Whether `id` is one of this edition's episode streams.

@@ -9,17 +9,24 @@ struct SportsHomeShelf: View {
     @Environment(NavigationModel.self) private var navigation
     @Environment(SportsPresentation.self) private var sports: SportsPresentation?
     @Environment(\.playPrismItem) private var playItem
+    @Environment(\.isPageActive) private var isActive
+    @State private var memo = HomeFixturesMemo()
 
     var body: some View {
         VStack(spacing: 0) {
             if let sports {
-                let fixtures = Self.homeFixtures(sports.fixtures, now: sports.now)
+                // The presentation is shared with the Sports page: while Home is buried
+                // its ticks must not re-evaluate this shelf, and even visible, the
+                // selection is memoized — five filter passes + per-fixture normalization
+                // don't belong in every unrelated body evaluation.
+                let now = isActive ? sports.now : Date.now
+                let fixtures = memo.value(for: sports.fixtures, now: now)
                 if !fixtures.isEmpty {
                     // One union pass for the per-card status/source badges instead of
                     // ~16 independent glass effects across the shelf.
                     GlassEffectContainer(spacing: 8) {
                         Shelf(title: "Sport", items: fixtures, sizing: .columns(minWidth: 260), onHeaderTap: { navigation.select(.sports) }) { fixture in
-                            SportsHomeCard(fixture: fixture, now: sports.now) {
+                            SportsHomeCard(fixture: fixture, now: now) {
                                 let broadcasts = fixture.liveBroadcasts(at: .now)
                                 if let broadcast = broadcasts.first, broadcasts.count == 1 {
                                     SportsPlayback(app: app, play: playItem)(broadcast)
@@ -59,6 +66,26 @@ struct SportsHomeShelf: View {
             if distinct.count == limit { break }
         }
         return distinct
+    }
+}
+
+/// Cache of the last home-shelf selection, keyed by its exact inputs. `homeFixtures`
+/// runs five filter passes plus a per-fixture `TitleNormalizer` normalization; the
+/// array equality check that gates the memo is far cheaper, so unrelated body
+/// re-evaluations (scroll, hover, library writes) reuse the previous selection.
+/// Not observed: the memo never invalidates anything by itself.
+private final class HomeFixturesMemo {
+    private var fixtures: [SportsFixture]?
+    private var now: Date?
+    private var result: [SportsFixture] = []
+
+    func value(for fixtures: [SportsFixture], now: Date) -> [SportsFixture] {
+        if self.fixtures == fixtures, self.now == now { return result }
+        let result = SportsHomeShelf.homeFixtures(fixtures, now: now)
+        self.fixtures = fixtures
+        self.now = now
+        self.result = result
+        return result
     }
 }
 

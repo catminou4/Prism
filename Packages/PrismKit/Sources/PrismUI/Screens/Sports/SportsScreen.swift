@@ -29,7 +29,11 @@ struct SportsScreen: View {
 
     var body: some View {
         if let sports {
-            let now = sports.now
+            // Hidden-but-mounted pages skip the `sports.now` read: the presentation is
+            // shared with the Home shelf, whose own update loop keeps ticking while this
+            // page is buried — subscribing here would rebuild every agenda each minute
+            // for an invisible page. `isActive` flips re-evaluate with a fresh clock.
+            let now = isActive ? sports.now : Date.now
             let calendar = Calendar.current
             let today = calendar.startOfDay(for: now)
             let days = calendarDays(startingAt: today, calendar: calendar)

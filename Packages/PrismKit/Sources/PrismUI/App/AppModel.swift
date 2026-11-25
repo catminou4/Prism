@@ -310,18 +310,26 @@ public final class AppModel {
         guard !didBootstrap else { return }
         didBootstrap = true
         sources = sourceStore.load()
-        isMetadataEnabled = await metadataRepository.isEnabled
+        // La lecture Keychain des métadonnées part en parallèle du decode des caches :
+        // aucune des deux ne dépend de l'autre, et l'attente ne doit pas se sérialiser
+        // devant le chemin critique vers `.ready`.
+        async let metadataEnabled = metadataRepository.isEnabled
         // Le decode des caches démarre dès que `sources` est connu : il ne dépend ni de
         // `library.json` ni des métadonnées, et chaque ms compte avant `.ready`.
         async let cached = catalogRepository.cachedCatalogs(for: sources)
-        // `library.json` is decoded off the main actor since `init`: await it on every
-        // path (onboarding included) so no caller can mutate the store while the disk
-        // snapshot is still in flight — a pre-load mutation would otherwise discard it.
-        await library.awaitDiskLoad()
+        // L'onboarding ne touche pas à la bibliothèque et les chemins d'import/rebuild
+        // re-attendent tous `awaitDiskLoad` : inutile de bloquer l'affichage de
+        // l'onboarding sur le decode de `library.json`.
         guard !sources.isEmpty else {
+            isMetadataEnabled = await metadataEnabled
             phase = .onboarding
             return
         }
+        isMetadataEnabled = await metadataEnabled
+        // `library.json` is decoded off the main actor since `init`: await it before the
+        // first catalog publish so no caller can mutate the store while the disk snapshot
+        // is still in flight — a pre-load mutation would otherwise discard it.
+        await library.awaitDiskLoad()
         for catalog in await cached {
             sourceCatalogs[catalog.sourceID] = catalog
             if let account = catalog.account { accounts[catalog.sourceID] = account }
@@ -330,18 +338,24 @@ public final class AppModel {
         // `reconcileTitles` therefore sees the real collections, not empty ones.
         await rebuildCatalog()
         phase = .ready
-        // Le guide n'est pas nécessaire à `.ready` : le démarrer ici l'empêche de
-        // disputer les cœurs avec le decode catalogue pendant la fenêtre critique
-        // (~250 ms mesurées), au prix d'un guide disponible ~1 s plus tard.
-        guide = await epgRepository.cachedGuide(for: sources)
+        // Maintenance post-`.ready`, en tâche de fond : le decode du guide et les
+        // rafraîchissements démarrent immédiatement mais à basse priorité, sans disputer
+        // les cœurs avec la composition du premier contenu (index de curation) pendant
+        // la fenêtre critique. Le guide reste néanmoins disponible rapidement — les pages
+        // TV/Guide l'attendent déjà via leurs états vides et `refreshGuide`.
+        Task(priority: .background) { [weak self] in
+            guard let self else { return }
+            let sources = self.sources
+            self.guide = await self.epgRepository.cachedGuide(for: sources)
 
-        let now = Date.now
-        for source in sources where source.isEnabled {
-            let stale = sourceCatalogs[source.id] == nil
-                || (source.lastRefreshedAt.map { now.timeIntervalSince($0) > Self.catalogMaxAge } ?? true)
-            if stale { Task { await refresh(source.id) } }
+            let now = Date.now
+            for source in sources where source.isEnabled {
+                let stale = self.sourceCatalogs[source.id] == nil
+                    || (source.lastRefreshedAt.map { now.timeIntervalSince($0) > Self.catalogMaxAge } ?? true)
+                if stale { Task { await self.refresh(source.id) } }
+            }
+            Task { await self.refreshGuideIfStale() }
         }
-        Task { await refreshGuideIfStale() }
     }
 
     /// Called by the onboarding when the user enters the app.

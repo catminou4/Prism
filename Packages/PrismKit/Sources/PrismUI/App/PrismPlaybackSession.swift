@@ -167,10 +167,22 @@ struct PrismPlaybackWindow: View {
         .frame(minWidth: 520, minHeight: 292)
         .onChange(of: session.controller?.phase) { _, _ in session.playbackBegan(app: app) }
         .task(id: session.seriesEditionID) { await session.loadEpisodeInventory(app: app) }
-        .task(id: session.controller?.isLive == true) {
+        // The poll exists for programme *changes*, and a resolved programme has a known
+        // end: sleep until that boundary (+1 s of slack) instead of polling every 25 s for
+        // the whole life of a live playback. The 25 s cadence remains while no programme
+        // is resolved (empty or partial guide). The id carries the content so zapping —
+        // which swaps the programme — restarts the clock on the new channel's boundary.
+        .task(id: session.controller?.isLive == true ? session.contentID : nil) {
             guard session.controller?.isLive == true else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(25))
+                let now = Date.now
+                let delay: TimeInterval
+                if let end = session.controller?.liveProgramme?.end, end > now {
+                    delay = end.timeIntervalSince(now) + 1
+                } else {
+                    delay = 25
+                }
+                try? await Task.sleep(for: .seconds(delay), tolerance: .seconds(2))
                 guard !Task.isCancelled else { return }
                 session.updateProgramme(app: app)
             }

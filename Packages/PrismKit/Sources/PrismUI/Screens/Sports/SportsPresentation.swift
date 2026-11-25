@@ -28,15 +28,24 @@ final class SportsPresentation {
             now = .now
             async let scores = app.sportsRepository.scoreboard()
             if scheduleKey != key {
-                let window = Self.scheduleWindow(from: key.day)
-                let schedule = await app.guide.sportsSchedule(channels: app.catalog.channels, in: window)
-                guard !Task.isCancelled else { return }
-                broadcasts = schedule
-                scheduleKey = key
-                if !schedule.isEmpty {
-                    await updateFixtures(with: displayedEvents, key: key)
+                // An empty guide yields an empty schedule: skip the matching pass
+                // (channels × programmes) entirely. The key stamps the empty state
+                // either way, and `guideRevision` in the key re-runs the match as
+                // soon as the post-launch guide decode lands.
+                if app.guide.isEmpty {
+                    broadcasts = []
+                    scheduleKey = key
+                } else {
+                    let window = Self.scheduleWindow(from: key.day)
+                    let schedule = await app.guide.sportsSchedule(channels: app.catalog.channels, in: window)
                     guard !Task.isCancelled else { return }
-                    hasLoaded = true
+                    broadcasts = schedule
+                    scheduleKey = key
+                    if !schedule.isEmpty {
+                        await updateFixtures(with: displayedEvents, key: key)
+                        guard !Task.isCancelled else { return }
+                        hasLoaded = true
+                    }
                 }
             }
             let snapshot = await scores
@@ -102,12 +111,17 @@ struct SportsUpdates: ViewModifier {
     @Environment(\.appearsActive) private var appearsActive
 
     func body(content: Content) -> some View {
-        let day = Calendar.current.startOfDay(for: presentation?.now ?? .now)
-        let key = isActive && appearsActive ? SportsScheduleKey(
+        // The minute-level polling and the guide matching are background refresh work,
+        // not first-composition work: `.utility` keeps them off the launch critical path.
+        // `now` is only read while the page is active — hidden-but-mounted pages must
+        // not subscribe to the ticks (the key is nil then anyway).
+        let active = isActive && appearsActive
+        let day = active ? Calendar.current.startOfDay(for: presentation?.now ?? .now) : .distantPast
+        let key = active ? SportsScheduleKey(
             day: day, guideRevision: app.guideRevision, catalogRevision: app.catalogRevision,
             settingsRevision: app.sportsSettingsRevision
         ) : nil
-        content.task(id: key) {
+        content.task(id: key, priority: .utility) {
             if let key { await presentation?.run(app: app, key: key) }
         }
     }

@@ -5,6 +5,19 @@ import PrismData
 import PrismDesign
 import PrismPlayer
 
+/// Order-sensitive fingerprint of a sequence of ids — same change detection as
+/// collecting them into an array for `.animation(value:)`/`.onChange(of:)`, without
+/// allocating that array on every body evaluation (HeroCarousel's `itemsSignature`).
+private func idSignature<S: Sequence>(_ ids: S) -> Int where S.Element: Hashable {
+    var signature = 0
+    var count = 0
+    for id in ids {
+        signature = signature &* 31 &+ id.hashValue
+        count &+= 1
+    }
+    return signature &+ count
+}
+
 struct BrowseScreen: View {
     @Environment(AppModel.self) private var app
     @Environment(NavigationModel.self) private var navigation
@@ -68,8 +81,8 @@ struct BrowseScreen: View {
                 }
                 .padding(.bottom, 48)
                 // A new composition (first load, languages, a day later) cross-fades row by row
-                // instead of popping.
-                .animation(reduceMotion ? nil : PrismMotion.entrance, value: feed.shelves.map(\.id))
+                // instead of popping. The fold avoids allocating the id array per evaluation.
+                .animation(reduceMotion ? nil : PrismMotion.entrance, value: idSignature(feed.shelves.lazy.map(\.id)))
             }
             .scrollContentBackground(.hidden)
             .onScrollGeometryChange(for: Bool.self) { scroll in
@@ -289,7 +302,7 @@ private struct BrowseHero: View {
             motion.heroTitle = currentTitle
             loadMoreIfNeeded()
         }
-        .onChange(of: items.map(\.id)) { _, _ in motion.heroTitle = currentTitle }
+        .onChange(of: idSignature(items.lazy.map(\.id))) { _, _ in motion.heroTitle = currentTitle }
         .task(id: PagerKey(request: app.curationRequest(for: scope), highlights: highlights.map(\.id))) {
             let previousID = motion.heroTitle?.id
             loadingTask?.cancel()

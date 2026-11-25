@@ -48,12 +48,11 @@ public final class LibraryStore {
     public private(set) var favoriteChannels: [String] = [] {
         didSet { favoriteChannelSet = Set(favoriteChannels) }
     }
-    public private(set) var progress: [ContentID: PlaybackProgress] = [:] {
-        didSet {
-            latestByTitle = nil
-            continueWatchingRevision &+= 1
-        }
-    }
+    /// The full resume-point table. Reads of single entries should go through
+    /// `progress(for:)`/`latestProgress(forTitle:)`: those subscribe to one
+    /// observable cell per key, so a playback position tick invalidates only the
+    /// views showing that exact content — not every progress reader.
+    public private(set) var progress: [ContentID: PlaybackProgress] = [:]
     public private(set) var watched: Set<ContentID> = [] {
         didSet { continueWatchingRevision &+= 1 }
     }
@@ -88,13 +87,13 @@ public final class LibraryStore {
 
     private var storedLastChannelGroupID: String?
 
-    public static let maxHistory = 200
-    static let maxDismissed = 2_000
-    static let maxProgressEntries = 3_000
-    static let maxWatched = 20_000
-    static let maxWatchlist = 2_000
-    static let maxFavoriteChannels = 1_000
-    static let maxPreferredEntries = 5_000
+    public nonisolated static let maxHistory = 200
+    nonisolated static let maxDismissed = 2_000
+    nonisolated static let maxProgressEntries = 3_000
+    nonisolated static let maxWatched = 20_000
+    nonisolated static let maxWatchlist = 2_000
+    nonisolated static let maxFavoriteChannels = 1_000
+    nonisolated static let maxPreferredEntries = 5_000
 
     @ObservationIgnored private let fileURL: URL?
     @ObservationIgnored private let saveDelay: Duration
@@ -110,7 +109,17 @@ public final class LibraryStore {
     @ObservationIgnored private(set) var saveCount = 0
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private let writer = LibraryWriter()
-    @ObservationIgnored private var latestByTitle: [TitleID: PlaybackProgress]?
+    /// Per-content and per-title observable mirrors of `progress`, same narrowing
+    /// pattern as the import cells in `AppModel`: the dictionaries mutate only when
+    /// a cell is created (first write for the key — itself a continue-watching
+    /// membership change), while the frequent writes — playback position ticks —
+    /// invalidate just the readers of that one key. Every `progress` mutation
+    /// funnels through `writeProgress`/`rebuildProgressMirrors` to keep them exact.
+    private var progressCells: [ContentID: PlaybackProgressCell] = [:]
+    private var latestCells: [TitleID: PlaybackProgressCell] = [:]
+    /// Reverse index of `progress` by title: recomputing one title's latest entry
+    /// scans its own contents instead of the whole table on every write.
+    @ObservationIgnored private var contentIDsByTitle: [TitleID: Set<ContentID>] = [:]
 
     /// Loads `library.json` off the main actor (a few MB at the collection caps
     /// would otherwise decode synchronously inside `AppModel.init`, on the first
@@ -126,20 +135,52 @@ public final class LibraryStore {
         self.loadTask = nil
         if let fileURL {
             loadTask = Task { [weak self] in
-                guard let file = await Self.decode(fileURL), let self,
+                guard let prepared = await Self.decode(fileURL), let self,
                       !Task.isCancelled, !self.hasLocalChanges else { return }
-                self.apply(file)
+                self.apply(prepared)
             }
         }
     }
 
-    /// Reads and decodes `library.json` on a worker: JSON decoding a multi-MB
-    /// file on the main actor stalls first-frame work.
-    nonisolated private static func decode(_ url: URL) async -> LibraryFile? {
+    /// Reads, decodes and caps `library.json` on a worker: JSON decoding a multi-MB
+    /// file — and building its large dictionaries/sets — on the main actor stalls
+    /// first-frame work. `@concurrent` is required: with NonisolatedNonsendingByDefault
+    /// a plain `nonisolated` async function would resume on the calling (main) actor.
+    @concurrent private static func decode(_ url: URL) async -> PreparedLibrary? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(LibraryFile.self, from: data)
+        guard let file = try? decoder.decode(LibraryFile.self, from: data) else { return nil }
+        return prepare(file)
+    }
+
+    /// A hand-edited or corrupt `library.json` must not grow the in-memory state without
+    /// bound: every collection is capped here (and again on mutation). Runs in the decode
+    /// worker so `apply` on the main actor only assigns already-built collections; the
+    /// capping order is unchanged — progress pruning decides which entries watched pruning
+    /// still sees.
+    nonisolated private static func prepare(_ file: LibraryFile) -> PreparedLibrary {
+        let progress = prunedProgress(Dictionary(
+            file.progress.map { ($0.contentID, $0) },
+            uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 }
+        ))
+        return PreparedLibrary(
+            watchlist: Array(file.watchlist.prefix(Self.maxWatchlist)),
+            favoriteChannels: Array(file.favoriteChannels.prefix(Self.maxFavoriteChannels)),
+            progress: progress,
+            watched: prunedWatched(Set(file.watched), progress: progress),
+            history: Array(file.history.prefix(Self.maxHistory)),
+            preferredVariants: Dictionary(
+                file.preferredVariants.prefix(Self.maxPreferredEntries).map { (TitleID(rawValue: $0.key), $0.contentID) },
+                uniquingKeysWith: { a, _ in a }
+            ),
+            preferredChannelVariants: Dictionary(
+                file.preferredChannelVariants.prefix(Self.maxPreferredEntries).map { ($0.key, $0.contentID) },
+                uniquingKeysWith: { a, _ in a }
+            ),
+            lastChannelGroupID: file.lastChannelGroupID,
+            dismissed: Array(file.dismissed.prefix(Self.maxDismissed))
+        )
     }
 
     /// Non-persistent store for previews and tests.
@@ -232,16 +273,12 @@ public final class LibraryStore {
 
     // MARK: - Progress & watched state
 
-    public func progress(for id: ContentID) -> PlaybackProgress? { progress[id] }
+    public func progress(for id: ContentID) -> PlaybackProgress? { progressCells[id]?.value }
 
-    /// Latest progress recorded for any content of a grouped title.
+    /// Latest progress recorded for any content of a grouped title. Reads one
+    /// observable cell per title: a tick on an unrelated title doesn't invalidate.
     public func latestProgress(forTitle id: TitleID) -> PlaybackProgress? {
-        // Read the observed change token even when the index is already built.
-        _ = continueWatchingRevision
-        if latestByTitle == nil {
-            latestByTitle = Self.latestEntries(in: progress)
-        }
-        return latestByTitle?[id]
+        latestCells[id]?.value
     }
 
     /// Updates the resume point in memory immediately; the disk write is debounced.
@@ -249,7 +286,7 @@ public final class LibraryStore {
         guard newValue.position.isFinite, newValue.duration.isFinite, newValue.position >= 0 else { return }
         var value = newValue
         if value.titleID == nil { value.titleID = progress[value.contentID]?.titleID }
-        progress[value.contentID] = value
+        writeProgress(value, for: value.contentID)
         if value.isFinished, !watched.contains(value.contentID) { watched.insert(value.contentID) }
         pruneProgressIfNeeded()
         pruneWatchedIfNeeded()
@@ -258,7 +295,7 @@ public final class LibraryStore {
 
     public func clearProgress(for id: ContentID) {
         guard progress[id] != nil else { return }
-        progress[id] = nil
+        writeProgress(nil, for: id)
         scheduleSave()
     }
 
@@ -266,9 +303,9 @@ public final class LibraryStore {
         watched.insert(id)
         let existing = progress[id]
         let duration = max(existing?.duration ?? 0, 1)
-        progress[id] = PlaybackProgress(
+        writeProgress(PlaybackProgress(
             contentID: id, titleID: titleID ?? existing?.titleID, position: duration, duration: duration, updatedAt: .now
-        )
+        ), for: id)
         pruneProgressIfNeeded()
         pruneWatchedIfNeeded()
         scheduleSave()
@@ -276,12 +313,108 @@ public final class LibraryStore {
 
     public func markUnwatched(_ id: ContentID) {
         watched.remove(id)
-        progress[id] = nil
+        writeProgress(nil, for: id)
         scheduleSave()
     }
 
     public func isWatched(_ id: ContentID) -> Bool {
-        watched.contains(id) || progress[id]?.isFinished == true
+        watched.contains(id) || progressCells[id]?.value?.isFinished == true
+    }
+
+    /// Single funnel for every `progress` mutation. Besides the write itself it:
+    /// - mirrors the entry into the content's observable cell (created on first write),
+    /// - maintains the per-title reverse index and refreshes the affected titles'
+    ///   latest-entry cells,
+    /// - bumps `continueWatchingRevision` only when shelf *membership* can change:
+    ///   an entry appearing or disappearing, its finish/`position >= 5` facet or its
+    ///   title flipping, or the title's latest entry becoming a different content.
+    ///   A position-only tick on an existing entry therefore leaves the shelf alone.
+    private func writeProgress(_ entry: PlaybackProgress?, for id: ContentID) {
+        let old = progress[id]
+        guard old != entry else { return }
+        progress[id] = entry
+
+        if let cell = progressCells[id] {
+            cell.value = entry
+        } else if entry != nil {
+            progressCells[id] = PlaybackProgressCell(value: entry)
+        }
+
+        var affectedTitles: Set<TitleID> = []
+        if let oldTitle = old?.titleID, oldTitle != entry?.titleID {
+            contentIDsByTitle[oldTitle]?.remove(id)
+            if contentIDsByTitle[oldTitle]?.isEmpty == true { contentIDsByTitle[oldTitle] = nil }
+            affectedTitles.insert(oldTitle)
+        }
+        if let newTitle = entry?.titleID {
+            if old?.titleID != newTitle { contentIDsByTitle[newTitle, default: []].insert(id) }
+            affectedTitles.insert(newTitle)
+        }
+
+        var membershipChanged = (old == nil) != (entry == nil)
+        if let old, let entry,
+           old.titleID != entry.titleID || old.isFinished != entry.isFinished || (old.position >= 5) != (entry.position >= 5) {
+            membershipChanged = true
+        }
+        for title in affectedTitles {
+            if refreshLatestCell(for: title) { membershipChanged = true }
+        }
+        if membershipChanged { continueWatchingRevision &+= 1 }
+    }
+
+    /// Recomputes one title's latest entry — max by (updatedAt, contentID), same
+    /// tiebreak as `latestEntries` — and mirrors it into the title's cell when it
+    /// changed. Returns whether the latest entry is now a *different* content.
+    @discardableResult
+    private func refreshLatestCell(for title: TitleID) -> Bool {
+        var latest: PlaybackProgress?
+        for id in contentIDsByTitle[title] ?? [] {
+            guard let entry = progress[id] else { continue }
+            if let current = latest,
+               current.updatedAt > entry.updatedAt || (current.updatedAt == entry.updatedAt && current.contentID > entry.contentID) {
+                continue
+            }
+            latest = entry
+        }
+        let cell = latestCells[title]
+        let identityChanged = cell?.value?.contentID != latest?.contentID
+        if let cell {
+            if cell.value != latest { cell.value = latest }
+        } else if let latest {
+            latestCells[title] = PlaybackProgressCell(value: latest)
+        }
+        return identityChanged
+    }
+
+    /// Rebuilds the reverse index and re-mirrors every cell after a bulk replacement
+    /// of `progress` (disk apply, title reconciliation). Cell writes are equality-guarded,
+    /// so only contents whose entry actually changed invalidate their readers.
+    private func rebuildProgressMirrors() {
+        var index: [TitleID: Set<ContentID>] = [:]
+        for (id, entry) in progress {
+            guard let title = entry.titleID else { continue }
+            index[title, default: []].insert(id)
+        }
+        contentIDsByTitle = index
+
+        for (id, entry) in progress {
+            if let cell = progressCells[id] {
+                if cell.value != entry { cell.value = entry }
+            } else {
+                progressCells[id] = PlaybackProgressCell(value: entry)
+            }
+        }
+        for (id, cell) in progressCells where progress[id] == nil {
+            if cell.value != nil { cell.value = nil }
+        }
+
+        var membershipChanged = false
+        var titles = Set(index.keys)
+        titles.formUnion(latestCells.keys)
+        for title in titles {
+            if refreshLatestCell(for: title) { membershipChanged = true }
+        }
+        if membershipChanged { continueWatchingRevision &+= 1 }
     }
 
     // MARK: - History
@@ -337,7 +470,7 @@ public final class LibraryStore {
             let resolved = catalog.titleID(containing: contentID) ?? entry.titleID.flatMap { catalog.title($0)?.id }
             if let resolved, resolved != entry.titleID {
                 entry.titleID = resolved
-                progress[contentID] = entry
+                writeProgress(entry, for: contentID)
                 didChange = true
             }
         }
@@ -528,13 +661,27 @@ public final class LibraryStore {
     }
 
     private func pruneProgressIfNeeded() {
+        guard progress.count - Self.maxProgressEntries > 0 else { return }
+        let pruned = Self.prunedProgress(progress)
+        // Pruning only removes entries: route each drop through the mutation funnel
+        // so cells, the title index and the shelf revision stay exact. The key list
+        // is materialized first — `progress` mutates inside the loop.
+        let dropped = progress.keys.filter { pruned[$0] == nil }
+        for id in dropped {
+            writeProgress(nil, for: id)
+        }
+    }
+
+    /// Pure counterpart of the mutation-path pruning, shared with the disk-load
+    /// worker. Mutations past the cap overflow by one entry at a time: a full sort of
+    /// thousands of values ran on the main actor on EVERY playback tick. Drop the
+    /// few oldest entries with linear scans instead (updatedAt ties were already
+    /// arbitrary — `sorted` is not stable); large overflows (disk apply) still sort.
+    nonisolated static func prunedProgress(_ progress: [ContentID: PlaybackProgress]) -> [ContentID: PlaybackProgress] {
         let overflow = progress.count - Self.maxProgressEntries
-        guard overflow > 0 else { return }
-        // Mutations past the cap overflow by one entry at a time: a full sort of
-        // thousands of values ran on the main actor on EVERY playback tick. Drop the
-        // few oldest entries with linear scans instead (updatedAt ties were already
-        // arbitrary — `sorted` is not stable); large overflows (disk apply) still sort.
+        guard overflow > 0 else { return progress }
         if overflow <= 8 {
+            var progress = progress
             for _ in 0..<overflow {
                 var oldest: (key: ContentID, updatedAt: Date)?
                 for (key, value) in progress {
@@ -544,21 +691,28 @@ public final class LibraryStore {
                 guard let drop = oldest else { break }
                 progress[drop.key] = nil
             }
-            return
+            return progress
         }
         let keep = progress.values.sorted { $0.updatedAt > $1.updatedAt }.prefix(Self.maxProgressEntries)
-        progress = Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
+        return Dictionary(uniqueKeysWithValues: keep.map { ($0.contentID, $0) })
     }
 
     /// `watched` has no timestamps: entries without a progress entry are the oldest (progress
     /// itself keeps only the 3 000 most recent), then the oldest resume points go first.
     private func pruneWatchedIfNeeded() {
+        guard watched.count - Self.maxWatched > 0 else { return }
+        watched = Self.prunedWatched(watched, progress: progress)
+    }
+
+    /// Pure counterpart of the mutation-path pruning. Same small-overflow fast path as
+    /// `prunedProgress`: the drop candidate is the smallest progress-updatedAt
+    /// (distantPast when absent), then — matching the sort's ascending rawValue
+    /// tiebreak — the largest rawValue.
+    nonisolated static func prunedWatched(_ watched: Set<ContentID>, progress: [ContentID: PlaybackProgress]) -> Set<ContentID> {
         let overflow = watched.count - Self.maxWatched
-        guard overflow > 0 else { return }
-        // Same small-overflow fast path as `pruneProgressIfNeeded`: the drop candidate is
-        // the smallest progress-updatedAt (distantPast when absent), then — matching the
-        // sort's ascending rawValue tiebreak — the largest rawValue.
+        guard overflow > 0 else { return watched }
         if overflow <= 8 {
+            var watched = watched
             for _ in 0..<overflow {
                 var oldest: (id: ContentID, date: Date)?
                 for id in watched {
@@ -571,14 +725,14 @@ public final class LibraryStore {
                 guard let drop = oldest else { break }
                 watched.remove(drop.id)
             }
-            return
+            return watched
         }
         let ordered = watched.sorted { lhs, rhs in
             let l = progress[lhs]?.updatedAt ?? .distantPast
             let r = progress[rhs]?.updatedAt ?? .distantPast
             return l == r ? lhs.rawValue < rhs.rawValue : l > r
         }
-        watched = Set(ordered.prefix(Self.maxWatched))
+        return Set(ordered.prefix(Self.maxWatched))
     }
 
     /// Capture the current collections here. Encoding and the write run off the
@@ -606,27 +760,48 @@ public final class LibraryStore {
         }
     }
 
-    /// A hand-edited or corrupt `library.json` must not grow the in-memory state without bound:
-    /// every collection is capped here (and again on mutation).
-    private func apply(_ file: LibraryFile) {
-        watchlist = Array(file.watchlist.prefix(Self.maxWatchlist))
-        favoriteChannels = Array(file.favoriteChannels.prefix(Self.maxFavoriteChannels))
-        progress = Dictionary(file.progress.map { ($0.contentID, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
-        pruneProgressIfNeeded()
-        watched = Set(file.watched)
-        pruneWatchedIfNeeded()
-        history = Array(file.history.prefix(Self.maxHistory))
-        preferredVariants = Dictionary(
-            file.preferredVariants.prefix(Self.maxPreferredEntries).map { (TitleID(rawValue: $0.key), $0.contentID) },
-            uniquingKeysWith: { a, _ in a }
-        )
-        preferredChannelVariants = Dictionary(
-            file.preferredChannelVariants.prefix(Self.maxPreferredEntries).map { ($0.key, $0.contentID) },
-            uniquingKeysWith: { a, _ in a }
-        )
-        storedLastChannelGroupID = file.lastChannelGroupID
-        dismissed = Array(file.dismissed.prefix(Self.maxDismissed))
+    /// The decode worker already built and capped every collection (`PreparedLibrary`):
+    /// applying the disk state is a handful of assignments, not multi-MB dictionary work.
+    private func apply(_ prepared: PreparedLibrary) {
+        watchlist = prepared.watchlist
+        favoriteChannels = prepared.favoriteChannels
+        progress = prepared.progress
+        watched = prepared.watched
+        history = prepared.history
+        preferredVariants = prepared.preferredVariants
+        preferredChannelVariants = prepared.preferredChannelVariants
+        storedLastChannelGroupID = prepared.lastChannelGroupID
+        dismissed = prepared.dismissed
+        rebuildProgressMirrors()
     }
+}
+
+/// One observable cell per content (`progressCells`) or per title (`latestCells`).
+/// Views reading `progress(for:)`/`latestProgress(forTitle:)` subscribe to a single
+/// cell, so a playback position tick invalidates just the cards/mastheads showing
+/// that content instead of every progress reader in the app.
+@MainActor
+@Observable
+final class PlaybackProgressCell {
+    var value: PlaybackProgress?
+
+    init(value: PlaybackProgress? = nil) {
+        self.value = value
+    }
+}
+
+/// Capped collections produced by the `library.json` decode worker, ready for
+/// assignment on the main actor. Caps match what `apply` enforced inline before.
+struct PreparedLibrary: Sendable {
+    var watchlist: [TitleID]
+    var favoriteChannels: [String]
+    var progress: [ContentID: PlaybackProgress]
+    var watched: Set<ContentID>
+    var history: [HistoryEntry]
+    var preferredVariants: [TitleID: ContentID]
+    var preferredChannelVariants: [String: ContentID]
+    var lastChannelGroupID: String?
+    var dismissed: [TitleID]
 }
 
 /// Serialises library writes: a snapshot older than the last one written is dropped, so a slow
