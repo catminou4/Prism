@@ -73,7 +73,7 @@ public final class PlayerController {
     public var liveProgramme: LiveProgramme?
     /// Whether the "Épisode suivant" card should be on screen: last 30 s of a VOD item
     /// (or the ended state). Published as a Bool so the up-next host doesn't subscribe
-    /// to the 4 Hz clock for a card that is hidden almost all of the time.
+    /// to the 2 Hz clock for a card that is hidden almost all of the time.
     public private(set) var upNextVisible = false
 
     public let preferences: PlayerPreferences
@@ -496,7 +496,7 @@ public final class PlayerController {
                 $0.upperBound - $0.lowerBound >= minimumWindow ? $0 : nil
             }
             // A continuously growing DVR window would otherwise rewrite `timeshiftWindow`
-            // at the engine's poll rate (~4 Hz) — every write re-evaluates PlayerView and
+            // at the engine's poll rate (~2 Hz) — every write re-evaluates PlayerView and
             // the scrubber. Sub-second drift is invisible on the timeline: publish only
             // on ≥0.5 s bound movement (≈1 Hz worst case while the window slides).
             let changed: Bool

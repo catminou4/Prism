@@ -118,7 +118,7 @@ nonisolated public enum EnginePlaybackState: Sendable, Hashable {
 nonisolated public enum EngineEvent: Sendable, Equatable {
     /// The media is ready; `duration` is nil for live/unknown.
     case ready(duration: TimeInterval?)
-    /// Periodic time update (≈ 4 Hz).
+    /// Periodic time update (≈ 2 Hz).
     case time(current: TimeInterval, buffered: TimeInterval)
     case state(EnginePlaybackState)
     /// The first video frame was rendered (or the audio-only stream started).

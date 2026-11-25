@@ -53,7 +53,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
     /// Names+counts fingerprint, only computed on elementary-stream events to catch
     /// same-count track swaps without paying for it on every poll.
     private var trackNamesSignature = ""
-    /// `seekableRange` hits libvlc locks; the controller polls it at 4 Hz for live.
+    /// `seekableRange` hits libvlc locks; the controller polls it at 2 Hz for live.
     private var seekableRangeCache: (range: ClosedRange<TimeInterval>?, at: ContinuousClock.Instant)?
     /// Codec/FPS extracted from `tracksInformation` (expensive): computed once per
     /// media, re-probed a bounded number of times while codecs are still missing
@@ -122,6 +122,11 @@ final class VLCEngine: NSObject, PlaybackEngine {
         media.addOption(":http-reconnect")
         media.addOption(":no-video-title-show")
         media.addOption(":clock-jitter=0")
+        // Prefer hardware decode (VideoToolbox) explicitly instead of relying on
+        // libvlc's compiled default: software-decoded MPEG-TS is the player's biggest
+        // CPU/energy cost by far. `any` still falls back to software codecs when no
+        // hardware decoder exists for the format.
+        media.addOption(":avcodec-hw=any")
         // Subtitle rendering is an input option in libvlc (applies to this media only;
         // a runtime style change lands on the next loaded item).
         switch subtitleStyle {
@@ -258,7 +263,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
     /// libvlc cannot restyle subtitles at runtime; the style applies on next load only.
     var subtitleStyle: SubtitleStyle
 
-    /// Cached ~1 s: every call crosses libvlc locks and the controller polls at 4 Hz.
+    /// Cached ~1 s: every call crosses libvlc locks and the controller polls at 2 Hz.
     var seekableRange: ClosedRange<TimeInterval>? {
         guard isLive else { return nil }
         let now = ContinuousClock.now
@@ -546,7 +551,7 @@ final class VLCEngine: NSObject, PlaybackEngine {
         // run below costs several libvlc calls on the main thread (time, isPlaying,
         // hasVideoOut, track counts…): sample the playhead at ~100 ms — ready,
         // first-frame and stall detection don't need frame granularity. Once the
-        // first frame lands, the 250 ms emit gate already bounds the work.
+        // first frame lands, the 500 ms emit gate already bounds the work.
         let bodyDue: Bool
         if didReportFirstFrame {
             bodyDue = publishesTime
@@ -569,7 +574,9 @@ final class VLCEngine: NSObject, PlaybackEngine {
         }
         let seconds = TimeInterval(ms) / 1000
         if publishesTime {
-            nextTimeUpdate = now.advanced(by: .milliseconds(250))
+            // 2 Hz like the AVFoundation engine: the scrubber resolves seconds, seeks
+            // confirm through `seek(to:)`'s own poll and stall detection waits 8 s.
+            nextTimeUpdate = now.advanced(by: .milliseconds(500))
             // libvlc exposes no buffered-ahead position (VLCKit 3.6 offers only
             // time/position/seekable + VLCMedia.Stats counters): `buffered` stays
             // equal to `current`, the scrubber's buffered bar is cosmetic for VLC.
@@ -668,17 +675,56 @@ final class VLCEngine: NSObject, PlaybackEngine {
     }
 }
 
+/// Collapses time-changed bursts before they hop to the main actor. libvlc fires at
+/// input-clock rate (10–40 Hz for MPEG-TS) while the engine samples the playhead at
+/// most every 100 ms pre-first-frame and publishes at 2 Hz — intermediate evaluations
+/// only run the gate logic for nothing. Thread-safe: VLCKit 3 posts delegate callbacks
+/// on the main thread, but nothing in the API guarantees it.
+nonisolated final class TimeChangeCoalescer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastEvaluation: ContinuousClock.Instant?
+    private var hopPending = false
+
+    /// Cheap gate running on the caller's thread: admits at most one evaluation per
+    /// 100 ms and never schedules a second hop while one is still in flight. Dropping
+    /// a notification loses nothing — the evaluation reads the player's current state
+    /// rather than anything carried by the notification itself.
+    func shouldEvaluate(now: ContinuousClock.Instant = .now) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if hopPending { return false }
+        if let lastEvaluation, now - lastEvaluation < .milliseconds(100) { return false }
+        hopPending = true
+        return true
+    }
+
+    /// Runs inside the hop, whether the owner still exists or not: releases the pending
+    /// flag and starts the 100 ms window at the actual evaluation instant.
+    func didEvaluate(now: ContinuousClock.Instant = .now) {
+        lock.lock()
+        hopPending = false
+        lastEvaluation = now
+        lock.unlock()
+    }
+}
+
 /// Objective-C delegate living outside the engine so callbacks hop to the main actor safely
 /// (VLCKit 3 posts them on the main thread, but nothing in the API guarantees it).
 final class VLCDelegateProxy: NSObject, VLCMediaPlayerDelegate {
     weak var owner: VLCEngine?
+    private let timeCoalescer = TimeChangeCoalescer()
 
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
         onMainActor { [weak self] in self?.owner?.handleStateChange() }
     }
 
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
-        onMainActor { [weak self] in self?.owner?.handleTimeChange() }
+        guard timeCoalescer.shouldEvaluate() else { return }
+        let coalescer = timeCoalescer
+        onMainActor { [weak self] in
+            coalescer.didEvaluate()
+            self?.owner?.handleTimeChange()
+        }
     }
 }
 

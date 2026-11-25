@@ -56,8 +56,14 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
     private var videoCodec: String?
     private var audioCodec: String?
     /// `seekableTimeRanges` bridges an NSArray per call and the controller polls it
-    /// at ~4 Hz for live streams; ~1 s of staleness is invisible on a DVR window.
+    /// at ~2 Hz for live streams; ~1 s of staleness is invisible on a DVR window.
     private var seekableRangeCache: (range: ClosedRange<TimeInterval>?, at: ContinuousClock.Instant)?
+    /// `loadedTimeRanges` bridges an NSArray of boxed `CMTimeRange`s on every access.
+    /// The buffer edge moves at segment granularity (seconds), so the unboxed ranges
+    /// are cached for ~1 s while the cheap coverage scan still runs on every tick —
+    /// keeping `buffered` correct across seeks, which a wall-clock-only cache of the
+    /// result would not be (the covering range depends on the playhead position).
+    private var loadedRangesCache: (ranges: [CMTimeRange], at: ContinuousClock.Instant)?
 
     private var pipController: AVPictureInPictureController?
     private var pipObservation: NSKeyValueObservation?
@@ -350,7 +356,13 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
 
     private func addTimeObserver() {
         guard timeObserverToken == nil else { return }
-        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        // 2 Hz, not more: every tick is a main-thread wakeup for the whole playback
+        // (~14 400 over a 2 h movie at this rate) and nothing needs finer granularity —
+        // timecode labels resolve seconds, seeks publish their target optimistically
+        // instead of waiting for a tick, the up-next card owns the last 30 s with a
+        // single flip, stall detection waits 8 s and progress reporting 20 s. The
+        // scrubber knob/bar move in sub-point steps per tick at this rate.
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) {
             [weak self] time in
             let seconds = time.seconds
@@ -519,16 +531,7 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
 
     private func handleTime(_ seconds: TimeInterval) {
         guard let item = currentItem, seconds.isFinite else { return }
-        var buffered = seconds
-        for value in item.loadedTimeRanges {
-            let range = value.timeRangeValue
-            let start = range.start.seconds
-            let end = range.end.seconds
-            if start.isFinite, end.isFinite, start <= seconds + 0.5, end >= seconds {
-                buffered = max(buffered, end)
-            }
-        }
-        eventHandler?(.time(current: seconds, buffered: buffered))
+        eventHandler?(.time(current: seconds, buffered: bufferedTime(for: item, at: seconds)))
         // Audio-only streams never become "ready for display".
         if !didReportFirstFrame, didReportReady, seconds > 0.3, item.presentationSize == .zero,
             player.timeControlStatus == .playing
@@ -536,6 +539,30 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
             didReportFirstFrame = true
             eventHandler?(.firstFrame)
         }
+    }
+
+    /// End of the buffered run covering the playhead. The expensive part — bridging and
+    /// unboxing `loadedTimeRanges` — is refreshed at most once per second; the coverage
+    /// scan itself is a handful of comparisons on already-unboxed values and runs per
+    /// tick so a seek immediately re-evaluates against the new playhead position.
+    private func bufferedTime(for item: AVPlayerItem, at seconds: TimeInterval) -> TimeInterval {
+        let now = ContinuousClock.now
+        let ranges: [CMTimeRange]
+        if let cache = loadedRangesCache, now - cache.at < .seconds(1) {
+            ranges = cache.ranges
+        } else {
+            ranges = item.loadedTimeRanges.map(\.timeRangeValue)
+            loadedRangesCache = (ranges, now)
+        }
+        var buffered = seconds
+        for range in ranges {
+            let start = range.start.seconds
+            let end = range.end.seconds
+            if start.isFinite, end.isFinite, start <= seconds + 0.5, end >= seconds {
+                buffered = max(buffered, end)
+            }
+        }
+        return buffered
     }
 
     private func report(_ state: EnginePlaybackState) {
@@ -563,6 +590,7 @@ final class AVFoundationEngine: NSObject, PlaybackEngine {
         audioCodec = nil
         lastPresentationSize = .zero
         seekableRangeCache = nil
+        loadedRangesCache = nil
         currentItem = nil
     }
 

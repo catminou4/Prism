@@ -561,7 +561,7 @@ public struct PlayerView<InfoAccessory: View, SidePanel: View, UpNext: View>: Vi
 }
 
 /// Shows the `upNext` slot during the last 30 s of a VOD item. Reads the controller's
-/// `upNextVisible` flag (flips once) instead of the 4 Hz clock, so the host only
+/// `upNextVisible` flag (flips once) instead of the 2 Hz clock, so the host only
 /// subscribes to `currentTime` while the card is actually on screen.
 private struct PlayerUpNextHost<Content: View>: View {
     let controller: PlayerController

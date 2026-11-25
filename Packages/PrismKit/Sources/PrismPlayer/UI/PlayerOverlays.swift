@@ -247,7 +247,10 @@ public struct PlayerUpNextCard<Artwork: View>: View {
                 }
                 .frame(width: 36, height: 36)
                 .contentShape(Circle())
-                .animation(reduceMotion ? nil : .linear(duration: 0.25), value: progress)
+                // `progress` steps at the engines' 2 Hz publish rate: matching the
+                // duration to the step interval keeps the ring in continuous motion
+                // instead of covering each step in half the time and pausing.
+                .animation(reduceMotion ? nil : .linear(duration: 0.5), value: progress)
             }
             .buttonStyle(.plain)
             .help("Lire maintenant")
