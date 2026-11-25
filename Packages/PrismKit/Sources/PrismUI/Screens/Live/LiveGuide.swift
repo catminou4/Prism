@@ -39,6 +39,9 @@ struct LiveGuide<ChannelMenu: View>: View {
     @Environment(\.isPageActive) private var isPageActive
     @Environment(\.appearsActive) private var appearsActive
     @State private var clock = GuideClock()
+    /// Live mirror of the guide's scroll phase: the rows read it without invalidating —
+    /// only a currently-hovered button observes the flip, the rest never re-evaluate.
+    @State private var scrollActivity = ScrollActivity()
 
     var body: some View {
         GeometryReader { geometry in
@@ -65,7 +68,8 @@ struct LiveGuide<ChannelMenu: View>: View {
                 }
                 .accessibilityLabel("Grille des programmes TV")
                 .scrollEdgeEffectStyle(.soft, for: .top)
-                .prismScrollPhase()
+                .prismScrollPhase { scrolling in scrollActivity.update(isScrolling: scrolling) }
+                .environment(\.prismScrollActivity, scrollActivity)
             }
             .padding(.top, 8)
         }
@@ -252,7 +256,7 @@ private struct GuideChannelButton: View {
     let play: () -> Void
     @State private var hovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.prismScrollActivity) private var scrollActivity
 
     var body: some View {
         Button(action: play) {
@@ -282,9 +286,13 @@ private struct GuideChannelButton: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .onHover { if !isScrollingContent { hovered = $0 } }
-        .onChange(of: isScrollingContent) { _, scrolling in
-            if scrolling && hovered { hovered = false }
+        // Live read through the activity object: correct without any re-evaluation.
+        .onHover { if scrollActivity?.isScrolling != true { hovered = $0 } }
+        // Short-circuited behind `hovered`: unhovered buttons never subscribe to the
+        // scroll phase, so a scroll start/stop no longer re-evaluates every row — only
+        // the one hovered button invalidates, drops its hover, then unsubscribes.
+        .onChange(of: hovered && (scrollActivity?.isScrolling ?? false)) { _, shouldReset in
+            if shouldReset { hovered = false }
         }
         .animation(reduceMotion ? nil : PrismMotion.quickFade, value: hovered)
         .help(channel.name)
@@ -306,7 +314,7 @@ private struct GuideProgrammeButton: View {
     @State private var isLive: Bool
     @State private var mightReplay: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.prismIsScrollingContent) private var isScrollingContent
+    @Environment(\.prismScrollActivity) private var scrollActivity
 
     init(program: EPGProgram, width: CGFloat, archiveWindow: Int, onPlay: @escaping () -> Void, replay: @escaping () -> (() -> Void)?) {
         self.program = program
@@ -356,9 +364,13 @@ private struct GuideProgrammeButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(.rect(cornerRadius: PrismMetrics.listRowRadius))
-        .onHover { if !isScrollingContent { hovered = $0 } }
-        .onChange(of: isScrollingContent) { _, scrolling in
-            if scrolling && hovered { hovered = false }
+        // Live read through the activity object: correct without any re-evaluation.
+        .onHover { if scrollActivity?.isScrolling != true { hovered = $0 } }
+        // Short-circuited behind `hovered`: unhovered buttons never subscribe to the
+        // scroll phase, so a scroll start/stop no longer re-evaluates every programme —
+        // only the one hovered button invalidates, drops its hover, then unsubscribes.
+        .onChange(of: hovered && (scrollActivity?.isScrolling ?? false)) { _, shouldReset in
+            if shouldReset { hovered = false }
         }
         .animation(reduceMotion ? nil : PrismMotion.quickFade, value: hovered)
         .help("\(program.title) · \(times)")

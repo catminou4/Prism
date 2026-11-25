@@ -36,10 +36,8 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     @State private var viewport = ShelfViewport()
     @State private var measuredWidth: CGFloat = 0
     @State private var hovering = false
-    @State private var rowScrolling = false
     @Environment(\.prismShelfViewportWidth) private var layoutWidth
     @Environment(\.prismSnapshotHover) private var forcedHover
-    @Environment(\.prismIsScrollingContent) private var parentRowIsScrolling
     @Environment(\.prismScrollActivity) private var scrollActivity
     @ScrollingContent private var isScrollingContent
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -83,7 +81,6 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     }
 
     public var body: some View {
-        let warm = warmRequest
         VStack(alignment: .leading, spacing: PrismMetrics.shelfHeaderSpacing) {
             if let title {
                 ShelfHeader(title, subtitle: subtitle, action: onHeaderTap)
@@ -97,11 +94,7 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         // shelf (header + row) in the middle of a page scroll. The box debounces the
         // warm off the view tree instead.
         .onScrollVisibilityChange(threshold: 0.15) { visible in
-            warmBox.setVisible(visible, warm, activity: scrollActivity)
-        }
-        // Row scrolling/resizing changes the warm target without a visibility event.
-        .onChange(of: warm) { _, request in
-            warmBox.refresh(request, activity: scrollActivity)
+            warmBox.setVisible(visible, activity: scrollActivity)
         }
         .onDisappear { warmBox.cancel() }
     }
@@ -111,13 +104,24 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         let pixelSize: CGSize
     }
 
-    private var warmRequest: WarmRequest? {
+    /// Artwork warm target for the posters just past the visible columns. Computed in the
+    /// scroll-geometry callback rather than in `body`: the closure runs off the view
+    /// re-evaluation path, reads the container width straight from the geometry (fresher
+    /// than the `measuredWidth` it feeds) and derives the leading column from the offset
+    /// in O(1) — no per-invalidation scan of `items` for the anchored identifier.
+    /// The visible window *is* the offset, so a one-row difference from the anchored
+    /// item is immaterial for a prefetch that runs six posters ahead.
+    private func warmRequest(edges: ScrollEdges) -> WarmRequest? {
         guard let posterArtwork, !items.isEmpty else { return nil }
-        let width = itemWidth
-        let available = (layoutWidth ?? measuredWidth) - margin * 2
+        let available = (layoutWidth ?? edges.width) - margin * 2
+        let width: CGFloat = switch sizing {
+        case .fixed(let fixed): fixed
+        case .columns(let minWidth): PrismMetrics.columnWidth(available: available, minWidth: minWidth, spacing: spacing)
+        }
         guard available > 0, width > 0 else { return nil }
-        let leading = leadingItem.flatMap { id in items.firstIndex { $0.id == id } } ?? 0
-        let columns = max(1, Int((available + spacing) / (width + spacing)))
+        let stride = max(1, width + spacing)
+        let leading = min(max(0, Int((edges.offset - edges.minOffset) / stride)), items.count - 1)
+        let columns = max(1, Int((available + spacing) / stride))
         let first = min(items.count, leading + columns)
         let urls = items.dropFirst(first).prefix(6).compactMap { $0[keyPath: posterArtwork] }
         guard !urls.isEmpty else { return nil }
@@ -130,16 +134,21 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
     /// shelf — class storage is invisible to SwiftUI observation.
     private final class WarmBox {
         private(set) var isVisible = false
+        private var current: WarmRequest?
         private var task: Task<Void, Never>?
 
         /// Visibility threshold crossed: remember it, then arm or cancel the pending warm.
-        func setVisible(_ visible: Bool, _ request: WarmRequest?, activity: ScrollActivity?) {
+        func setVisible(_ visible: Bool, activity: ScrollActivity?) {
             isVisible = visible
-            schedule(visible ? request : nil, activity: activity)
+            schedule(visible ? current : nil, activity: activity)
         }
 
-        /// The warm target changed (row scrolled, width changed, items swapped).
+        /// The warm target changed (row scrolled, width changed, items swapped). Called
+        /// once per scroll-geometry frame: requests are deduplicated because the target
+        /// only moves when the leading column crosses a card.
         func refresh(_ request: WarmRequest?, activity: ScrollActivity?) {
+            guard request != current else { return }
+            current = request
             schedule(isVisible ? request : nil, activity: activity)
         }
 
@@ -193,15 +202,16 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
         .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
         .scrollPosition(id: $leadingItem, anchor: .leading)
         // Cards suspend hover lift/shadow while this row (or an ancestor scroller) moves.
-        .environment(\.prismIsScrollingContent, parentRowIsScrolling || rowScrolling)
-        .onScrollPhaseChange { _, phase in
-            rowScrolling = phase.isScrolling
-        }
+        // Isolated in a leaf modifier: a scroll start/stop re-evaluates that leaf alone
+        // instead of the shelf body (header + row structure). Cards read the environment
+        // conditionally, so only a hovered card or an in-flight image is ever invalidated.
+        .modifier(RowScrollEnvironment())
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
             ScrollEdges(geometry: geometry)
         } action: { _, newValue in
             viewport.update(newValue)
             if layoutWidth == nil, measuredWidth != newValue.width { measuredWidth = newValue.width }
+            warmBox.refresh(warmRequest(edges: newValue), activity: scrollActivity)
         }
         .padding(.top, -Self.liftInset.top)
         .padding(.bottom, -Self.liftInset.bottom)
@@ -245,6 +255,24 @@ public struct Shelf<Item: Identifiable, Card: View>: View {
 extension EnvironmentValues {
     /// The proposed width for full-width shelves in the library's content column.
     @Entry public var prismShelfViewportWidth: CGFloat? = nil
+}
+
+/// Combined row/page scroll phase for the cards inside one shelf row, written to
+/// `prismIsScrollingContent`. Kept in a leaf modifier so a scroll start/stop re-evaluates
+/// this leaf alone instead of the shelf body (header + row structure) — and, transitively,
+/// keeps the cards untouched unless they conditionally read the value (hovered card or
+/// in-flight artwork).
+private struct RowScrollEnvironment: ViewModifier {
+    @Environment(\.prismIsScrollingContent) private var parentRowIsScrolling
+    @State private var rowScrolling = false
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.prismIsScrollingContent, parentRowIsScrolling || rowScrolling)
+            .onScrollPhaseChange { _, phase in
+                rowScrolling = phase.isScrolling
+            }
+    }
 }
 
 /// Paging uses the exact offsets. Only the chevron overlay observes edge availability.
