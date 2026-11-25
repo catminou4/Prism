@@ -91,21 +91,61 @@ public enum RecommendationBuilder {
         }
         var editorialCopy: [TitleID: Recommendations.EditorialCopy] = [:]
         let matchStart = ContinuousClock.now
-        var candidates = 0
-        let editorial = EditorialSelection.shelves.map { shelf in
-            shelf.map { entry in
-                entry.matches(in: catalog).map { title in
-                    candidates += 1
-                    let copy = editorialCopy[title.id] ?? .init(
-                        title: entry.name, plot: homePlot(for: title), originalLanguage: entry.originalLanguage
-                    )
-                    editorialCopy[title.id] = copy
-                    var item = title
-                    item.title = copy.title
-                    item.plot = copy.plot
-                    return Candidate(item: item, audio: availableAudio(for: title, original: entry.originalLanguage, catalog: catalog))
+        // Plot language recognition dominates on multi-edition titles and is independent per
+        // editorial entry. Compute entries concurrently, then fold the indexed partials back in
+        // shelf/entry order: candidate order and first-wins ownership of `editorialCopy` remain
+        // exactly those of the former serial loop.
+        let jobs = EditorialSelection.shelves.flatMap { $0 }
+        let works = await withTaskGroup(of: (Int, EditorialEntryWork).self) { group in
+            for (index, entry) in jobs.enumerated() {
+                group.addTask {
+                    let matches = entry.matches(in: catalog).map { title in
+                        EditorialMatchWork(
+                            title: title,
+                            plot: homePlot(for: title),
+                            audio: availableAudio(for: title, original: entry.originalLanguage, catalog: catalog)
+                        )
+                    }
+                    return (index, EditorialEntryWork(matches: matches))
                 }
             }
+            var results = [EditorialEntryWork?](repeating: nil, count: jobs.count)
+            for await (index, work) in group { results[index] = work }
+            return results
+        }
+
+        var candidates = 0
+        var position = 0
+        var editorial: [[[Candidate]]] = []
+        editorial.reserveCapacity(EditorialSelection.shelves.count)
+        for shelf in EditorialSelection.shelves {
+            var versionsByEntry: [[Candidate]] = []
+            versionsByEntry.reserveCapacity(shelf.count)
+            for entry in shelf {
+                let work = works[position] ?? EditorialEntryWork()
+                position += 1
+                var versions: [Candidate] = []
+                versions.reserveCapacity(work.matches.count)
+                for match in work.matches {
+                    candidates += 1
+                    let copy: Recommendations.EditorialCopy
+                    if let existing = editorialCopy[match.title.id] {
+                        copy = existing
+                    } else {
+                        let created = Recommendations.EditorialCopy(
+                            title: entry.name, plot: match.plot, originalLanguage: entry.originalLanguage
+                        )
+                        editorialCopy[match.title.id] = created
+                        copy = created
+                    }
+                    var item = match.title
+                    item.title = copy.title
+                    item.plot = copy.plot
+                    versions.append(Candidate(item: item, audio: match.audio))
+                }
+                versionsByEntry.append(versions)
+            }
+            editorial.append(versionsByEntry)
         }
         BuildProfile.mark("editorial matches+candidates (\(candidates))", since: matchStart)
 
@@ -176,6 +216,18 @@ public enum RecommendationBuilder {
 
     private struct Candidate {
         let item: MediaTitle
+        let audio: Set<HomeAudioLanguage>
+    }
+
+    /// Concurrent per-entry scan result. The first-wins copy merge stays serial, so these carry
+    /// the entry's own plot/audio facts rather than presentation-ready items.
+    private struct EditorialEntryWork: Sendable {
+        var matches: [EditorialMatchWork] = []
+    }
+
+    private struct EditorialMatchWork: Sendable {
+        let title: MediaTitle
+        let plot: String?
         let audio: Set<HomeAudioLanguage>
     }
 
