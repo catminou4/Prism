@@ -64,6 +64,16 @@ input-format independent, not cured by heap prewarming). Any single cold measure
 interpreted against that floor. `queryLatencyAt100k` / `performance150k` are load-sensitive
 flakes — rerun in isolation before believing a failure.
 
+## Cache formats (post-2026-11 perf rounds)
+
+Catalog and EPG disk caches use the versioned binary archive in `PrismData/Stores/BinaryArchive.swift`
+(PRSG magic + uint32 version, per-segment interned string tables). Both are at **version 2** with v1
+still readable: first launch after upgrade decodes v1 and re-encodes v2 at `.background` priority
+without overwriting fresher saves. When touching cache code, keep the migration oracle tests green
+and the readers fuzz-hardened (bit flips must never crash). Dev-loop trap: freshly rebuilt app
+binaries trigger a keychain authorization prompt on first read (keychain ACLs don't trust the new
+cdhash) and `AppModel.bootstrap` blocks on it — this is environmental, not a regression.
+
 ## Conventions
 
 - Swift 6, `@Observable` models, `@State` owned at the right level, `@Environment` for app-wide models.
