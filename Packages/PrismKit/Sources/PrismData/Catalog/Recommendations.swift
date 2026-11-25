@@ -67,8 +67,21 @@ public struct Recommendations: Sendable {
 }
 
 public enum RecommendationBuilder {
+    /// Full recommendations, including the expensive catalog-wide fallback scan.
+    /// Kept as the compatibility API; new launch code uses the two stages below so
+    /// editorial naming/copy is available early without putting the fallback scan
+    /// on the catalog-publication critical path.
     @concurrent
     public static func build(for catalog: Catalog) async -> Recommendations {
+        let editorial = await buildEditorial(for: catalog)
+        return await completeWithFallback(editorial, for: catalog)
+    }
+
+    /// Cheap editorial stage: canonical names, plots, original-language hints and the
+    /// curated editorial shelves. This is the only part consumed by `CurationIndex`,
+    /// `SearchIndex` and feed presentation, so it must land before those builds start.
+    @concurrent
+    public static func buildEditorial(for catalog: Catalog) async -> Recommendations {
         if !catalog.sources.isEmpty, catalog.sources.allSatisfy(DemoContent.isDemo) {
             let titles = catalog.featured(limit: 7)
             let selection = RecommendationSelection(highlights: titles, french: [], american: [], discoveries: [], wellRated: titles)
@@ -107,32 +120,52 @@ public enum RecommendationBuilder {
                 return items
             }
         }
-        let fallbackChoices = zip(choices, curatedChoices).compactMap { languages, curated in
-            curated.allSatisfy(\.isEmpty) ? languages : nil
-        }
-        var rated: [[Set<HomeAudioLanguage>: [MediaTitle]]] = []
-        if !fallbackChoices.isEmpty, catalog.indexes.hasTaggedEditions || !catalog.indexes.categoryLanguages.isEmpty {
-            let excluded = Set(editorialCopy.keys)
-            async let movies = fallback(catalog.movies, choices: fallbackChoices, catalog: catalog, excluding: excluded)
-            async let series = fallback(catalog.series, choices: fallbackChoices, catalog: catalog, excluding: excluded)
-            rated = await [movies, series]
-        }
 
         var selections: [Set<HomeAudioLanguage>: RecommendationSelection] = [:]
         for (languages, curated) in zip(choices, curatedChoices) {
-            let fallback = interleaved(rated.map { $0[languages] ?? [] }, limit: 24)
             let spotlight = interleaved(curated.map(artworkFirst), limit: 7)
-            let fallbackHighlights: [MediaTitle] = spotlight.isEmpty ? artworkFirst(fallback).prefix(7).map { item in
-                var visible = item
-                visible.plot = homePlot(for: item)
-                return visible
-            } : []
             selections[languages] = RecommendationSelection(
-                highlights: spotlight.isEmpty ? fallbackHighlights : artworkFirst(spotlight),
-                french: curated[0], american: curated[1], discoveries: curated[2], wellRated: fallback
+                highlights: artworkFirst(spotlight),
+                french: curated[0], american: curated[1], discoveries: curated[2], wellRated: []
             )
         }
         return Recommendations(selections: selections, editorialCopy: editorialCopy)
+    }
+
+    /// Expensive completion stage: scan the whole catalog only for language choices whose
+    /// editorial shelves are empty. The scan feeds `wellRated` and fallback hero candidates;
+    /// it does not change `editorialCopy`, so indexes built from the editorial stage remain valid.
+    @concurrent
+    public static func completeWithFallback(_ base: Recommendations, for catalog: Catalog) async -> Recommendations {
+        if !catalog.sources.isEmpty, catalog.sources.allSatisfy(DemoContent.isDemo) { return base }
+        let choices: [Set<HomeAudioLanguage>] = [HomeAudioLanguage.defaults, [.french], [.english]]
+        let fallbackChoices = choices.filter { languages in
+            let selection = base.selections[languages] ?? .empty
+            return selection.french.isEmpty && selection.american.isEmpty && selection.discoveries.isEmpty
+        }
+        guard !fallbackChoices.isEmpty, catalog.indexes.hasTaggedEditions || !catalog.indexes.categoryLanguages.isEmpty else {
+            return base
+        }
+        let excluded = Set(base.editorialCopy.keys)
+        async let movies = fallback(catalog.movies, choices: fallbackChoices, catalog: catalog, excluding: excluded)
+        async let series = fallback(catalog.series, choices: fallbackChoices, catalog: catalog, excluding: excluded)
+        let rated = await [movies, series]
+
+        var selections = base.selections
+        for languages in choices {
+            let existing = selections[languages] ?? .empty
+            let fallback = interleaved(rated.map { $0[languages] ?? [] }, limit: 24)
+            let fallbackHighlights: [MediaTitle] = existing.highlights.isEmpty ? artworkFirst(fallback).prefix(7).map { item in
+                var visible = item
+                visible.plot = homePlot(for: item)
+                return visible
+            } : existing.highlights
+            selections[languages] = RecommendationSelection(
+                highlights: fallbackHighlights,
+                french: existing.french, american: existing.american, discoveries: existing.discoveries, wellRated: fallback
+            )
+        }
+        return Recommendations(selections: selections, editorialCopy: base.editorialCopy)
     }
 
     private struct Candidate {

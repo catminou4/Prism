@@ -161,6 +161,10 @@ public struct CurationIndex: Sendable {
 
     // MARK: - Build
 
+    // Recommendation input is deliberately limited to `editorialCopy` (canonical names and
+    // original-language hints). The catalog-wide fallback selections are not read here, which
+    // is what allows launch publication to build this index once while fallback recommendations
+    // are still completing in the background.
     @concurrent
     public static func build(catalog: Catalog, recommendations: Recommendations, now: Date = .now) async -> CurationIndex {
         let calendar = Calendar(identifier: .gregorian)
@@ -520,8 +524,10 @@ public struct CurationIndex: Sendable {
         "HDLIGHT", "4KLIGHT",
     ]
 
-    /// Any tag that is not about picture quality, or a language-named category.
-    private static func hasLanguageHints(_ title: MediaTitle, catalog: Catalog) -> Bool {
+    /// `true` when provider tags/categories give any evidence about the title's audio:
+    /// any tag that is not about picture quality, or a language-named category.
+    /// Internal so the pre-index Home seed applies the same unknown-audio rule as the index.
+    static func hasLanguageHints(_ title: MediaTitle, catalog: Catalog) -> Bool {
         title.variants.indices.prefix(16).contains { index in
             title.variants[index].tags.contains { !pictureTags.contains($0) }
                 || !catalog.providerLanguages(for: title.variants[index]).isEmpty

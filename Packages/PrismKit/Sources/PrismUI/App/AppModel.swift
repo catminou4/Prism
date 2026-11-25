@@ -82,6 +82,9 @@ public final class AppModel {
     private var trendingRevision = 0
     @ObservationIgnored private var trendingTask: Task<Void, Never>?
     @ObservationIgnored private var curationTask: Task<Void, Never>?
+    /// Completion stage for catalog-wide fallback recommendations. Kept off the publish
+    /// critical path; editorial copy needed by indexes is already present before publishing.
+    @ObservationIgnored private var recommendationsTask: Task<Void, Never>?
     private var hiddenCategoriesBySource: [String: [String]] = [:]
     /// Bumped every time `catalog` is replaced (cheap change token for views/tasks).
     public private(set) var catalogRevision = 0
@@ -208,10 +211,16 @@ public final class AppModel {
     fileprivate struct CuratedResult {
         let request: CurationRequest
         let feed: CuratedFeed
+        /// `true` only for the lightweight pre-index Home seed. Seed feeds may be replaced
+        /// by another seed before the first real feed, but never after a real feed exists.
+        let isSeed: Bool
     }
 
     @Observable fileprivate final class CuratedFeedState {
         var result: CuratedResult?
+        /// Scope-local latch: once index-backed content has been composed, later catalog
+        /// refreshes keep the previous real feed visible instead of flashing back to seed content.
+        var hasRealFeed = false
     }
 
     /// What the curated shelves know about the user (local only).
@@ -244,14 +253,36 @@ public final class AppModel {
 
     public func refreshFeed(_ request: CurationRequest) async {
         guard let state = curatedFeeds[request.scope], request == curationRequest(for: request.scope), state.result?.request != request,
-              curationIndex.isBuilt, !Task.isCancelled else { return }
-        let catalog = self.catalog, index = curationIndex, recommendations = self.recommendations
+              !Task.isCancelled else { return }
+        let catalog = self.catalog, recommendations = self.recommendations
+
+        // Before the first index exists, Home can already show deterministic catalog content:
+        // featured hero candidates plus a recently-added shelf. This is deliberately limited
+        // to the pre-first-real-feed window. On later catalog refreshes the previous real feed
+        // remains visible while its index-backed replacement is built, so shelves never flash
+        // back to seed content.
+        if !curationIndex.isBuilt {
+            let maySeed = request.scope == .home && !state.hasRealFeed && (state.result == nil || state.result?.isSeed == true)
+            guard maySeed, !catalog.isEmpty else { return }
+            let seed = await Curator.seedHome(
+                catalog: catalog, recommendations: recommendations, languages: request.languages, profile: request.profile
+            )
+            guard !Task.isCancelled, request == curationRequest(for: request.scope),
+                  !curationIndex.isBuilt, !state.hasRealFeed else { return }
+            if !seed.isEmpty {
+                state.result = CuratedResult(request: request, feed: seed, isSeed: true)
+            }
+            return
+        }
+
+        let index = curationIndex
         let feed = await Curator.feed(
             scope: request.scope, catalog: catalog, index: index, recommendations: recommendations,
             languages: request.languages, profile: request.profile, trending: trendingIDs
         )
         guard !Task.isCancelled, request == curationRequest(for: request.scope) else { return }
-        state.result = CuratedResult(request: request, feed: feed)
+        state.result = CuratedResult(request: request, feed: feed, isSeed: false)
+        state.hasRealFeed = true
         if isMetadataEnabled, trendingTask == nil, trendingIDs.isEmpty { refreshTrending() }
     }
 
@@ -708,6 +739,8 @@ public final class AppModel {
         rebuildGeneration &+= 1
         catalogTask?.cancel()
         searchTask?.cancel()
+        recommendationsTask?.cancel()
+        recommendationsTask = nil
         let sources = self.sources
         let catalogs = sources.compactMap { sourceCatalogs[$0.id] }
         let options = CatalogBuildOptions(
@@ -717,11 +750,37 @@ public final class AppModel {
         catalogTask = Task { [weak self] in
             let built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
             guard !Task.isCancelled else { return }
-            let recommendations = await RecommendationBuilder.build(for: built)
+            // Only the cheap editorial stage is awaited before publication: index/search/feed
+            // naming consume `editorialCopy`, while the catalog-wide fallback scan is completed
+            // concurrently after the catalog is already usable.
+            let recommendations = await RecommendationBuilder.buildEditorial(for: built)
             guard !Task.isCancelled else { return }
             self?.publish(built, recommendations: recommendations)
         }
         await waitForCurrentCatalog(includingSearch: includingSearch)
+    }
+
+    /// Compares the small user-visible recommendation shelves. `editorialCopy` is identical
+    /// across the staged completion by construction and is internal to PrismData.
+    private static func sameRecommendationSelections(_ lhs: Recommendations, _ rhs: Recommendations) -> Bool {
+        func sameTitles(_ a: [MediaTitle], _ b: [MediaTitle]) -> Bool {
+            guard a.count == b.count else { return false }
+            // `MediaTitle` equality is deep and series can carry thousands of episodes; the
+            // staged completion never rewrites variants, only which titles are selected and
+            // occasionally their display plot/name.
+            for (left, right) in zip(a, b) where left.id != right.id || left.title != right.title || left.plot != right.plot {
+                return false
+            }
+            return true
+        }
+        let choices: [Set<HomeAudioLanguage>] = [HomeAudioLanguage.defaults, [.french], [.english]]
+        for languages in choices {
+            let a = lhs.selection(for: languages)
+            let b = rhs.selection(for: languages)
+            guard sameTitles(a.highlights, b.highlights), sameTitles(a.french, b.french), sameTitles(a.american, b.american),
+                  sameTitles(a.discoveries, b.discoveries), sameTitles(a.wellRated, b.wellRated) else { return false }
+        }
+        return true
     }
 
     private func publish(_ built: Catalog, recommendations: Recommendations) {
@@ -730,6 +789,7 @@ public final class AppModel {
         searchIndex = nil
         self.recommendations = recommendations
         catalogRevision &+= 1
+        let publishedRevision = catalogRevision
         trendingTask?.cancel()
         trendingTask = nil
         trendingIDs = [:]
@@ -743,6 +803,21 @@ public final class AppModel {
             // Previous feeds stay visible until each page recomposes with the new index.
             self.curationRevision &+= 1
             if self.isMetadataEnabled { self.refreshTrending() }
+        }
+        // The fallback scan can walk every movie/series, so it must not gate publication or
+        // the single curation-index build. It only fills `wellRated` and fallback spotlight
+        // arrays; `editorialCopy` is identical, therefore search/curation indexes do not need
+        // to be rebuilt when this lands. Lower priority keeps the first-feed scan ahead.
+        recommendationsTask?.cancel()
+        recommendationsTask = Task(priority: .utility) { [weak self] in
+            let completed = await RecommendationBuilder.completeWithFallback(recommendations, for: built)
+            guard !Task.isCancelled, let self, self.catalogRevision == publishedRevision else { return }
+            // Most catalogs already have editorial shelves: completion then returns the same
+            // small selections. Avoid a no-op observable write that would re-render every poster.
+            if !Self.sameRecommendationSelections(self.recommendations, completed) {
+                self.recommendations = completed
+            }
+            self.recommendationsTask = nil
         }
         searchTask?.cancel()
         searchTask = nil
@@ -861,6 +936,10 @@ public final class AppModel {
                 prepareSearchIndex()
                 await searchTask?.value
                 await curationTask?.value
+                // Explicit "fully rebuilt" callers keep the old completion semantics, while
+                // bootstrap/background refreshes (includingSearch == false) do not wait for
+                // the catalog-wide fallback scan.
+                await recommendationsTask?.value
             }
             if generation == rebuildGeneration { return }
         }

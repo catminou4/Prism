@@ -158,6 +158,84 @@ public enum Curator {
         builder.used.removeAll()
         return builder.titles(for: query, limit: limit)
     }
+
+    /// Lightweight first Home feed used only while the full curation index is being built.
+    /// It intentionally uses inputs that are already computed by `CatalogBuilder`: the
+    /// deterministic featured ranking for the hero and the `addedAt`-ordered arrays for
+    /// one recently-added shelf. The shelf keeps the real feed's `new` identifier so the
+    /// later curated replacement updates one row instead of making the page flap.
+    @concurrent
+    public static func seedHome(
+        catalog: Catalog, recommendations: Recommendations, languages: Set<HomeAudioLanguage>, profile: CurationProfile
+    ) async -> CuratedFeed {
+        guard !catalog.isEmpty else { return .empty }
+
+        func present(_ title: MediaTitle) -> MediaTitle {
+            var item = recommendations.named(title)
+            if let name = recommendations.localizedName(for: title, in: catalog, languages: languages) {
+                item.title = name
+            }
+            return item
+        }
+
+        // Mirror the index's language gate: titles without any language evidence stay eligible,
+        // while a title with explicit but non-matching audio is not proposed for this language set.
+        let checksLanguage = catalog.indexes.hasTaggedEditions || !catalog.indexes.categoryLanguages.isEmpty
+        let selectedLanguages = languages.isEmpty ? HomeAudioLanguage.defaults : languages
+        func languageMatches(_ title: MediaTitle) -> Bool {
+            guard checksLanguage else { return true }
+            let original = recommendations.editorialCopy[title.id]?.originalLanguage
+            let audio = RecommendationBuilder.availableAudio(for: title, original: original, catalog: catalog)
+            if !audio.isEmpty { return !audio.isDisjoint(with: selectedLanguages) }
+            return original == nil && !CurationIndex.hasLanguageHints(title, catalog: catalog)
+        }
+
+        func usable(_ title: MediaTitle) -> Bool {
+            !title.isAdult
+                && !profile.dismissed.contains(title.id)
+                && (title.$posterURL != nil || title.$backdropURL != nil)
+                && (title.year != nil || title.rating != nil)
+                && !CurationTaxonomy.looksLikeEpisode(title.title)
+                && RecommendationBuilder.hasLatinTitle(recommendations.named(title).title)
+                && languageMatches(title)
+        }
+
+        var seen: Set<TitleID> = []
+        var highlights: [CuratedHighlight] = []
+        for title in catalog.featured(limit: 18) where usable(title) && seen.insert(title.id).inserted {
+            highlights.append(CuratedHighlight(title: present(title), label: highlights.isEmpty ? "À la une" : nil))
+            if highlights.count == 6 { break }
+        }
+
+        // The catalog arrays are already sorted by `addedAt` descending. Scan only a short
+        // prefix of each kind, alternate movies and series, and skip titles reserved by the hero.
+        let movieCandidates = catalog.recentlyAdded(.movie, limit: 80).filter { $0.addedAt != nil && usable($0) }
+        let seriesCandidates = catalog.recentlyAdded(.series, limit: 80).filter { $0.addedAt != nil && usable($0) }
+        var fresh: [MediaTitle] = []
+        var movieIndex = 0
+        var seriesIndex = 0
+        while fresh.count < shelfSize, movieIndex < movieCandidates.count || seriesIndex < seriesCandidates.count {
+            if movieIndex < movieCandidates.count {
+                let candidate = movieCandidates[movieIndex]
+                movieIndex += 1
+                if seen.insert(candidate.id).inserted { fresh.append(candidate) }
+            }
+            if fresh.count < shelfSize, seriesIndex < seriesCandidates.count {
+                let candidate = seriesCandidates[seriesIndex]
+                seriesIndex += 1
+                if seen.insert(candidate.id).inserted { fresh.append(candidate) }
+            }
+        }
+
+        var shelves: [CuratedShelf] = []
+        if fresh.count >= 4 {
+            shelves.append(CuratedShelf(
+                id: "new", title: "Nouveautés", subtitle: "Ajoutés récemment dans vos sources",
+                style: .poster, items: fresh.map(present), seeAll: nil
+            ))
+        }
+        return CuratedFeed(highlights: highlights, shelves: shelves, genres: [])
+    }
 }
 
 // MARK: - Builder
