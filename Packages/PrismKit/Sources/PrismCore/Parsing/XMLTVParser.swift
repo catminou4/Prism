@@ -45,8 +45,11 @@ public enum XMLTVParser {
         let delegate = XMLTVParserDelegate(window: window, shift: timeShiftHours * 3600)
         let parser = XMLParser(data: xml)
         parser.shouldResolveExternalEntities = false
-        parser.shouldProcessNamespaces = true
-        parser.shouldReportNamespacePrefixes = false
+        // XMLTV uses no namespaces (`xmltv_ns` is a plain attribute value). Skipping namespace
+        // processing avoids a per-element qname split + prefix→URI resolution inside XMLParser;
+        // the rare prefixed documents (`<tv:programme>`) still parse because the delegate
+        // matches local names itself, which is much cheaper.
+        parser.shouldProcessNamespaces = false
         parser.delegate = delegate
         let ok = parser.parse()
         if !ok && delegate.channels.isEmpty && delegate.programs.isEmpty {
@@ -189,7 +192,17 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
         self.shift = shift
     }
 
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
+    /// Local part of a possibly prefixed element name (`tv:programme` → `programme`).
+    /// Namespace processing is disabled, so the rare prefixed document reports qualified
+    /// names; unprefixed names — essentially all XMLTV — scan once for ":" and allocate nothing.
+    @inline(__always)
+    static func localName(_ name: String) -> Substring {
+        guard let colon = name.lastIndex(of: ":") else { return name[...] }
+        return name[name.index(after: colon)...]
+    }
+
+    func parser(_ parser: XMLParser, didStartElement rawName: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
+        let elementName = Self.localName(rawName)
         switch context {
         case .none:
             if elementName == "programme" {
@@ -231,7 +244,8 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
         if capture != .none { text += String(decoding: CDATABlock, as: UTF8.self) }
     }
 
-    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+    func parser(_ parser: XMLParser, didEndElement rawName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let elementName = Self.localName(rawName)
         switch context {
         case .none:
             return
@@ -278,7 +292,9 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
     private func begin(_ kind: Capture, _ attributes: [String: String]) {
         capture = kind
         text = ""
-        lang = attributes["lang"]
+        // With namespace processing off, `xml:lang` keeps its prefix instead of collapsing to
+        // `lang`; accept both spellings.
+        lang = attributes["lang"] ?? attributes["xml:lang"]
         system = attributes["system"]
     }
 

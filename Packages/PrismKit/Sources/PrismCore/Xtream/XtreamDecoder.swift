@@ -96,6 +96,8 @@ public enum XtreamDecoder {
         let canHLS = formats.isEmpty || formats.contains("m3u8") || formats.contains("hls")
         let canTS = formats.isEmpty || formats.contains("ts") || formats.contains("mpegts")
         let primaryIsHLS = (preferHLS && canHLS) || !canTS
+        // Server base + encoded credentials are invariant across the list: encode once.
+        let streamBase = XtreamURLBuilder.StreamBase(credentials)
 
         var result: [Channel] = []
         result.reserveCapacity(items.count)
@@ -104,8 +106,8 @@ public enum XtreamDecoder {
             let rawName = obj.string("name", "title") ?? "Chaîne \(id)"
             let n = TitleNormalizer.normalize(rawName)
             let category = categoryNativeID(obj)
-            let hls = XtreamURLBuilder.live(credentials, streamID: id, format: .m3u8)
-            let ts = XtreamURLBuilder.live(credentials, streamID: id, format: .ts)
+            let hls = streamBase.live(streamID: id, format: .m3u8)
+            let ts = streamBase.live(streamID: id, format: .ts)
             var catchup: Catchup?
             if obj.bool("tv_archive") == true {
                 catchup = Catchup(mode: .xtream, days: max(obj.int("tv_archive_duration") ?? 1, 1))
@@ -146,6 +148,8 @@ public enum XtreamDecoder {
     static func vodStreams(
         _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
     ) -> [Movie] {
+        // Server base + encoded credentials are invariant across the list: encode once.
+        let streamBase = XtreamURLBuilder.StreamBase(credentials)
         var result: [Movie] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -170,7 +174,7 @@ public enum XtreamDecoder {
                 cast: obj.list("cast", "actors"),
                 director: obj.string("director"),
                 categoryID: category.map { "\(sourceID.rawValue):\(MediaKind.movie.rawValue):\($0)" },
-                streamURL: XtreamURLBuilder.movie(credentials, streamID: id, ext: ext),
+                streamURL: streamBase.movie(streamID: id, ext: ext),
                 containerExtension: ext?.lowercased(),
                 quality: n.quality,
                 tags: n.tags,
@@ -282,6 +286,8 @@ public enum XtreamDecoder {
         var bySeason: [Int: [Episode]] = [:]
         var seenIDs = Set<String>()
         let seriesKey = TitleNormalizer.key(series.title)
+        // Server base + encoded credentials are invariant across the episodes: encode once.
+        let streamBase = XtreamURLBuilder.StreamBase(credentials)
         for item in raw {
             guard let ep = JSONObject(item.value), let id = ep.string("id", "stream_id"), seenIDs.insert(id).inserted else { continue }
             let epInfo = ep.object("info") ?? JSONObject.empty
@@ -299,7 +305,7 @@ public enum XtreamDecoder {
                 plot: epInfo.string("plot", "overview", "description"),
                 durationSeconds: duration.flatMap { $0 > 0 ? $0 : nil },
                 stillURL: epInfo.url("movie_image", "cover_big", "still_path", "cover"),
-                streamURL: XtreamURLBuilder.episode(credentials, episodeID: id, ext: ext),
+                streamURL: streamBase.episode(episodeID: id, ext: ext),
                 containerExtension: ext?.lowercased(),
                 airDate: epInfo.day("releasedate", "release_date", "air_date") ?? ep.date("added"),
                 rating: rating(epInfo),

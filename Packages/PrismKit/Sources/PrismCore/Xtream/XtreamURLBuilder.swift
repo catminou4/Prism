@@ -8,17 +8,17 @@ public enum XtreamStreamFormat: String, Sendable {
 public enum XtreamURLBuilder {
     /// `{server}/live/{u}/{p}/{id}.{ext}`
     public static func live(_ c: XtreamCredentials, streamID: String, format: XtreamStreamFormat) -> URL {
-        stream(c, kind: "live", id: streamID, ext: format.rawValue)
+        StreamBase(c).live(streamID: streamID, format: format)
     }
 
     /// `{server}/movie/{u}/{p}/{id}.{ext ?? "mp4"}`
     public static func movie(_ c: XtreamCredentials, streamID: String, ext: String?) -> URL {
-        stream(c, kind: "movie", id: streamID, ext: cleanExtension(ext))
+        StreamBase(c).movie(streamID: streamID, ext: ext)
     }
 
     /// `{server}/series/{u}/{p}/{id}.{ext ?? "mp4"}`
     public static func episode(_ c: XtreamCredentials, episodeID: String, ext: String?) -> URL {
-        stream(c, kind: "series", id: episodeID, ext: cleanExtension(ext))
+        StreamBase(c).episode(episodeID: episodeID, ext: ext)
     }
 
     /// `{server}/timeshift/{u}/{p}/{duration}/{yyyy-MM-dd:HH-mm}/{id}.ts` — `start` expressed in the
@@ -64,11 +64,7 @@ public enum XtreamURLBuilder {
         return string
     }
 
-    private static func stream(_ c: XtreamCredentials, kind: String, id: String, ext: String) -> URL {
-        url(base(c) + "/\(kind)/\(segment(c.username))/\(segment(c.password))/\(segment(id)).\(ext)", fallback: c.server)
-    }
-
-    private static func cleanExtension(_ ext: String?) -> String {
+    static func cleanExtension(_ ext: String?) -> String {
         let trimmed = (ext ?? "").trimmingCharacters(in: CharacterSet(charactersIn: ". ")).lowercased()
         guard !trimmed.isEmpty, trimmed.count <= 5, trimmed.allSatisfy({ $0.isLetter || $0.isNumber }) else { return "mp4" }
         return trimmed
@@ -97,5 +93,46 @@ public enum XtreamURLBuilder {
 
     private static func url(_ string: String, fallback: URL) -> URL {
         URL(string: string) ?? fallback
+    }
+
+    /// Stream URL prefix with the invariant parts pre-encoded: server base, kind path and the
+    /// percent-encoded credentials are fixed for a whole decode list, so they are baked into
+    /// per-kind prefixes once instead of being rebuilt and re-encoded for every item. Output
+    /// is byte-identical to the static builders — only the id segment and extension are
+    /// interpolated per item.
+    public struct StreamBase: Sendable {
+        private let livePrefix: String
+        private let moviePrefix: String
+        private let seriesPrefix: String
+        private let fallback: URL
+
+        public init(_ c: XtreamCredentials) {
+            let root = XtreamURLBuilder.base(c)
+            let user = XtreamURLBuilder.segment(c.username)
+            let pass = XtreamURLBuilder.segment(c.password)
+            livePrefix = "\(root)/live/\(user)/\(pass)/"
+            moviePrefix = "\(root)/movie/\(user)/\(pass)/"
+            seriesPrefix = "\(root)/series/\(user)/\(pass)/"
+            fallback = c.server
+        }
+
+        /// `{server}/live/{u}/{p}/{id}.{ext}`
+        public func live(streamID: String, format: XtreamStreamFormat) -> URL {
+            Self.url(livePrefix, id: streamID, ext: format.rawValue, fallback: fallback)
+        }
+
+        /// `{server}/movie/{u}/{p}/{id}.{ext ?? "mp4"}`
+        public func movie(streamID: String, ext: String?) -> URL {
+            Self.url(moviePrefix, id: streamID, ext: XtreamURLBuilder.cleanExtension(ext), fallback: fallback)
+        }
+
+        /// `{server}/series/{u}/{p}/{id}.{ext ?? "mp4"}`
+        public func episode(episodeID: String, ext: String?) -> URL {
+            Self.url(seriesPrefix, id: episodeID, ext: XtreamURLBuilder.cleanExtension(ext), fallback: fallback)
+        }
+
+        private static func url(_ prefix: String, id: String, ext: String, fallback: URL) -> URL {
+            URL(string: "\(prefix)\(XtreamURLBuilder.segment(id)).\(ext)") ?? fallback
+        }
     }
 }

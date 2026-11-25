@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Turns a parsed M3U playlist into a `SourceCatalog` (live channels, movies, series grouped
 /// into seasons, categories). Pure and synchronous: run it off the main actor.
@@ -9,21 +10,31 @@ public enum M3UCatalogMapper {
     static let movieExtensions: Set<String> = ["mp4", "mkv", "avi", "mov", "m4v", "wmv", "webm", "mpg", "mpeg", "flv", "divx", "ogv", "3gp"]
     static let liveExtensions: Set<String> = ["ts", "m3u8", "m3u", "mpd", "php"]
 
+    /// Two passes. Pass 1 (`precompute`) evaluates everything that is a pure function of the
+    /// entry — normalization, classification, logo/catch-up/tag derivation, URL hashing — in
+    /// parallel indexed chunks, concatenated in order. Pass 2 is the original serial loop:
+    /// separator carry-over, category numbering, duplicate-id suffixes and series grouping are
+    /// order-dependent and stay sequential, consuming the precomputed values. Output is
+    /// byte-identical to a fully serial mapping.
     public static func makeCatalog(from playlist: M3UPlaylist, sourceID: SourceID, now: Date = .now) -> SourceCatalog {
+        let entries = playlist.entries
+        let prepared = precompute(entries)
         var builder = CatalogBuilder(sourceID: sourceID)
         var separatorGroup: String?
-        for entry in playlist.entries {
-            let normalized = TitleNormalizer.normalize(entry.name)
+        for index in entries.indices {
+            let prep = prepared[index]
+            let normalized = prep.normalized
             if normalized.isSeparator {
                 separatorGroup = normalized.title.isEmpty ? nil : normalized.title
                 continue
             }
+            let entry = entries[index]
             var group = entry.group
             if group?.isEmpty ?? true { group = separatorGroup }
-            switch classify(entry, normalized) {
-            case .live: builder.addChannel(entry, normalized, group: group)
-            case .movie: builder.addMovie(entry, normalized, group: group)
-            default: builder.addEpisode(entry, normalized, group: group)
+            switch prep.kind {
+            case .live: builder.addChannel(entry, prep, group: group)
+            case .movie: builder.addMovie(entry, prep, group: group)
+            default: builder.addEpisode(entry, prep, group: group)
             }
         }
         return SourceCatalog(
@@ -35,6 +46,92 @@ public enum M3UCatalogMapper {
             account: nil,
             fetchedAt: now
         )
+    }
+
+    // MARK: - Parallel pre-pass
+
+    /// Per-entry pure derivations consumed by the stateful pass. Meaningless fields are left
+    /// at their defaults for separator entries (which only carry `normalized`).
+    struct PreparedEntry: Sendable {
+        var normalized: NormalizedName
+        var kind: MediaKind = .live
+        /// Channels: `n.title` falling back to the raw name. Movies/series: the refined title.
+        var displayTitle = ""
+        /// Channels: `n.tags`; movies: `mediaTags`; episodes: tags merged with declared audio.
+        var tags: [String] = []
+        var logoURL: URL?
+        var catchup: Catchup?
+        var audioEdition: String?
+        /// Lowercased path extension ("" when none); movies/episodes only.
+        var ext = ""
+        /// FNV-1a hex of the URL — the `uniqueID` base.
+        var urlHash = ""
+        var isAdultName = false
+    }
+
+    /// Pure per-entry derivation shared by every chunk worker. Must stay free of mutable state.
+    static func prepare(_ entry: M3UEntry) -> PreparedEntry {
+        let n = TitleNormalizer.normalize(entry.name)
+        guard !n.isSeparator else { return PreparedEntry(normalized: n) }
+        var prep = PreparedEntry(normalized: n)
+        let kind = classify(entry, n)
+        prep.kind = kind
+        prep.logoURL = imageURL(entry.attributes["tvg-logo"])
+        prep.urlHash = StableHash.hex(entry.url.absoluteString)
+        prep.isAdultName = TitleNormalizer.isAdultName(n)
+        switch kind {
+        case .live:
+            prep.displayTitle = n.title.isEmpty ? entry.name : n.title
+            prep.tags = n.tags
+            prep.catchup = catchup(from: entry.attributes)
+        case .movie:
+            prep.displayTitle = n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title)
+            prep.tags = mediaTags(n, attributes: entry.attributes)
+            prep.ext = entry.url.pathExtension.lowercased()
+        default:
+            prep.displayTitle = n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title)
+            let declared = declaredAudio(attributes: entry.attributes)
+            let tags = n.tags + declared.sorted().filter { !n.tags.contains($0) }
+            prep.tags = tags
+            prep.audioEdition = audioEdition(tags: tags, declared: declared)
+            prep.ext = entry.url.pathExtension.lowercased()
+        }
+        return prep
+    }
+
+    static func prepareChunk(_ entries: [M3UEntry], in range: Range<Int>) -> [PreparedEntry] {
+        var out: [PreparedEntry] = []
+        out.reserveCapacity(range.count)
+        // Indexed loop, not `map`: the subscript passes a borrow of each entry.
+        for index in range { out.append(prepare(entries[index])) }
+        return out
+    }
+
+    /// Pass 1. Small playlists map serially; large ones split into indexed chunks processed
+    /// concurrently (same shape as `CatalogBuilder.parallelKeys`): each worker writes its chunk
+    /// under the lock and the partials concatenate in input order, so `result[i]` always
+    /// matches `entries[i]`.
+    static func precompute(_ entries: [M3UEntry]) -> [PreparedEntry] {
+        let count = entries.count
+        guard count > 0 else { return [] }
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
+        let chunk = max(2_048, count / (workers * 2))
+        let chunkCount = (count + chunk - 1) / chunk
+        guard chunkCount > 1 else { return prepareChunk(entries, in: 0..<count) }
+        let partials = Mutex<[Int: [PreparedEntry]]>([:])
+        DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+            let lower = chunkIndex * chunk
+            let upper = min(lower + chunk, count)
+            let part = prepareChunk(entries, in: lower..<upper)
+            partials.withLock { $0[chunkIndex] = part }
+        }
+        var result: [PreparedEntry] = []
+        result.reserveCapacity(count)
+        for chunkIndex in 0..<chunkCount {
+            guard let part = partials.withLock({ $0[chunkIndex] }) else { continue }
+            result.append(contentsOf: part)
+        }
+        return result
     }
 
     /// `.live`, `.movie` or `.series` (an episode of a series).
@@ -323,83 +420,80 @@ private struct CatalogBuilder {
         }
     }
 
-    mutating func addChannel(_ entry: M3UEntry, _ n: NormalizedName, group: String?) {
+    mutating func addChannel(_ entry: M3UEntry, _ prep: M3UCatalogMapper.PreparedEntry, group: String?) {
+        let n = prep.normalized
         let category = category(kind: .live, raw: group)
         let attributes = entry.attributes
         let numberString = attributes["tvg-chno"] ?? attributes["channel-number"] ?? attributes["tvg-num"]
         let number = numberString.flatMap { Int($0) }
         let epgID = attributes["tvg-id"].flatMap { $0.isEmpty ? nil : $0 }
-        let name = n.title.isEmpty ? entry.name : n.title
         let channel = Channel(
             sourceID: sourceID,
-            nativeID: uniqueID(StableHash.hex(entry.url.absoluteString), kind: .live),
-            name: name,
+            nativeID: uniqueID(prep.urlHash, kind: .live),
+            name: prep.displayTitle,
             rawName: entry.name,
             number: number,
-            logoURL: M3UCatalogMapper.imageURL(attributes["tvg-logo"]),
+            logoURL: prep.logoURL,
             categoryID: category?.id,
             epgID: epgID,
             streamURL: entry.url,
             quality: n.quality,
-            tags: n.tags,
-            catchup: M3UCatalogMapper.catchup(from: attributes),
-            isAdult: (category?.isAdult ?? false) || TitleNormalizer.isAdultName(n),
+            tags: prep.tags,
+            catchup: prep.catchup,
+            isAdult: (category?.isAdult ?? false) || prep.isAdultName,
             httpHeaders: entry.headers
         )
         channels.append(channel)
     }
 
-    mutating func addMovie(_ entry: M3UEntry, _ n: NormalizedName, group: String?) {
+    mutating func addMovie(_ entry: M3UEntry, _ prep: M3UCatalogMapper.PreparedEntry, group: String?) {
+        let n = prep.normalized
         let category = category(kind: .movie, raw: group)
-        let ext = entry.url.pathExtension.lowercased()
         let movie = Movie(
             sourceID: sourceID,
-            nativeID: uniqueID(StableHash.hex(entry.url.absoluteString), kind: .movie),
-            title: n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title),
+            nativeID: uniqueID(prep.urlHash, kind: .movie),
+            title: prep.displayTitle,
             rawName: entry.name,
             year: n.year,
-            posterURL: M3UCatalogMapper.imageURL(entry.attributes["tvg-logo"]),
+            posterURL: prep.logoURL,
             durationSeconds: entry.duration > 0 ? entry.duration : nil,
             categoryID: category?.id,
             streamURL: entry.url,
-            containerExtension: ext.isEmpty ? nil : ext,
+            containerExtension: prep.ext.isEmpty ? nil : prep.ext,
             quality: n.quality,
-            tags: M3UCatalogMapper.mediaTags(n, attributes: entry.attributes),
-            isAdult: (category?.isAdult ?? false) || TitleNormalizer.isAdultName(n),
+            tags: prep.tags,
+            isAdult: (category?.isAdult ?? false) || prep.isAdultName,
             httpHeaders: entry.headers
         )
         movies.append(movie)
     }
 
-    mutating func addEpisode(_ entry: M3UEntry, _ n: NormalizedName, group: String?) {
+    mutating func addEpisode(_ entry: M3UEntry, _ prep: M3UCatalogMapper.PreparedEntry, group: String?) {
+        let n = prep.normalized
         let category = category(kind: .series, raw: group)
         let showKey = (n.key.isEmpty ? TitleNormalizer.key(entry.name) : n.key) + "|" + (group ?? "")
-        let logo = M3UCatalogMapper.imageURL(entry.attributes["tvg-logo"])
         if series[showKey] == nil {
             series[showKey] = SeriesBuilder(
                 nativeID: StableHash.hex(showKey),
-                title: n.title.isEmpty ? entry.name : TitleRefinement.refine(n.title),
+                title: prep.displayTitle,
                 categoryID: category?.id,
-                isAdult: (category?.isAdult ?? false) || TitleNormalizer.isAdultName(n)
+                isAdult: (category?.isAdult ?? false) || prep.isAdultName
             )
             seriesOrder.append(showKey)
         }
-        let ext = entry.url.pathExtension.lowercased()
-        let declared = M3UCatalogMapper.declaredAudio(attributes: entry.attributes)
-        let tags = n.tags + declared.sorted().filter { !n.tags.contains($0) }
         let episode = PendingEpisode(
-            nativeID: uniqueID(StableHash.hex(entry.url.absoluteString), kind: .episode),
+            nativeID: uniqueID(prep.urlHash, kind: .episode),
             rawName: entry.name,
-            edition: SeriesEdition(year: n.year, audio: M3UCatalogMapper.audioEdition(tags: tags, declared: declared)),
+            edition: SeriesEdition(year: n.year, audio: prep.audioEdition),
             quality: n.quality,
-            tags: tags,
+            tags: prep.tags,
             season: n.season ?? 1,
             number: n.episode,
             title: n.episodeTitle,
             durationSeconds: entry.duration > 0 ? entry.duration : nil,
-            logoURL: logo,
+            logoURL: prep.logoURL,
             streamURL: entry.url,
-            containerExtension: ext.isEmpty ? nil : ext,
+            containerExtension: prep.ext.isEmpty ? nil : prep.ext,
             headers: entry.headers,
             order: episodeCounter
         )

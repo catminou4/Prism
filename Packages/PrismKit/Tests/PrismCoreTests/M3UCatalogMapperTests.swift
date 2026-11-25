@@ -202,5 +202,18 @@ struct M3UCatalogMapperTests {
         #expect(catalog.channels.count == 10_000)
         #expect(catalog.movies.count == 10_000)
         #expect(catalog.series.reduce(0) { $0 + ($1.seasons?.reduce(0) { $0 + $1.episodes.count } ?? 0) } == 10_000)
+
+        // The parallel pre-pass must concatenate chunks in input order: channels/movies keep
+        // the exact playlist sequence, and every id is the FNV-1a of its own URL.
+        #expect(catalog.channels.map(\.number) == stride(from: 0, to: 30_000, by: 3).map { Optional($0) })
+        #expect(catalog.channels.prefix(3).map(\.name) == ["Channel 0", "Channel 3", "Channel 6"])
+        #expect(catalog.channels.last?.name == "Channel 29997")
+        #expect(catalog.movies.prefix(2).map(\.title) == ["Movie 1", "Movie 4"])
+        #expect(catalog.movies.last?.title == "Movie 29998")
+        #expect(catalog.movies.first?.year == 2019)
+        #expect(catalog.channels.first?.nativeID == StableHash.hex("http://live.example.com:8080/live/username/password/100000.ts"))
+        #expect(catalog.movies.first?.nativeID == StableHash.hex("http://vod.example.com:8080/movie/username/password/200001.mkv"))
+        #expect(Set(catalog.channels.map(\.id)).count == catalog.channels.count)
+        #expect(Set(catalog.movies.map(\.id)).count == catalog.movies.count)
     }
 }
