@@ -44,6 +44,26 @@ xcodegen generate && xcodebuild -project Prism.xcodeproj -scheme Prism -destinat
 Never run the GUI app or take screen captures without the user's consent (the Mac is in use).
 Visual checks are done offscreen with the snapshot harness (`PrismUITests` / `Tools/`).
 
+## Measuring on the real catalog
+
+`Tests/PrismDataTests/RealCatalogBenchTests.swift` measures the launch pipeline (cache decode,
+build, editorial, curation/search index, EPG) against the configured app's real caches — strictly
+read-only. Run it in release, env-gated:
+
+```sh
+PRISM_REAL_BENCH=1 swift test -c release --filter RealCatalogBenchTests --scratch-path .build/bench-release
+# phase breakdown inside CatalogBuilder:
+PRISM_REAL_BENCH=1 PRISM_BUILD_PROFILE=1 swift test -c release --filter RealCatalogBenchTests ...
+```
+
+Measurement traps learned the hard way (2026-11): on a loaded machine, wall times of parallel
+phases inflate 2-4× — compare CPU time (rusage), not wall, and never compare across time, only
+same-process A/B. The **first** `CatalogBuilder.build` in any process costs ~4-5× the steady-state
+CPU (~7-8 vs ~1.6 CPU-s on the real catalog, user-space memory stalls on the object-heavy graph —
+input-format independent, not cured by heap prewarming). Any single cold measurement must be
+interpreted against that floor. `queryLatencyAt100k` / `performance150k` are load-sensitive
+flakes — rerun in isolation before believing a failure.
+
 ## Conventions
 
 - Swift 6, `@Observable` models, `@State` owned at the right level, `@Environment` for app-wide models.
