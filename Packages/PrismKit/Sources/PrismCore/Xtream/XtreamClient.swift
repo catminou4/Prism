@@ -147,7 +147,7 @@ public actor XtreamClient {
     /// `map` back on this actor.
     private nonisolated func decodeList<T: Sendable>(
         _ data: Data,
-        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+        map: @escaping @Sendable (Slice<LenientArray>) -> [T]
     ) async throws -> [T] {
         try Task.checkCancellation()
         if data.count >= Self.parallelParseMinBytes, let chunked = await parseAndMapChunked(data, map: map) {
@@ -161,7 +161,7 @@ public actor XtreamClient {
     /// over the whole payload, then parallel per-item mapping for large element counts.
     private nonisolated func parseWholeThenMap<T: Sendable>(
         _ data: Data,
-        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+        map: @escaping @Sendable (Slice<LenientArray>) -> [T]
     ) async throws -> [T] {
         let parsed = try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
@@ -218,7 +218,7 @@ public actor XtreamClient {
     /// valid JSON and the fallback reproduces the original parse error.
     private nonisolated func parseAndMapChunked<T: Sendable>(
         _ data: Data,
-        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+        map: @escaping @Sendable (Slice<LenientArray>) -> [T]
     ) async -> [T]? {
         guard let payload = XtreamDecoder.payloadForParsing(data),
               let split = TopLevelArraySplitter.split(payload) else { return nil }
@@ -239,7 +239,7 @@ public actor XtreamClient {
                     fragment.append(0x5B) // [
                     fragment.append(payloadData[range])
                     fragment.append(0x5D) // ]
-                    guard let parsed = try? LenientValue.parse(fragment), let array = parsed as? [Any] else { return nil }
+                    guard let parsed = try? LenientValue.parse(fragment), let array = LenientArray(parsed) else { return nil }
                     return ChunkedDecode(index: index, parsedCount: array.count, mapped: map(array[...]))
                 }
             }
@@ -331,9 +331,9 @@ public actor XtreamClient {
 }
 
 /// The JSONSerialization tree is immutable once parsed: sharing it read-only across decode
-/// tasks is safe even though `[Any]` is not `Sendable`.
+/// tasks is safe even though its object graph is not `Sendable`.
 private struct ParsedElements: @unchecked Sendable {
-    let value: [Any]
+    let value: LenientArray
 }
 
 /// One chunk worker's output of the parallel array parse: the number of JSON elements the

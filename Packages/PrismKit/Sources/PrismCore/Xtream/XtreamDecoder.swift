@@ -89,7 +89,7 @@ public enum XtreamDecoder {
     /// Maps already-parsed JSON elements → channels. Non-throwing: malformed elements are skipped,
     /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
     static func liveStreams(
-        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
+        _ items: Slice<LenientArray>, sourceID: SourceID, credentials: XtreamCredentials, preferHLS: Bool,
         allowedFormats: [String] = [], adultCategoryIDs: Set<String> = []
     ) -> [Channel] {
         let formats = Set(allowedFormats.map { $0.lowercased() })
@@ -147,7 +147,7 @@ public enum XtreamDecoder {
     /// Maps already-parsed JSON elements → movies. Non-throwing: malformed elements are skipped,
     /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
     static func vodStreams(
-        _ items: ArraySlice<Any>, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
+        _ items: Slice<LenientArray>, sourceID: SourceID, credentials: XtreamCredentials, adultCategoryIDs: Set<String> = []
     ) -> [Movie] {
         // Server base + encoded credentials are invariant across the list: encode once.
         let streamBase = XtreamURLBuilder.StreamBase(credentials)
@@ -197,7 +197,7 @@ public enum XtreamDecoder {
 
     /// Maps already-parsed JSON elements → series. Non-throwing: malformed elements are skipped,
     /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
-    static func series(_ items: ArraySlice<Any>, sourceID: SourceID, adultCategoryIDs: Set<String> = []) -> [Series] {
+    static func series(_ items: Slice<LenientArray>, sourceID: SourceID, adultCategoryIDs: Set<String> = []) -> [Series] {
         var interner = CategoryIDInterner(sourceID: sourceID, kind: .series)
         var result: [Series] = []
         result.reserveCapacity(items.count)
@@ -269,16 +269,17 @@ public enum XtreamDecoder {
 
         // Episodes: {"1": [...], "2": [...]} or [[...], [...]] or [ep, ep…].
         var raw: [(season: Int?, value: Any)] = []
-        let episodesValue = root.raw["episodes"]
+        let episodesValue = root.storedValue("episodes")
         if let dict = episodesValue as? [String: Any] {
             let keys = dict.keys.sorted { (Int($0) ?? .max, $0) < (Int($1) ?? .max, $1) }
             for key in keys {
                 let season = Int(key.trimmingCharacters(in: .whitespaces))
                 for ep in LenientValue.array(dict[key]) { raw.append((season, ep)) }
             }
-        } else if let array = episodesValue as? [Any] {
+        } else if let array = LenientArray(episodesValue) {
             for element in array {
-                if element is [Any] || (element is [String: Any] && JSONObject(element)?.raw["id"] == nil && JSONObject(element)?.raw["episode_num"] == nil) {
+                let object = JSONObject(element)
+                if element is [Any] || (element is [String: Any] && object?.storedValue("id") == nil && object?.storedValue("episode_num") == nil) {
                     for ep in LenientValue.array(element) { raw.append((nil, ep)) }
                 } else {
                     raw.append((nil, element))
@@ -350,7 +351,7 @@ public enum XtreamDecoder {
 
     public static func shortEPG(_ data: Data, streamID: String, epgChannelID: String?) throws -> [EPGProgram] {
         let value = try json(data)
-        let listings: [Any]
+        let listings: LenientArray
         if let obj = JSONObject(value) {
             listings = obj.array("epg_listings")
         } else {
@@ -409,22 +410,23 @@ public enum XtreamDecoder {
     }
 
     /// Top-level array (or dictionary of elements).
-    static func elements(_ data: Data) throws -> [Any] {
+    static func elements(_ data: Data) throws -> LenientArray {
         let value = try json(data)
-        if let dict = value as? [String: Any] {
-            if let userInfo = dict["user_info"] {
+        if let object = JSONObject(value) {
+            if let userInfo = object.storedValue("user_info") {
                 if JSONObject(userInfo)?.bool("auth") == false { throw XtreamError.unauthorized }
                 throw XtreamError.decoding("Liste attendue, réponse de compte reçue")
             }
+            let dict = object.raw
             if dict.values.allSatisfy({ $0 is [String: Any] }) { return LenientValue.array(dict) }
-            return []
+            return .empty
         }
         return LenientValue.array(value)
     }
 
     static func categoryNativeID(_ obj: JSONObject) -> String? {
         if let id = obj.string("category_id") { return id }
-        if let ids = obj.raw["category_ids"] as? [Any], let first = ids.lazy.compactMap({ LenientValue.string($0) }).first { return first }
+        if let ids = LenientArray(obj.storedValue("category_ids")), let first = ids.lazy.compactMap({ LenientValue.string($0) }).first { return first }
         return nil
     }
 

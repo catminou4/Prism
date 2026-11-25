@@ -315,7 +315,7 @@ public actor TMDBClient {
     }
 
     static func decodeTrends(_ data: Data) throws -> [TMDBTrend] {
-        guard let results = try json(data).value(["results"]) as? [Any] else {
+        guard let results = LenientArray(try json(data).value(["results"])) else {
             throw TMDBError.decoding("classement TMDB manquant")
         }
         var seen: Set<Int> = []

@@ -1,5 +1,59 @@
 import Foundation
 
+/// Indexed view over a JSON array. `JSONSerialization` arrays are immutable `NSArray`s on Darwin:
+/// retaining the backing store and reading elements on demand avoids the O(element count) bridge
+/// copy that `as? [Any]` performs, while native arrays keep their existing storage.
+struct LenientArray: Collection {
+    private enum Storage {
+        case swift([Any])
+        case foundation(NSArray)
+    }
+
+    private let storage: Storage
+    let count: Int
+
+    init?(_ value: Any?) {
+        guard let value else { return nil }
+        if type(of: value) == [Any].self, let array = value as? [Any] {
+            self.init(swift: array)
+        } else if let array = value as? NSArray {
+            self.init(foundation: array)
+        } else if let array = value as? [Any] {
+            self.init(swift: array)
+        } else {
+            return nil
+        }
+    }
+
+    private init(swift array: [Any]) {
+        storage = .swift(array)
+        count = array.count
+    }
+
+    private init(foundation array: NSArray) {
+        storage = .foundation(array)
+        count = array.count
+    }
+
+    static var empty: LenientArray { LenientArray(swift: []) }
+
+    static func materialized(_ array: [Any]) -> LenientArray {
+        LenientArray(swift: array)
+    }
+
+    var startIndex: Int { 0 }
+    var endIndex: Int { count }
+
+    func index(after index: Int) -> Int { index + 1 }
+
+    subscript(position: Int) -> Any {
+        switch storage {
+        case .swift(let array): return array[position]
+        case .foundation(let array): return array.object(at: position)
+        }
+    }
+}
+
 /// Extremely lenient accessors over `JSONSerialization` values. IPTV panels return numbers as
 /// strings, `""`/`null` for missing values, booleans as `0/1/"0"/"1"/true`, `[]` instead of `{}`…
 /// Values are only used locally inside decoding functions (not `Sendable`).
@@ -20,6 +74,19 @@ enum LenientValue {
     /// `s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty` without allocating.
     static func isAllWhitespace(_ s: String) -> Bool {
         s.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
+    /// UTF-16 fast path for unparsed `NSString` leaves. The whitespace set is entirely in the
+    /// BMP, so surrogate pairs are never whitespace and per-unit membership is equivalent to
+    /// scanning the bridged String's scalars.
+    static func isAllWhitespace(_ s: NSString) -> Bool {
+        var index = 0
+        while index < s.length {
+            guard let scalar = UnicodeScalar(UInt32(s.character(at: index))),
+                  CharacterSet.whitespacesAndNewlines.contains(scalar) else { return false }
+            index += 1
+        }
+        return true
     }
 
     static func parse(_ data: Data) throws -> Any {
@@ -114,7 +181,7 @@ enum LenientValue {
 
     /// Array of URLs, a single URL string, or a comma separated list.
     static func urls(_ value: Any?) -> [URL] {
-        if let array = value as? [Any] { return array.compactMap { url($0) } }
+        if let array = LenientArray(value) { return array.compactMap { url($0) } }
         guard let raw = string(value) else { return [] }
         if let single = url(raw) { return [single] }
         return raw.split(separator: ",").compactMap { url(String($0)) }
@@ -178,7 +245,7 @@ enum LenientValue {
     /// Array of strings or a separated string ("Action, Drame / Thriller").
     static func list(_ value: Any?, separators: Set<Character> = [","]) -> [String] {
         var parts: [String] = []
-        if let array = value as? [Any] {
+        if let array = LenientArray(value) {
             parts = array.compactMap { string($0) }
         } else if let raw = string(value) {
             parts = raw.split(whereSeparator: { separators.contains($0) }).map { String($0) }
@@ -194,17 +261,20 @@ enum LenientValue {
     }
 
     /// Array elements; dictionaries become their values ordered by (numeric) key; anything else → [].
-    static func array(_ value: Any?) -> [Any] {
-        if let array = value as? [Any] { return array }
+    static func array(_ value: Any?) -> LenientArray {
+        if let array = LenientArray(value) { return array }
+        // The mixed numeric/lexicographic comparator is not a strict weak ordering, so the
+        // resulting order can depend on the exact key order produced by the legacy bridge.
+        // Keyed dictionaries are rare and small in Xtream payloads; keep that exact bridge here.
         if let dict = value as? [String: Any] {
-            return dict.keys.sorted { lhs, rhs in
+            return .materialized(dict.keys.sorted { lhs, rhs in
                 switch (Int(lhs), Int(rhs)) {
                 case let (l?, r?): l < r
                 default: lhs < rhs
                 }
-            }.compactMap { dict[$0] }
+            }.compactMap { dict[$0] })
         }
-        return []
+        return .empty
     }
 
     /// "01:52:33" / "52:33" / "6753" → seconds.
@@ -260,24 +330,61 @@ enum LenientValue {
 }
 
 /// Typed view over a JSON dictionary with multi-key lookups (`obj.string("releaseDate", "releasedate")`).
+/// `JSONSerialization` dictionaries are immutable `NSDictionary`s on Darwin. Keeping that backing
+/// store and looking up individual keys avoids re-materializing every key/value pair as a Swift
+/// dictionary for each object in a large list. `raw` remains available for the few keyset-oriented
+/// paths; it bridges on demand rather than being the storage representation.
 struct JSONObject {
-    let raw: [String: Any]
+    private enum Storage {
+        case swift([String: Any])
+        case foundation(NSDictionary)
+    }
+
+    private let storage: Storage
+
+    var raw: [String: Any] {
+        switch storage {
+        case .swift(let dict): return dict
+        case .foundation(let dict): return (dict as? [String: Any]) ?? [:]
+        }
+    }
 
     init?(_ value: Any?) {
-        guard let dict = value as? [String: Any] else { return nil }
-        raw = dict
+        guard let value else { return nil }
+        if type(of: value) == [String: Any].self, let dict = value as? [String: Any] {
+            storage = .swift(dict)
+        } else if let dict = value as? NSDictionary {
+            storage = .foundation(dict)
+        } else if let dict = value as? [String: Any] {
+            storage = .swift(dict)
+        } else {
+            return nil
+        }
     }
 
     init(raw: [String: Any]) {
-        self.raw = raw
+        storage = .swift(raw)
     }
 
     static var empty: JSONObject { JSONObject(raw: [:]) }
 
+    /// Key lookup with dictionary semantics: no `NSNull` or whitespace filtering.
+    func storedValue(_ key: String) -> Any? {
+        switch storage {
+        case .swift(let dict): return dict[key]
+        case .foundation(let dict):
+            // Swift String equality is canonically equivalent while NSString equality is literal.
+            // ASCII keys (every hot Xtream/TMDB key) cannot have a distinct canonical twin, so they
+            // use the direct lookup; rare non-ASCII lookups take the exact legacy bridge instead.
+            if key.utf8.allSatisfy({ $0 < 0x80 }) { return dict.object(forKey: key as NSString) }
+            return (dict as? [String: Any])?[key]
+        }
+    }
+
     func value(_ keys: [String]) -> Any? {
         for key in keys {
-            if let v = raw[key], !(v is NSNull) {
-                if let s = v as? String, LenientValue.isAllWhitespace(s) { continue }
+            if let v = storedValue(key), !(v is NSNull) {
+                if let s = v as? NSString, LenientValue.isAllWhitespace(s) { continue }
                 return v
             }
         }
@@ -289,26 +396,26 @@ struct JSONObject {
     func double(_ keys: String...) -> Double? { LenientValue.double(value(keys)) }
     func bool(_ keys: String...) -> Bool? { LenientValue.bool(value(keys)) }
     func url(_ keys: String...) -> URL? {
-        for key in keys { if let u = LenientValue.url(raw[key]) { return u } }
+        for key in keys { if let u = LenientValue.url(storedValue(key)) { return u } }
         return nil
     }
     func urls(_ keys: String...) -> [URL] {
-        for key in keys { let u = LenientValue.urls(raw[key]); if !u.isEmpty { return u } }
+        for key in keys { let u = LenientValue.urls(storedValue(key)); if !u.isEmpty { return u } }
         return []
     }
     func date(_ keys: String...) -> Date? { LenientValue.date(value(keys)) }
     func day(_ keys: String...) -> Date? {
-        for key in keys { if let d = LenientValue.day(raw[key]) { return d } }
+        for key in keys { if let d = LenientValue.day(storedValue(key)) { return d } }
         return nil
     }
     func year(_ keys: String...) -> Int? {
-        for key in keys { if let y = LenientValue.year(raw[key]) { return y } }
+        for key in keys { if let y = LenientValue.year(storedValue(key)) { return y } }
         return nil
     }
     func list(_ keys: String..., separators: Set<Character> = [","]) -> [String] {
-        for key in keys { let l = LenientValue.list(raw[key], separators: separators); if !l.isEmpty { return l } }
+        for key in keys { let l = LenientValue.list(storedValue(key), separators: separators); if !l.isEmpty { return l } }
         return []
     }
-    func object(_ key: String) -> JSONObject? { JSONObject(raw[key]) }
-    func array(_ key: String) -> [Any] { LenientValue.array(raw[key]) }
+    func object(_ key: String) -> JSONObject? { JSONObject(storedValue(key)) }
+    func array(_ key: String) -> LenientArray { LenientValue.array(storedValue(key)) }
 }

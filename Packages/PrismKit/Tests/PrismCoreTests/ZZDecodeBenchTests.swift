@@ -33,13 +33,13 @@ struct ZZDecodeBenchTests {
         let items = try XtreamDecoder.elements(data)
         print("ZZBENCH elements (JSONSerialization): \(String(format: "%.0f", ms(since: t0))) ms")
 
-        // C0: JSONObject cast only
+        // C0: JSONObject construction + one key lookup (the per-item object access floor)
         t0 = ContinuousClock.now
         var sink = 0
         for element in items {
-            if let obj = JSONObject(element) { sink += obj.raw.count }
+            if let obj = JSONObject(element) { sink += obj.storedValue("stream_id") == nil ? 0 : 1 }
         }
-        print("ZZBENCH C0 cast-only: \(String(format: "%.0f", ms(since: t0))) ms (sink=\(sink))")
+        print("ZZBENCH C0 object+lookup: \(String(format: "%.0f", ms(since: t0))) ms (sink=\(sink))")
 
         // C1: string fields only
         t0 = ContinuousClock.now
@@ -102,13 +102,109 @@ struct ZZDecodeBenchTests {
         }
         print("ZZBENCH E normalize: \(String(format: "%.0f", ms(since: t0))) ms (sink=\(sink))")
 
-        // F: full decode (sequential decoder entry point)
+        // F: full decode (sequential decoder entry point), compared with the oracle in-process.
         let credentials = XtreamCredentials(server: URL(string: "http://panel.example.com")!, username: "u", password: "p")
-        t0 = ContinuousClock.now
-        let movies = try XtreamDecoder.vodStreams(data, sourceID: SourceID("bench"), credentials: credentials)
-        print("ZZBENCH F vodStreams-sequential: \(String(format: "%.0f", ms(since: t0))) ms → \(movies.count)")
+        var bestProduction = Double.infinity
+        var movies: [Movie] = []
+        for _ in 0..<2 {
+            t0 = ContinuousClock.now
+            movies = try XtreamDecoder.vodStreams(data, sourceID: SourceID("bench"), credentials: credentials)
+            bestProduction = min(bestProduction, ms(since: t0))
+        }
+        print("ZZBENCH F vodStreams-sequential: \(String(format: "%.0f", bestProduction)) ms → \(movies.count)")
+
+        var bestReference = Double.infinity
+        var reference: [Movie] = []
+        for _ in 0..<2 {
+            t0 = ContinuousClock.now
+            reference = try LenientOracle.referenceVODStreams(data, sourceID: "bench", credentials: credentials)
+            bestReference = min(bestReference, ms(since: t0))
+        }
+        print("ZZBENCH F2 oracle-vodStreams: \(String(format: "%.0f", bestReference)) ms → \(reference.count)")
+        print("ZZBENCH F saving vs oracle: \(String(format: "%.1f", (bestReference - bestProduction) / bestReference * 100))%")
 
         #expect(movies.count == count)
+        #expect(movies == reference)
+    }
+
+    /// Dirty 20k-object payload: measures the LenientJSON object/array access layer against the
+    /// pre-optimization oracle in the same process, then the full sequential VOD decode.
+    @Test func dirtyBridgingProfile() throws {
+        let count = 20_000
+        let data = LenientDirtyFixture.payload(count: count)
+        let parsed = try LenientValue.parse(data)
+        print("ZZBENCH-D dirty payload bytes=\(data.count) items=\(count)")
+
+        var bestProduction = Double.infinity
+        var sink = 0
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            sink = 0
+            let productionElements = LenientArray(parsed) ?? .empty
+            for element in productionElements {
+                guard let obj = JSONObject(element) else { continue }
+                sink += Self.productionAccess(obj)
+            }
+            bestProduction = min(bestProduction, ms(since: t0))
+        }
+        print("ZZBENCH-D A production-access: \(String(format: "%.1f", bestProduction)) ms → \(String(format: "%.2f", bestProduction * 1000 / Double(count))) µs/item (sink=\(sink))")
+
+        var bestReference = Double.infinity
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            sink = 0
+            let referenceElements = LenientOracle.array(parsed)
+            for element in referenceElements {
+                guard let obj = LenientReferenceJSONObject(element) else { continue }
+                sink += Self.referenceAccess(obj)
+            }
+            bestReference = min(bestReference, ms(since: t0))
+        }
+        print("ZZBENCH-D B oracle-access: \(String(format: "%.1f", bestReference)) ms → \(String(format: "%.2f", bestReference * 1000 / Double(count))) µs/item (sink=\(sink))")
+        print("ZZBENCH-D access saving: \(String(format: "%.1f", (bestReference - bestProduction) / bestReference * 100))%")
+
+        let credentials = XtreamCredentials(server: URL(string: "http://panel.example.com")!, username: "bench", password: "secret")
+        var bestProductionMap = Double.infinity
+        var productionMapped: [Movie] = []
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            let productionElements = LenientArray(parsed) ?? .empty
+            productionMapped = XtreamDecoder.vodStreams(productionElements[...], sourceID: "bench", credentials: credentials)
+            bestProductionMap = min(bestProductionMap, ms(since: t0))
+        }
+        print("ZZBENCH-D M1 production-map-only: \(String(format: "%.1f", bestProductionMap)) ms → \(String(format: "%.2f", bestProductionMap * 1000 / Double(count))) µs/item → \(productionMapped.count)")
+
+        var bestReferenceMap = Double.infinity
+        var referenceMapped: [Movie] = []
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            let referenceElements = LenientOracle.array(parsed)
+            referenceMapped = LenientOracle.referenceVODStreams(referenceElements, sourceID: "bench", credentials: credentials)
+            bestReferenceMap = min(bestReferenceMap, ms(since: t0))
+        }
+        print("ZZBENCH-D M2 oracle-map-only: \(String(format: "%.1f", bestReferenceMap)) ms → \(String(format: "%.2f", bestReferenceMap * 1000 / Double(count))) µs/item → \(referenceMapped.count)")
+        print("ZZBENCH-D map-only saving: \(String(format: "%.1f", (bestReferenceMap - bestProductionMap) / bestReferenceMap * 100))%")
+        #expect(productionMapped == referenceMapped)
+
+        var bestProductionFull = Double.infinity
+        var production: [Movie] = []
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            production = try XtreamDecoder.vodStreams(data, sourceID: "bench", credentials: credentials)
+            bestProductionFull = min(bestProductionFull, ms(since: t0))
+        }
+        print("ZZBENCH-D C production-vodStreams: \(String(format: "%.1f", bestProductionFull)) ms → \(String(format: "%.2f", bestProductionFull * 1000 / Double(count))) µs/item → \(production.count)")
+
+        var bestReferenceFull = Double.infinity
+        var reference: [Movie] = []
+        for _ in 0..<3 {
+            let t0 = ContinuousClock.now
+            reference = try LenientOracle.referenceVODStreams(data, sourceID: "bench", credentials: credentials)
+            bestReferenceFull = min(bestReferenceFull, ms(since: t0))
+        }
+        print("ZZBENCH-D D oracle-vodStreams: \(String(format: "%.1f", bestReferenceFull)) ms → \(String(format: "%.2f", bestReferenceFull * 1000 / Double(count))) µs/item → \(reference.count)")
+        print("ZZBENCH-D full-decode saving: \(String(format: "%.1f", (bestReferenceFull - bestProductionFull) / bestReferenceFull * 100))%")
+        #expect(production == reference)
     }
 
     /// End-to-end through XtreamClient + StubURLProtocol: measures the chunked decodeList path.
@@ -166,7 +262,7 @@ struct ZZDecodeBenchTests {
                     fragment.append(payloadData[range])
                     fragment.append(0x5D)
                     let parsed = try? LenientValue.parse(fragment)
-                    return (index, (parsed as? [Any])?.count ?? -1)
+                    return (index, LenientArray(parsed)?.count ?? -1)
                 }
             }
             var collected: [(Int, Int)] = []
@@ -178,6 +274,52 @@ struct ZZDecodeBenchTests {
         print("ZZBENCH-P C chunked-parse (\(workers) workers): \(String(format: "%.0f", chunkedMs)) ms → \(total)")
         print("ZZBENCH-P scan+chunked: \(String(format: "%.0f", scanMs + chunkedMs)) ms vs single \(String(format: "%.0f", singleMs)) ms → speedup ×\(String(format: "%.1f", singleMs / max(scanMs + chunkedMs, 0.01)))")
         #expect(total == count)
+    }
+
+    private static func productionAccess(_ obj: JSONObject) -> Int {
+        var score = 0
+        score += obj.string("stream_id", "id")?.count ?? 0
+        score += obj.string("name", "title")?.count ?? 0
+        score += obj.string("plot", "description")?.count ?? 0
+        score += obj.string("container_extension")?.count ?? 0
+        score += obj.string("director")?.count ?? 0
+        score += obj.url("stream_icon", "cover", "cover_big") != nil ? 1 : 0
+        score += obj.urls("backdrop_path").count
+        score += obj.list("genre", "genres", separators: XtreamDecoder.genreSeparators).count
+        score += obj.list("cast", "actors").count
+        score += obj.int("duration_secs") ?? 0
+        score += obj.int("tmdb", "tmdb_id") ?? 0
+        score += obj.year("year", "releaseDate", "releasedate", "release_date") ?? 0
+        score += obj.date("added").map { Int($0.timeIntervalSince1970) } ?? 0
+        score += obj.double("rating").map { Int($0 * 100) } ?? 0
+        score += obj.bool("is_adult") == true ? 1 : 0
+        score += obj.object("nested")?.string("nombre")?.count ?? 0
+        score += obj.array("category_ids").count
+        score += obj.array("array_value").count
+        return score
+    }
+
+    private static func referenceAccess(_ obj: LenientReferenceJSONObject) -> Int {
+        var score = 0
+        score += obj.string("stream_id", "id")?.count ?? 0
+        score += obj.string("name", "title")?.count ?? 0
+        score += obj.string("plot", "description")?.count ?? 0
+        score += obj.string("container_extension")?.count ?? 0
+        score += obj.string("director")?.count ?? 0
+        score += obj.url("stream_icon", "cover", "cover_big") != nil ? 1 : 0
+        score += obj.urls("backdrop_path").count
+        score += obj.list("genre", "genres", separators: XtreamDecoder.genreSeparators).count
+        score += obj.list("cast", "actors").count
+        score += obj.int("duration_secs") ?? 0
+        score += obj.int("tmdb", "tmdb_id") ?? 0
+        score += obj.year("year", "releaseDate", "releasedate", "release_date") ?? 0
+        score += obj.date("added").map { Int($0.timeIntervalSince1970) } ?? 0
+        score += obj.double("rating").map { Int($0 * 100) } ?? 0
+        score += obj.bool("is_adult") == true ? 1 : 0
+        score += obj.object("nested")?.string("nombre")?.count ?? 0
+        score += obj.array("category_ids").count
+        score += obj.array("array_value").count
+        return score
     }
 
     private func ms(since start: ContinuousClock.Instant) -> Double {
