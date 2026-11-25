@@ -131,6 +131,55 @@ struct ZZDecodeBenchTests {
         #expect(movies == reference)
     }
 
+    /// Single-parse vs chunked parallel parse on a ~50 MB / 100k-element payload: scan cost,
+    /// fragment parse scaling, end-to-end wall time, output equality.
+    @Test func parallelParseBenchmark() async throws {
+        let count = 100_000
+        let data = Self.vodPayload(count: count)
+        print("ZZBENCH-P payload bytes=\(data.count) items=\(count)")
+
+        // A: single JSONSerialization parse (the old serial bottleneck).
+        var t0 = ContinuousClock.now
+        let reference = try XtreamDecoder.elements(data)
+        let singleMs = ms(since: t0)
+        print("ZZBENCH-P A single-parse: \(String(format: "%.0f", singleMs)) ms → \(reference.count)")
+
+        // B: byte-scan splitter alone (serial, on the critical path).
+        let payload = try #require(XtreamDecoder.payloadForParsing(data))
+        t0 = ContinuousClock.now
+        let split = try #require(TopLevelArraySplitter.split(payload))
+        let scanMs = ms(since: t0)
+        print("ZZBENCH-P B scan: \(String(format: "%.0f", scanMs)) ms → \(split.elements.count) slots")
+        #expect(split.elements.count == count)
+
+        // C: chunked parallel fragment parse (what decodeList does before mapping).
+        t0 = ContinuousClock.now
+        let workers = min(6, ProcessInfo.processInfo.activeProcessorCount)
+        let chunks = TopLevelArraySplitter.chunks(split, workers: workers)
+        let payloadData = split.payload
+        let parsedChunks: [(Int, Int)] = await withTaskGroup(of: (Int, Int).self) { group in
+            for (index, range) in chunks.enumerated() {
+                group.addTask {
+                    var fragment = Data()
+                    fragment.reserveCapacity(range.count + 2)
+                    fragment.append(0x5B)
+                    fragment.append(payloadData[range])
+                    fragment.append(0x5D)
+                    let parsed = try? LenientValue.parse(fragment)
+                    return (index, (parsed as? [Any])?.count ?? -1)
+                }
+            }
+            var collected: [(Int, Int)] = []
+            for await chunk in group { collected.append(chunk) }
+            return collected
+        }
+        let chunkedMs = ms(since: t0)
+        let total = parsedChunks.reduce(0) { $0 + $1.1 }
+        print("ZZBENCH-P C chunked-parse (\(workers) workers): \(String(format: "%.0f", chunkedMs)) ms → \(total)")
+        print("ZZBENCH-P scan+chunked: \(String(format: "%.0f", scanMs + chunkedMs)) ms vs single \(String(format: "%.0f", singleMs)) ms → speedup ×\(String(format: "%.1f", singleMs / max(scanMs + chunkedMs, 0.01)))")
+        #expect(total == count)
+    }
+
     private func ms(since start: ContinuousClock.Instant) -> Double {
         let e = ContinuousClock.now - start
         return Double(e.components.seconds) * 1000 + Double(e.components.attoseconds) / 1e15

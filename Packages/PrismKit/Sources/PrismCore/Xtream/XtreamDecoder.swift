@@ -98,6 +98,7 @@ public enum XtreamDecoder {
         let primaryIsHLS = (preferHLS && canHLS) || !canTS
         // Server base + encoded credentials are invariant across the list: encode once.
         let streamBase = XtreamURLBuilder.StreamBase(credentials)
+        var interner = CategoryIDInterner(sourceID: sourceID, kind: .live)
 
         var result: [Channel] = []
         result.reserveCapacity(items.count)
@@ -122,7 +123,7 @@ public enum XtreamDecoder {
                 rawName: rawName,
                 number: obj.int("num").flatMap { $0 > 0 ? $0 : nil },
                 logoURL: obj.url("stream_icon", "logo"),
-                categoryID: category.map { "\(sourceID.rawValue):\(MediaKind.live.rawValue):\($0)" },
+                categoryID: category.map { interner.intern($0) },
                 epgID: obj.string("epg_channel_id"),
                 streamURL: primaryIsHLS ? hls : ts,
                 alternateStreamURL: primaryIsHLS ? (canTS ? ts : nil) : (canHLS ? hls : nil),
@@ -150,6 +151,7 @@ public enum XtreamDecoder {
     ) -> [Movie] {
         // Server base + encoded credentials are invariant across the list: encode once.
         let streamBase = XtreamURLBuilder.StreamBase(credentials)
+        var interner = CategoryIDInterner(sourceID: sourceID, kind: .movie)
         var result: [Movie] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -173,7 +175,7 @@ public enum XtreamDecoder {
                 durationSeconds: obj.int("duration_secs") ?? obj.int("episode_run_time").map { $0 * 60 },
                 cast: obj.list("cast", "actors"),
                 director: obj.string("director"),
-                categoryID: category.map { "\(sourceID.rawValue):\(MediaKind.movie.rawValue):\($0)" },
+                categoryID: category.map { interner.intern($0) },
                 streamURL: streamBase.movie(streamID: id, ext: ext),
                 containerExtension: ext?.lowercased(),
                 quality: n.quality,
@@ -196,6 +198,7 @@ public enum XtreamDecoder {
     /// Maps already-parsed JSON elements → series. Non-throwing: malformed elements are skipped,
     /// order is preserved. Shared by the sequential entry point and the client's chunked decode.
     static func series(_ items: ArraySlice<Any>, sourceID: SourceID, adultCategoryIDs: Set<String> = []) -> [Series] {
+        var interner = CategoryIDInterner(sourceID: sourceID, kind: .series)
         var result: [Series] = []
         result.reserveCapacity(items.count)
         for element in items {
@@ -216,7 +219,7 @@ public enum XtreamDecoder {
                 rating: rating(obj),
                 cast: obj.list("cast", "actors"),
                 director: obj.string("director"),
-                categoryID: category.map { "\(sourceID.rawValue):\(MediaKind.series.rawValue):\($0)" },
+                categoryID: category.map { interner.intern($0) },
                 quality: n.quality,
                 tags: n.tags,
                 addedAt: obj.date("last_modified", "added"),
@@ -373,21 +376,33 @@ public enum XtreamDecoder {
 
     // MARK: Helpers
 
-    static func json(_ data: Data) throws -> Any {
+    /// Shared payload normalization ahead of JSON parsing: BOM after leading whitespace is
+    /// rebased to the start, gzip bodies without Content-Encoding are inflated. `nil` when
+    /// the body is whitespace only (which `json` decodes as an empty array). Also used by
+    /// the client's chunked parallel array parsing, which scans these exact bytes.
+    static func payloadForParsing(_ data: Data) -> Data? {
         guard let first = data.firstIndex(where: { $0 != 0x20 && $0 != 0x0A && $0 != 0x0D && $0 != 0x09 }) else {
+            return nil
+        }
+        // Some panels prepend whitespace before a UTF-8 BOM.
+        var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
+        // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
+        // (URLSession only decompresses when the header is present). A failed inflate falls
+        // back to the raw bytes, preserving the previous parse error.
+        if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
+            payload = inflated
+        }
+        return payload
+    }
+
+    static func json(_ data: Data) throws -> Any {
+        guard let payload = payloadForParsing(data) else {
             return [Any]()
         }
         do {
-            // Some panels prepend whitespace before a UTF-8 BOM.
-            var payload = first != data.startIndex && data[first...].starts(with: [0xEF, 0xBB, 0xBF]) ? data[first...] : data
-            // Panels behind misconfigured proxies can emit gzip bodies without Content-Encoding
-            // (URLSession only decompresses when the header is present). A failed inflate falls
-            // back to the raw bytes, preserving the previous parse error.
-            if Gzip.isCompressed(payload), let inflated = try? Gzip.decompress(payload) {
-                payload = inflated
-            }
             return try LenientValue.parse(payload)
         } catch {
+            let first = data.firstIndex(where: { $0 != 0x20 && $0 != 0x0A && $0 != 0x0D && $0 != 0x09 }) ?? data.startIndex
             let preview = String(decoding: data[first...].prefix(80), as: UTF8.self)
             throw XtreamError.decoding("JSON invalide : \(preview)")
         }
@@ -471,5 +486,27 @@ public enum XtreamDecoder {
             audioChannels: audio?.int("channels"),
             isHDR: isHDR
         )
+    }
+}
+
+/// Interns `sourceID:kind:nativeID` category strings during list decoding. Only a few
+/// hundred distinct categories exist, but a naive interpolation allocates a fresh string
+/// per item (100k+ allocations per list); reusing the first instance turns the per-item
+/// cost into a dictionary lookup. Scope is one decode worker (one list-mapping call), so
+/// no synchronization is needed and items sharing a category end up sharing one storage
+/// even before the catalog-wide `shareRepeatedValues` pass.
+struct CategoryIDInterner {
+    private let prefix: String
+    private var cache: [String: String] = [:]
+
+    init(sourceID: SourceID, kind: MediaKind) {
+        prefix = "\(sourceID.rawValue):\(kind.rawValue):"
+    }
+
+    mutating func intern(_ nativeID: String) -> String {
+        if let cached = cache[nativeID] { return cached }
+        let built = prefix + nativeID
+        cache[nativeID] = built
+        return built
     }
 }

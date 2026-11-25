@@ -137,17 +137,32 @@ public actor XtreamClient {
         }.value
     }
 
-    /// Parses the JSON once off-actor, then maps the elements in parallel slices when the list
+    /// Parses the JSON off-actor, then maps the elements in parallel slices when the list
     /// is large. Per-item mapping costs ~50-130 µs (normalization, field coercion, URL building),
     /// so a 100k-item `get_vod_streams` spends ~10 s on a single core; six workers cut that to
     /// ~2 s while the other endpoints are still downloading. Output order is always preserved.
-    /// `nonisolated` so the task-group workers below inherit the generic executor: actor-
-    /// isolated children would run the CPU-bound `map` back on this actor.
+    /// Large top-level arrays (the three catalog endpoints) take the chunked path below, which
+    /// also parallelizes the object-graph parse itself. `nonisolated` so the task-group workers
+    /// below inherit the generic executor: actor-isolated children would run the CPU-bound
+    /// `map` back on this actor.
     private nonisolated func decodeList<T: Sendable>(
         _ data: Data,
         map: @escaping @Sendable (ArraySlice<Any>) -> [T]
     ) async throws -> [T] {
         try Task.checkCancellation()
+        if data.count >= Self.parallelParseMinBytes, let chunked = await parseAndMapChunked(data, map: map) {
+            try Task.checkCancellation()
+            return chunked
+        }
+        return try await parseWholeThenMap(data, map: map)
+    }
+
+    /// Single-parse decode pipeline (exact pre-chunking behavior): one `JSONSerialization`
+    /// over the whole payload, then parallel per-item mapping for large element counts.
+    private nonisolated func parseWholeThenMap<T: Sendable>(
+        _ data: Data,
+        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+    ) async throws -> [T] {
         let parsed = try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return ParsedElements(value: try XtreamDecoder.elements(data))
@@ -188,6 +203,67 @@ public actor XtreamClient {
         return result
     }
 
+    /// Chunked parallel decode of a large top-level JSON array. The byte-scan splitter finds
+    /// every depth-1 element range in one pass; each worker then copies its share of the bytes
+    /// into a `[`…`]`-wrapped fragment, parses that fragment with `JSONSerialization`, and maps
+    /// its elements — so both the object-graph construction and the per-item mapping scale with
+    /// the worker count, and the giant `[Any]` tree never exists as a single allocation.
+    ///
+    /// Returns `nil` — meaning "use the exact single-parse fallback" — for anything the scan
+    /// cannot certify: non-array roots (`{}` error objects, keyed-element dictionaries, `null`,
+    /// `false`), malformed structure, a fragment that fails to parse, or a decoded element count
+    /// that differs from the scanned slot count. The count comparison is the malformed-input
+    /// detector: valid arrays decode exactly one element per slot, while empty slots from
+    /// leading/trailing/double commas decode as zero — so a mismatch means the input was never
+    /// valid JSON and the fallback reproduces the original parse error.
+    private nonisolated func parseAndMapChunked<T: Sendable>(
+        _ data: Data,
+        map: @escaping @Sendable (ArraySlice<Any>) -> [T]
+    ) async -> [T]? {
+        guard let payload = XtreamDecoder.payloadForParsing(data),
+              let split = TopLevelArraySplitter.split(payload) else { return nil }
+        let workers = min(
+            Self.maxDecodeWorkers,
+            ProcessInfo.processInfo.activeProcessorCount,
+            max(2, (payload.count + Self.parseChunkTargetBytes - 1) / Self.parseChunkTargetBytes),
+            split.elements.count
+        )
+        guard workers >= 2 else { return nil }
+        let chunks = TopLevelArraySplitter.chunks(split, workers: workers)
+        let payloadData = split.payload
+        return await withTaskGroup(of: ChunkedDecode<T>?.self, returning: [T]?.self) { group in
+            for (index, range) in chunks.enumerated() {
+                group.addTask {
+                    var fragment = Data()
+                    fragment.reserveCapacity(range.count + 2)
+                    fragment.append(0x5B) // [
+                    fragment.append(payloadData[range])
+                    fragment.append(0x5D) // ]
+                    guard let parsed = try? LenientValue.parse(fragment), let array = parsed as? [Any] else { return nil }
+                    return ChunkedDecode(index: index, parsedCount: array.count, mapped: map(array[...]))
+                }
+            }
+            var collected: [ChunkedDecode<T>] = []
+            collected.reserveCapacity(chunks.count)
+            for await chunk in group {
+                guard let chunk else {
+                    group.cancelAll()
+                    return nil
+                }
+                collected.append(chunk)
+            }
+            guard collected.reduce(0, { $0 + $1.parsedCount }) == split.elements.count else { return nil }
+            var total = 0
+            for chunk in collected { total += chunk.mapped.count }
+            var result: [T] = []
+            result.reserveCapacity(total)
+            for chunk in collected.sorted(by: { $0.index < $1.index }) {
+                result.append(contentsOf: chunk.mapped)
+            }
+            return result
+        }
+    }
+
     private func adultIDs(_ kind: MediaKind) async -> Set<String> {
         if let cached = adultCategories[kind] { return cached }
         let fetch: Fetch
@@ -214,6 +290,12 @@ public actor XtreamClient {
     private static let decodeSliceTarget = 8_000
     /// Hard cap: the three lists can decode at once, so per-list workers stay modest.
     private static let maxDecodeWorkers = 6
+    /// Payloads smaller than this keep the single-parse path: scanning, fragment copies and
+    /// worker startup only pay off once the serial object-graph parse dominates (a few ms/MB).
+    private static let parallelParseMinBytes = 256 * 1024
+    /// Target uncompressed bytes per parse worker; small lists use fewer workers so a
+    /// marginally-large payload does not pay six task startups for two milliseconds of work.
+    private static let parseChunkTargetBytes = 2 * 1024 * 1024
 
     private func get(action: String?, extra: [URLQueryItem] = [], timeout: TimeInterval = 30, retries: Int = 2) async throws -> Data {
         let url = XtreamURLBuilder.api(credentials, action: action, extra: extra)
@@ -252,4 +334,14 @@ public actor XtreamClient {
 /// tasks is safe even though `[Any]` is not `Sendable`.
 private struct ParsedElements: @unchecked Sendable {
     let value: [Any]
+}
+
+/// One chunk worker's output of the parallel array parse: the number of JSON elements the
+/// fragment decoded (kept separately from `mapped.count`, which legitimately drops malformed
+/// items) and the mapped models, tagged with the chunk index for ordered reassembly.
+/// `mapped` is `Sendable` by constraint; the counts are plain values.
+private struct ChunkedDecode<T: Sendable>: Sendable {
+    let index: Int
+    let parsedCount: Int
+    let mapped: [T]
 }
