@@ -454,6 +454,113 @@ struct ScrollProbeTests {
         try await run("chrome=31 (bare)", chrome: 31)
     }
 
+    /// Grid-layout bisection with process-CPU samples. Every configuration is measured
+    /// several times interleaved; the reported run is the one with the lowest p95 wall
+    /// (noise can only inflate these synchronous samples). `totalCPU` also charges work
+    /// performed by helper/render threads while the timed scroll is underway, which the
+    /// per-step main-thread samples cannot see.
+    @Test func gridRowsAndEntrance() async throws {
+        var results: [ProbeGridMode: [ProbeRunResult]] = [:]
+        for repetition in 0..<4 {
+            let forward = repetition.isMultiple(of: 2)
+            let modes = forward ? ProbeGridMode.allCases : ProbeGridMode.allCases.reversed()
+            for mode in modes {
+                results[mode, default: []].append(try await runGridProbe(mode))
+            }
+        }
+        for mode in ProbeGridMode.allCases {
+            let values = results[mode] ?? []
+            guard let bestWall = values.min(by: { $0.p95Wall < $1.p95Wall }),
+                  let bestCPU = values.min(by: { $0.totalCPU < $1.totalCPU }) else { continue }
+            print("[probe-grid] \(mode.rawValue) best-wall: wall p50 \(format(bestWall.p50Wall)) ms, "
+                + "p95 \(format(bestWall.p95Wall)) ms, max \(format(bestWall.maxWall)) ms, "
+                + "\(bestWall.overBudget)/\(bestWall.steps) over 8.33 ms; step CPU p50 \(format(bestWall.p50CPU)) ms, "
+                + "p95 \(format(bestWall.p95CPU)) ms, max \(format(bestWall.maxCPU)) ms; "
+                + "total CPU \(format(bestWall.totalCPU)) ms over \(format(bestWall.wallSeconds)) s, "
+                + "tail CPU \(format(bestWall.tailCPU)) ms")
+            print("[probe-grid] \(mode.rawValue) best-cpu: wall p50 \(format(bestCPU.p50Wall)) ms, "
+                + "p95 \(format(bestCPU.p95Wall)) ms, max \(format(bestCPU.maxWall)) ms; "
+                + "total CPU \(format(bestCPU.totalCPU)) ms over \(format(bestCPU.wallSeconds)) s, "
+                + "tail CPU \(format(bestCPU.tailCPU)) ms")
+        }
+    }
+
+    /// Focused duration scaling check for the row entrance animation.
+    @Test func gridEntranceDurations() async throws {
+        let modes: [ProbeGridMode] = [.rowsEntrance, .rowsEntrance35, .rowsEntrance20, .rowsNoEntrance]
+        var results: [ProbeGridMode: [ProbeRunResult]] = [:]
+        for _ in 0..<4 {
+            for mode in modes {
+                results[mode, default: []].append(try await runGridProbe(mode))
+            }
+        }
+        for mode in modes {
+            guard let best = results[mode]?.min(by: { $0.totalCPU < $1.totalCPU }) else { continue }
+            print("[probe-grid-duration] \(mode.rawValue): wall p50 \(format(best.p50Wall)) ms, p95 \(format(best.p95Wall)) ms, "
+                + "max \(format(best.maxWall)) ms; total CPU \(format(best.totalCPU)) ms, tail CPU \(format(best.tailCPU)) ms")
+        }
+    }
+
+    private func runGridProbe(_ mode: ProbeGridMode) async throws -> ProbeRunResult {
+        _ = NSApplication.shared
+        let titles = (0..<20_000).map { index in
+            MediaTitle(id: TitleID(rawValue: "movie:\(index)"), kind: .movie,
+                       title: "Film \(index)", year: 2000 + index % 25, variants: [])
+        }
+        let model = AppModel(directories: .temporary("prism-probe-grid"), credentials: InMemoryCredentialStore(),
+                             library: .inMemory(), isEphemeral: true)
+        let navigation = NavigationModel()
+        let size = CGSize(width: 1_170, height: 870)
+        let frame = CGRect(origin: .zero, size: size)
+        let host = NSHostingView(rootView: ScrollView {
+            ProbeGridContent(mode: mode, items: titles, availableWidth: size.width)
+        }
+        .environment(\.prismIsScrollingContent, true)
+        .frame(width: size.width, height: size.height)
+        .environment(model)
+        .environment(navigation))
+        host.frame = frame
+        let window = NSWindow(contentRect: frame.offsetBy(dx: -20_000, dy: -20_000),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        layout(host)
+        let scroll = try #require(scrollView(in: host))
+        let clip = scroll.contentView
+        let origin = clip.bounds.origin
+        let direction: CGFloat = clip.isFlipped ? 1 : -1
+        try await Task.sleep(for: .milliseconds(100))
+        let clock = ContinuousClock()
+        let steps = 180
+        var wallSamples: [Double] = []
+        var cpuSamples: [Double] = []
+        wallSamples.reserveCapacity(steps)
+        cpuSamples.reserveCapacity(steps)
+        let start = clock.now
+        let scrollCPUStart = processCPUMilliseconds()
+        for step in 1...steps {
+            try await clock.sleep(until: start.advanced(by: .nanoseconds(8_333_333) * step))
+            let offset = min(step, steps - step)
+            let destination = CGPoint(x: origin.x, y: origin.y + direction * CGFloat(offset * 48))
+            let sampleStart = clock.now
+            let cpuStart = processCPUMilliseconds()
+            clip.scroll(to: destination)
+            scroll.reflectScrolledClipView(clip)
+            layout(host)
+            wallSamples.append(milliseconds(sampleStart.duration(to: clock.now)))
+            cpuSamples.append(processCPUMilliseconds() - cpuStart)
+        }
+        let wallSeconds = milliseconds(start.duration(to: clock.now)) / 1_000
+        let totalCPU = processCPUMilliseconds() - scrollCPUStart
+        let tailCPUStart = processCPUMilliseconds()
+        try await Task.sleep(for: .milliseconds(500))
+        layout(host)
+        let tailCPU = processCPUMilliseconds() - tailCPUStart
+        return ProbeRunResult(steps: steps, wall: wallSamples, cpu: cpuSamples,
+                              totalCPU: totalCPU, tailCPU: tailCPU, wallSeconds: wallSeconds)
+    }
+
     private func scrollView(in view: NSView) -> NSScrollView? {
         if let scroll = view as? NSScrollView { return scroll }
         return view.subviews.lazy.compactMap { scrollView(in: $0) }.first
@@ -471,6 +578,275 @@ struct ScrollProbeTests {
     }
 
     private func format(_ value: Double) -> String { String(format: "%.2f", value) }
+
+    private func processCPUMilliseconds() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        let seconds = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+            + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
+        return seconds * 1_000
+    }
+}
+
+private enum ProbeGridMode: String, CaseIterable {
+    /// `TitleGrid` exactly as the collection pages use it today.
+    case gridCurrent = "grid/current"
+    /// Same `LazyVGrid`, with the per-card scroll transition removed.
+    case gridNoEntrance = "grid/no-entrance"
+    /// Rows materialized as units; one shared scroll transition per row. Cards in a row
+    /// have identical vertical positions, so their entrance phase is identical too.
+    case rowsEntrance = "rows/entrance"
+    /// Row layout floor with no scroll-transition tracking at all.
+    case rowsNoEntrance = "rows/no-entrance"
+    /// Row transition driven directly by scroll position rather than a 0.5 s trailing animation.
+    case rowsDirectEntrance = "rows/direct-entrance"
+    /// Animated row transition applied to a compositing group.
+    case rowsEntranceComposited = "rows/entrance-composited"
+    /// Direct row transition applied to a compositing group.
+    case rowsDirectComposited = "rows/direct-composited"
+    /// Discrete entrance animation triggered once by visibility instead of `scrollTransition`.
+    case rowsVisibilityEntrance = "rows/visibility-entrance"
+    /// Same scroll transition with a shorter discrete animation.
+    case rowsEntrance35 = "rows/entrance-0.35"
+    case rowsEntrance20 = "rows/entrance-0.20"
+}
+
+private struct ProbeRunResult {
+    let steps: Int
+    let p50Wall: Double
+    let p95Wall: Double
+    let maxWall: Double
+    let overBudget: Int
+    let p50CPU: Double
+    let p95CPU: Double
+    let maxCPU: Double
+    let totalCPU: Double
+    let tailCPU: Double
+    let wallSeconds: Double
+
+    init(steps: Int, wall: [Double], cpu: [Double], totalCPU: Double, tailCPU: Double, wallSeconds: Double) {
+        func percentile(_ samples: [Double], _ fraction: Double) -> Double {
+            let sorted = samples.sorted()
+            return sorted[min(samples.count - 1, max(0, Int((Double(samples.count) * fraction).rounded(.up)) - 1))]
+        }
+        self.steps = steps
+        p50Wall = percentile(wall, 0.50)
+        p95Wall = percentile(wall, 0.95)
+        maxWall = wall.max() ?? 0
+        overBudget = wall.count { $0 > 1_000.0 / 120 }
+        p50CPU = percentile(cpu, 0.50)
+        p95CPU = percentile(cpu, 0.95)
+        maxCPU = cpu.max() ?? 0
+        self.totalCPU = totalCPU
+        self.tailCPU = tailCPU
+        self.wallSeconds = wallSeconds
+    }
+}
+
+private struct ProbeGridContent: View {
+    let mode: ProbeGridMode
+    let items: [MediaTitle]
+    let availableWidth: CGFloat
+
+    var body: some View {
+        switch mode {
+        case .gridCurrent:
+            TitleGrid(items: items, availableWidth: availableWidth)
+        case .gridNoEntrance:
+            ProbeLazyGrid(items: items, availableWidth: availableWidth, entrance: false)
+        case .rowsEntrance:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .animated)
+        case .rowsNoEntrance:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .none)
+        case .rowsDirectEntrance:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .direct)
+        case .rowsEntranceComposited:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .animatedComposited)
+        case .rowsDirectComposited:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .directComposited)
+        case .rowsVisibilityEntrance:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .visibility)
+        case .rowsEntrance35:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .animated35)
+        case .rowsEntrance20:
+            ProbeRowGrid(items: items, availableWidth: availableWidth, entrance: .animated20)
+        }
+    }
+}
+
+/// Exact `TitleGrid` geometry, with entrance transitions switchable for measurement.
+private struct ProbeLazyGrid: View {
+    let items: [MediaTitle]
+    let availableWidth: CGFloat
+    let entrance: Bool
+
+    var body: some View {
+        let spacing: CGFloat = 20
+        let contentWidth = max(140, availableWidth - 2 * PrismMetrics.contentMargin)
+        let count = max(1, Int((contentWidth + spacing) / (145 + spacing)))
+        let width = (contentWidth - CGFloat(count - 1) * spacing) / CGFloat(count)
+        let columns = Array(repeating: GridItem(.fixed(width), spacing: spacing), count: count)
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 28) {
+            ForEach(items) { item in
+                if entrance {
+                    BrowsePoster(item: item, width: width)
+                        .rowEntrance()
+                } else {
+                    BrowsePoster(item: item, width: width)
+                }
+            }
+        }
+        .padding(.horizontal, PrismMetrics.contentMargin)
+    }
+}
+
+/// The same fixed-column grid expressed as independently materialized rows. Because every
+/// card in one row has the same vertical geometry, a single row-level scroll transition
+/// produces the same entrance phase as six identical card-level transitions.
+private enum ProbeEntranceStyle {
+    case none, animated, direct, animatedComposited, directComposited, visibility, animated35, animated20
+}
+
+private struct ProbeRowGrid: View {
+    let items: [MediaTitle]
+    let availableWidth: CGFloat
+    let entrance: ProbeEntranceStyle
+
+    var body: some View {
+        let spacing: CGFloat = 20
+        let contentWidth = max(140, availableWidth - 2 * PrismMetrics.contentMargin)
+        let count = max(1, Int((contentWidth + spacing) / (145 + spacing)))
+        let width = (contentWidth - CGFloat(count - 1) * spacing) / CGFloat(count)
+        let rowCount = (items.count + count - 1) / count
+        LazyVStack(alignment: .leading, spacing: PrismMetrics.gridRowSpacing) {
+            ForEach(0..<rowCount, id: \.self) { row in
+                ProbeGridRow(items: items, row: row, columns: count, width: width,
+                             contentWidth: contentWidth, spacing: spacing, entrance: entrance)
+                    .padding(.horizontal, PrismMetrics.contentMargin)
+            }
+        }
+    }
+}
+
+private struct ProbeGridRow: View {
+    let items: [MediaTitle]
+    let row: Int
+    let columns: Int
+    let width: CGFloat
+    let contentWidth: CGFloat
+    let spacing: CGFloat
+    let entrance: ProbeEntranceStyle
+
+    var body: some View {
+        let start = row * columns
+        let end = min(items.count, start + columns)
+        let content = HStack(alignment: .top, spacing: spacing) {
+            ForEach(start..<end, id: \.self) { index in
+                BrowsePoster(item: items[index], width: width)
+            }
+        }
+        .frame(width: contentWidth, alignment: .leading)
+
+        switch entrance {
+        case .none:
+            content
+        case .animated:
+            content.rowEntrance()
+        case .direct:
+            content.probeDirectRowEntrance()
+        case .animatedComposited:
+            content.compositingGroup().rowEntrance()
+        case .directComposited:
+            content.compositingGroup().probeDirectRowEntrance()
+        case .visibility:
+            content.probeVisibilityRowEntrance()
+        case .animated35:
+            content.probeAnimatedRowEntrance(duration: 0.35)
+        case .animated20:
+            content.probeAnimatedRowEntrance(duration: 0.20)
+        }
+    }
+}
+
+private struct ProbeDirectRowEntrance: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismSnapshotRendering) private var isSnapshot
+
+    func body(content: Content) -> some View {
+        if isSnapshot {
+            content
+        } else {
+            let moves = !reduceMotion
+            content.scrollTransition(.interactive.threshold(.visible(0.08)), axis: .vertical) { view, phase in
+                view
+                    .opacity(phase.value > 0 ? 0 : 1)
+                    .scaleEffect(phase.value > 0 && moves ? 0.97 : 1, anchor: .top)
+                    .offset(y: phase.value > 0 && moves ? 28 : 0)
+            }
+        }
+    }
+}
+
+private struct ProbeAnimatedRowEntrance: ViewModifier {
+    let duration: Double
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismSnapshotRendering) private var isSnapshot
+
+    func body(content: Content) -> some View {
+        if isSnapshot {
+            content
+        } else {
+            let moves = !reduceMotion
+            content.scrollTransition(.animated(.smooth(duration: duration)).threshold(.visible(0.08)), axis: .vertical) { view, phase in
+                view
+                    .opacity(phase.value > 0 ? 0 : 1)
+                    .scaleEffect(phase.value > 0 && moves ? 0.97 : 1, anchor: .top)
+                    .offset(y: phase.value > 0 && moves ? 28 : 0)
+            }
+        }
+    }
+}
+
+private struct ProbeVisibilityRowEntrance: ViewModifier {
+    @State private var entered = false
+    @State private var initialized = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.prismSnapshotRendering) private var isSnapshot
+
+    func body(content: Content) -> some View {
+        let shown = entered || isSnapshot
+        content
+            .opacity(shown ? 1 : 0)
+            .scaleEffect(shown || reduceMotion ? 1 : 0.97, anchor: .top)
+            .offset(y: shown || reduceMotion ? 0 : 28)
+            .animation(PrismMotion.entrance, value: entered)
+            .onScrollVisibilityChange(threshold: 0.08) { visible in
+                if visible && !entered {
+                    if initialized {
+                        entered = true
+                    } else {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) { entered = true }
+                    }
+                }
+                initialized = true
+            }
+    }
+}
+
+private extension View {
+    func probeDirectRowEntrance() -> some View {
+        modifier(ProbeDirectRowEntrance())
+    }
+
+    func probeVisibilityRowEntrance() -> some View {
+        modifier(ProbeVisibilityRowEntrance())
+    }
+
+    func probeAnimatedRowEntrance(duration: Double) -> some View {
+        modifier(ProbeAnimatedRowEntrance(duration: duration))
+    }
 }
 
 /// `Shelf` replica with toggleable feature groups, used by `runShelfProbe` to attribute

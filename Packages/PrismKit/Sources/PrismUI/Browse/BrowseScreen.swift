@@ -785,7 +785,7 @@ struct BrowsePoster: View {
     var showsTitle: Bool? = nil
 
     var body: some View {
-        let name = app.recommendations.named(item).title
+        let name = app.recommendations.displayTitle(for: item)
         PosterCard(imageURL: item.posterURL, seed: name, title: name,
                    subtitle: subtitle, showsTitle: showsTitle ?? (rank == nil), rank: rank, width: width,
                    action: { navigation.push(.title(item.id)) }) {
@@ -854,7 +854,7 @@ struct ResumeCard: View {
 
     var body: some View {
         ResumeWideCard(imageURL: item.title.backdropURL ?? item.episode?.stillURL ?? item.title.posterURL,
-                       title: app.recommendations.named(item.title).title, metadata: metadata,
+                       title: app.recommendations.displayTitle(for: item.title), metadata: metadata,
                        progress: item.progress?.fraction, action: resume) {
             Button("Voir la fiche") { navigation.push(.title(item.title.id)) }
         }

@@ -29,6 +29,13 @@ public struct Recommendations: Sendable {
         selections[languages.isEmpty ? HomeAudioLanguage.defaults : languages] ?? .empty
     }
 
+    /// Display title after editorial canonicalization, without copying the grouped title graph.
+    /// Hot card paths only need the string; `named(_:)` remains for detail/curation code that
+    /// also needs the canonical plot.
+    public func displayTitle(for media: MediaTitle) -> String {
+        editorialCopy[media.id]?.title ?? media.title
+    }
+
     /// Use the identified work's canonical name while preserving the provider's title ID and offers.
     public func named(_ media: MediaTitle) -> MediaTitle {
         guard let copy = editorialCopy[media.id] else { return media }

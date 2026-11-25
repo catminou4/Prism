@@ -90,6 +90,7 @@ extension AnyTransition {
 /// Apply to the `ScrollView` itself — the environment reaches its content.
 struct ScrollPhaseEnvironment: ViewModifier {
     @State private var isScrolling = false
+    @State private var activity = ScrollActivity()
     let onChange: (Bool) -> Void
 
     func body(content: Content) -> some View {
@@ -97,9 +98,11 @@ struct ScrollPhaseEnvironment: ViewModifier {
             .onScrollPhaseChange { _, phase in
                 guard isScrolling != phase.isScrolling else { return }
                 isScrolling = phase.isScrolling
+                activity.update(isScrolling: phase.isScrolling)
                 onChange(isScrolling)
             }
             .environment(\.prismIsScrollingContent, isScrolling)
+            .environment(\.prismScrollActivity, activity)
     }
 }
 
