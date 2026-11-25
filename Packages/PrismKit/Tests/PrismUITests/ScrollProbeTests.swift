@@ -585,6 +585,56 @@ struct ScrollProbeTests {
         }
     }
 
+    /// Focused interleaved comparison of the interaction-chrome candidates that can preserve
+    /// the production behavior: the zero-distance drag gesture with geometry-measured inside
+    /// tracking, the same gesture masked by hover state only, and the tap+long-press pair.
+    /// Everything else in the card tree is held at production configuration.
+    @Test func interactionCandidates() async throws {
+        let configurations: [(String, ProbeMountOptions)] = [
+            ("interaction/button-replica", .full),
+            ("interaction/drag-geometry", .full.with { $0.interaction = .dragGeometry }),
+            ("interaction/none", .full.with { $0.interaction = .none }),
+            ("attribution/geometry-state", .full.with { $0.interaction = .noneGeometryState }),
+            ("attribution/geometry-box", .full.with { $0.interaction = .noneGeometryBox }),
+        ]
+        var results: [String: [ProbeRunResult]] = [:]
+
+        func measure<Card: View>(_ name: String, @ViewBuilder card: @escaping (Int) -> Card) async throws {
+            results[name, default: []].append(try await runShelfMountProbe(card: card))
+        }
+
+        for repetition in 0..<10 {
+            if repetition.isMultiple(of: 2) {
+                try await measure("production") { index in
+                    PosterCard(imageURL: nil, seed: "Film \(index)", title: "Film \(index)",
+                               subtitle: "20\(index % 25)", showsTitle: true, action: {}) {
+                        Button("Lire") {}
+                    }
+                }
+            }
+            let round = repetition.isMultiple(of: 2) ? configurations : configurations.reversed()
+            for (name, options) in round {
+                try await measure(name) { index in ProbeMountCard(index: index, options: options) }
+            }
+            if !repetition.isMultiple(of: 2) {
+                try await measure("production") { index in
+                    PosterCard(imageURL: nil, seed: "Film \(index)", title: "Film \(index)",
+                               subtitle: "20\(index % 25)", showsTitle: true, action: {}) {
+                        Button("Lire") {}
+                    }
+                }
+            }
+        }
+
+        for (name, _) in [("production", ProbeMountOptions.full)] + configurations {
+            let values = results[name] ?? []
+            guard let best = values.min(by: { $0.totalCPU < $1.totalCPU }) else { continue }
+            let all = values.map { $0.totalCPU }.map { format($0) }.joined(separator: " ")
+            print("[probe-interaction] \(name): wall p50 \(format(best.p50Wall)) ms, p95 \(format(best.p95Wall)) ms, "
+                + "max \(format(best.maxWall)) ms, \(best.overBudget)/\(best.steps) over; total CPU \(format(best.totalCPU)) ms; all [\(all)]")
+        }
+    }
+
     /// Compares how the scrolling state is represented while otherwise measuring the same
     /// production-card shelf. Browse historically publishes only the shared `ScrollActivity`
     /// object; collection pages additionally publish the boolean environment. Because every
@@ -1315,7 +1365,7 @@ private enum ProbeHorizontalContainer {
 }
 
 private struct ProbeMountOptions: Hashable {
-    enum Interaction: Hashable { case button, plainButton, tap, tapPressGesture, none }
+    enum Interaction: Hashable { case button, plainButton, tap, tapPressGesture, dragGeometry, dragGeometryBox, dragHover, none, noneGeometryState, noneGeometryBox }
     enum MenuAttachment: Hashable { case production, contextOnly, accessibilityActionsOnly, none }
     enum Accessibility: Hashable { case full, labelAndTraits, none }
     enum Captions: Hashable { case titleAndSubtitle, titleAndSubtitleNoInnerFrame, titleOnly, combined, none }
@@ -1352,12 +1402,19 @@ private struct ProbeMountOptions: Hashable {
 /// Layer-for-layer configurable replica of the production poster card. Keeping every variant
 /// behind this one concrete type lets the interleaved probe compare configurations without
 /// wrapping cards in `AnyView` (whose own layout cost would hide small differences).
+private final class ProbeSizeBox {
+    var size = CGSize.zero
+}
+
 private struct ProbeMountCard: View {
     let index: Int
     let options: ProbeMountOptions
 
     @State private var hovering = false
     @GestureState private var gesturePressed = false
+    @State private var dragInside = true
+    @State private var cardSize = CGSize.zero
+    @State private var sizeBox = ProbeSizeBox()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.prismSnapshotHover) private var forcedHover
     @Environment(\.prismCardWidth) private var shelfWidth
@@ -1400,6 +1457,63 @@ private struct ProbeMountCard: View {
                         isHovered: isHovered, isPressed: gesturePressed, reduceMotion: reduceMotion, effects: options.pressEffects,
                         scrollingOverride: options.shareScrollingRead ? isScrollingContent : nil
                     ))
+            case .dragGeometry:
+                cardContent(width: width)
+                    .contentShape(.rect)
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { cardSize = $0 }
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                            .updating($gesturePressed) { _, state, _ in state = true }
+                            .onChanged { value in
+                                dragInside = value.location.x >= 0 && value.location.y >= 0
+                                    && value.location.x <= cardSize.width && value.location.y <= cardSize.height
+                            }
+                            .onEnded { value in
+                                dragInside = true
+                            }
+                    )
+                    .accessibilityAction(.default) {}
+                    .modifier(ProbePressEffectModifier(
+                        isHovered: isHovered, isPressed: gesturePressed && dragInside, reduceMotion: reduceMotion, effects: options.pressEffects,
+                        scrollingOverride: options.shareScrollingRead ? isScrollingContent : nil
+                    ))
+            case .dragGeometryBox:
+                cardContent(width: width)
+                    .contentShape(.rect)
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { sizeBox.size = $0 }
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                            .updating($gesturePressed) { _, state, _ in state = true }
+                            .onChanged { value in
+                                let inside = value.location.x >= 0 && value.location.y >= 0
+                                    && value.location.x <= sizeBox.size.width && value.location.y <= sizeBox.size.height
+                                if inside != dragInside { dragInside = inside }
+                            }
+                            .onEnded { _ in dragInside = true }
+                    )
+                    .accessibilityAction(.default) {}
+                    .modifier(ProbePressEffectModifier(
+                        isHovered: isHovered, isPressed: gesturePressed && dragInside, reduceMotion: reduceMotion, effects: options.pressEffects,
+                        scrollingOverride: options.shareScrollingRead ? isScrollingContent : nil
+                    ))
+            case .dragHover:
+                cardContent(width: width)
+                    .contentShape(.rect)
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                            .updating($gesturePressed) { _, state, _ in state = true }
+                    )
+                    .accessibilityAction(.default) {}
+                    .modifier(ProbePressEffectModifier(
+                        isHovered: isHovered, isPressed: gesturePressed && isHovered, reduceMotion: reduceMotion, effects: options.pressEffects,
+                        scrollingOverride: options.shareScrollingRead ? isScrollingContent : nil
+                    ))
+            case .noneGeometryState:
+                cardContent(width: width)
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { cardSize = $0 }
+            case .noneGeometryBox:
+                cardContent(width: width)
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { sizeBox.size = $0 }
             case .none:
                 cardContent(width: width)
             }
