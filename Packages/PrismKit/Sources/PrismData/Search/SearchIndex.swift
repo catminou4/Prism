@@ -105,17 +105,35 @@ public final class SearchIndex: Sendable {
         var alternateNames: Set<String> = []
     }
 
-    /// Per-chunk output: names plus chunk-local word ids (deduplicated per entry).
+    /// Per-chunk output: names, the chunk's unique words as a sorted flattened table, and
+    /// per-entry positions into that table (deduplicated per entry, first-appearance order).
     private struct Chunk: Sendable {
         var start: Int
         var nameBytes: [UInt8] = []
         var nameLengths: [Int32] = []
-        /// Unique words of the chunk, indexed by local id.
-        var localWords: [String] = []
-        /// Local word ids of every entry, flattened.
+        /// Unique words of the chunk in bytewise order, flattened; `sortedWordOffsets.count == words + 1`.
+        var sortedWordBytes: [UInt8] = []
+        var sortedWordOffsets: [Int32] = []
+        /// Sorted-table positions of every entry's words, flattened.
         var entryWords: [Int32] = []
         var wordCounts: [Int32] = []
         var baseScores: [UInt64] = []
+
+        var wordCount: Int { max(sortedWordOffsets.count - 1, 0) }
+    }
+
+    /// Mutable buffer shared across parallel tasks, each writing positions no other task
+    /// touches. `Element` must be trivial (Int32/UInt64/UInt8): writes are then plain memory
+    /// stores to disjoint locations — no overlapping access, no object lifetime involved.
+    private struct DisjointBuffer<Element>: @unchecked Sendable {
+        var buffer: UnsafeMutableBufferPointer<Element>
+
+        var baseAddress: UnsafeMutablePointer<Element>? { buffer.baseAddress }
+
+        @inline(__always) subscript(_ index: Int) -> Element {
+            @inline(__always) _read { yield buffer[index] }
+            @inline(__always) nonmutating set { buffer[index] = newValue }
+        }
     }
 
     @concurrent
@@ -128,7 +146,7 @@ public final class SearchIndex: Sendable {
         // Describe + fold + split in parallel chunks (entry order: channels, movies, series).
         let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
         let chunkSize = max(4_096, total / (workers * 2))
-        let chunks = await withTaskGroup(of: Chunk.self) { group in
+        var chunks = await withTaskGroup(of: Chunk.self) { group in
             var start = 0
             while start < total {
                 let lower = start, upper = min(start + chunkSize, total)
@@ -167,116 +185,348 @@ public final class SearchIndex: Sendable {
         }
         guard !Task.isCancelled else { return .empty }
         BuildProfile.mark("search describe+fold chunks (parallel)", since: buildStart)
-        let mergeStart = ContinuousClock.now
+        let assemblyStart = ContinuousClock.now
+
+        // MARK: Parallel assembly.
+        // Serial pass 1: prefix sums of the per-chunk bases (a handful of additions per chunk).
+        // Parallel pass 2: each chunk copies its bytes into the final arrays at exact positions
+        // and accumulates its entries' offsets — disjoint writes, deterministic positions.
         let baseScores = chunks.flatMap(\.baseScores)
-
-        // Names, global word ids (only chunk-unique words hit the shared dictionary).
-        var nameBytes: [UInt8] = []
-        var nameOffsets: [Int32] = [0]
-        nameOffsets.reserveCapacity(total + 1)
-        var wordIDs: [String: Int32] = Dictionary(minimumCapacity: total / 2)
-        var uniqueWords: [String] = []
-        var entryWordIDs: [Int32] = []
-        entryWordIDs.reserveCapacity(total * 3)
-        var entryWordOffsets: [Int32] = [0]
-        entryWordOffsets.reserveCapacity(total + 1)
+        let chunkCount = chunks.count
+        var wordBase: [Int] = []
+        wordBase.reserveCapacity(chunkCount)
+        var byteBase: [Int] = []
+        byteBase.reserveCapacity(chunkCount)
+        var nameByteBase: [Int] = []
+        nameByteBase.reserveCapacity(chunkCount)
+        var instanceBase: [Int] = []
+        instanceBase.reserveCapacity(chunkCount)
+        var wordsInChunk: [Int] = []
+        wordsInChunk.reserveCapacity(chunkCount)
+        var totalChunkWords = 0, totalBytes = 0, totalNameBytes = 0, totalInstances = 0
         for chunk in chunks {
-            nameBytes.append(contentsOf: chunk.nameBytes)
-            var running = nameOffsets.last ?? 0
-            for length in chunk.nameLengths {
-                running += length
-                nameOffsets.append(running)
-            }
-            var globalOfLocal = [Int32](repeating: 0, count: chunk.localWords.count)
-            for (local, word) in chunk.localWords.enumerated() {
-                if let existing = wordIDs[word] {
-                    globalOfLocal[local] = existing
-                } else {
-                    let id = Int32(uniqueWords.count)
-                    wordIDs[word] = id
-                    uniqueWords.append(word)
-                    globalOfLocal[local] = id
-                }
-            }
-            globalOfLocal.withUnsafeBufferPointer { map in
-                for local in chunk.entryWords { entryWordIDs.append(map[Int(local)]) }
-            }
-            var cursor = entryWordOffsets.last ?? 0
-            for count in chunk.wordCounts {
-                cursor += count
-                entryWordOffsets.append(cursor)
-            }
+            wordBase.append(totalChunkWords)
+            byteBase.append(totalBytes)
+            nameByteBase.append(totalNameBytes)
+            instanceBase.append(totalInstances)
+            wordsInChunk.append(chunk.wordCount)
+            totalChunkWords += chunk.wordCount
+            totalBytes += chunk.sortedWordBytes.count
+            totalNameBytes += chunk.nameBytes.count
+            totalInstances += chunk.entryWords.count
         }
-        BuildProfile.mark("search word-id merge", since: mergeStart)
-        let sortStart = ContinuousClock.now
 
-        // Flatten unique words by id, then sort ids bytewise.
-        var idBytes: [UInt8] = []
-        var idOffsets: [Int32] = [0]
-        idOffsets.reserveCapacity(uniqueWords.count + 1)
-        for word in uniqueWords {
-            idBytes.append(contentsOf: word.utf8)
-            idOffsets.append(Int32(idBytes.count))
-        }
-        var order = (0..<Int32(uniqueWords.count)).map { $0 }
-        idBytes.withUnsafeBufferPointer { bytes in
-            idOffsets.withUnsafeBufferPointer { offsets in
-                order.sort { a, b in
-                    let a0 = Int(offsets[Int(a)]), a1 = Int(offsets[Int(a) + 1])
-                    let b0 = Int(offsets[Int(b)]), b1 = Int(offsets[Int(b) + 1])
-                    return compareBytes(bytes, a0, a1 - a0, bytes, b0, b1 - b0) < 0
-                }
-            }
-        }
-        var rankOfID = [Int32](repeating: 0, count: uniqueWords.count)
-        var wordBytes: [UInt8] = []
-        wordBytes.reserveCapacity(idBytes.count)
-        var wordOffsets: [Int32] = [0]
-        wordOffsets.reserveCapacity(order.count + 1)
-        for (rank, id) in order.enumerated() {
-            rankOfID[Int(id)] = Int32(rank)
-            wordBytes.append(contentsOf: idBytes[Int(idOffsets[Int(id)])..<Int(idOffsets[Int(id) + 1])])
-            wordOffsets.append(Int32(wordBytes.count))
-        }
-        let entryWords = entryWordIDs.map { rankOfID[Int($0)] }
-        guard !Task.isCancelled else { return .empty }
-        BuildProfile.mark("search unique-word sort+rank", since: sortStart)
-        let postingsStart = ContinuousClock.now
-
-        // Posting lists (counting sort by rank; entries stay ascending inside each list).
-        var counts = [Int32](repeating: 0, count: order.count + 1)
-        for rank in entryWords { counts[Int(rank) + 1] += 1 }
-        for index in 1..<counts.count { counts[index] += counts[index - 1] }
-        let postingOffsets = counts
-        var fill = counts
-        var postings = [Int32](repeating: 0, count: entryWords.count)
-        postings.withUnsafeMutableBufferPointer { out in
-            fill.withUnsafeMutableBufferPointer { fill in
-                entryWords.withUnsafeBufferPointer { words in
-                    entryWordOffsets.withUnsafeBufferPointer { offsets in
-                        for entry in 0..<total {
-                            for position in Int(offsets[entry])..<Int(offsets[entry + 1]) {
-                                let rank = Int(words[position])
-                                out[Int(fill[rank])] = Int32(entry)
-                                fill[rank] += 1
+        let frozenByteBase = byteBase, frozenNameByteBase = nameByteBase, frozenInstanceBase = instanceBase
+        let frozenPrefixWordBase = wordBase, frozenPrefixWordsInChunk = wordsInChunk, frozenAssemblyChunks = chunks
+        var allBytes = [UInt8](repeating: 0, count: totalBytes)
+        var allOffsets = [Int32](repeating: 0, count: totalChunkWords + 1)
+        var nameBytes = [UInt8](repeating: 0, count: totalNameBytes)
+        var nameOffsets = [Int32](repeating: 0, count: total + 1)
+        var entryWordOffsets = [Int32](repeating: 0, count: total + 1)
+        // Round-0 runs are contiguous segments of one flat array (chunks are adjacent in
+        // entry order, so their word positions are too): zero-copy slices, filled in parallel.
+        var runPositions = [Int32](repeating: 0, count: totalChunkWords)
+        allBytes.withUnsafeMutableBufferPointer { allBytesOut in
+            allOffsets.withUnsafeMutableBufferPointer { allOffsetsOut in
+                nameBytes.withUnsafeMutableBufferPointer { nameBytesOut in
+                    nameOffsets.withUnsafeMutableBufferPointer { nameOffsetsOut in
+                        entryWordOffsets.withUnsafeMutableBufferPointer { entryWordOffsetsOut in
+                            runPositions.withUnsafeMutableBufferPointer { runPositionsOut in
+                                let sharedAllBytes = DisjointBuffer(buffer: allBytesOut)
+                                let sharedAllOffsets = DisjointBuffer(buffer: allOffsetsOut)
+                                let sharedNameBytes = DisjointBuffer(buffer: nameBytesOut)
+                                let sharedNameOffsets = DisjointBuffer(buffer: nameOffsetsOut)
+                                let sharedEntryWordOffsets = DisjointBuffer(buffer: entryWordOffsetsOut)
+                                let sharedRunPositions = DisjointBuffer(buffer: runPositionsOut)
+                                DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+                                    let chunk = frozenAssemblyChunks[chunkIndex]
+                                    let words = frozenPrefixWordsInChunk[chunkIndex]
+                                    chunk.sortedWordBytes.withUnsafeBufferPointer { sourceBytes in
+                                        if let source = sourceBytes.baseAddress, let target = sharedAllBytes.baseAddress, !sourceBytes.isEmpty {
+                                            memcpy(target + frozenByteBase[chunkIndex], source, sourceBytes.count)
+                                        }
+                                    }
+                                    // Copy every offset but the sentinel: the end of a chunk's last
+                                    // word is the start of the next chunk's first word (back to back).
+                                    let adjust = Int32(frozenByteBase[chunkIndex])
+                                    let target = frozenPrefixWordBase[chunkIndex]
+                                    chunk.sortedWordOffsets.dropLast().withUnsafeBufferPointer { sourceOffsets in
+                                        for position in sourceOffsets.indices {
+                                            sharedAllOffsets[target + position] = sourceOffsets[position] + adjust
+                                        }
+                                    }
+                                    for position in 0..<words {
+                                        sharedRunPositions[target + position] = Int32(target + position)
+                                    }
+                                    chunk.nameBytes.withUnsafeBufferPointer { sourceNames in
+                                        if let source = sourceNames.baseAddress, let target = sharedNameBytes.baseAddress, !sourceNames.isEmpty {
+                                            memcpy(target + frozenNameByteBase[chunkIndex], source, sourceNames.count)
+                                        }
+                                    }
+                                    var nameCursor = Int32(frozenNameByteBase[chunkIndex])
+                                    var wordCursor = Int32(frozenInstanceBase[chunkIndex])
+                                    for entry in chunk.nameLengths.indices {
+                                        nameCursor += chunk.nameLengths[entry]
+                                        wordCursor += chunk.wordCounts[entry]
+                                        sharedNameOffsets[chunk.start + entry + 1] = nameCursor
+                                        sharedEntryWordOffsets[chunk.start + entry + 1] = wordCursor
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
-        // Per-word byte-class signature for the substring fallback.
-        var wordMasks = [UInt64](repeating: 0, count: order.count)
-        for rank in 0..<order.count {
-            let w0 = Int(wordOffsets[rank]), w1 = Int(wordOffsets[rank + 1])
-            var mask: UInt64 = 0
-            for position in w0..<w1 {
-                mask |= UInt64(1) << (wordBytes[position] & 63)
-            }
-            wordMasks[rank] = mask
+        allOffsets[totalChunkWords] = Int32(totalBytes)
+        for index in chunks.indices {
+            chunks[index].sortedWordBytes = []
+            chunks[index].sortedWordOffsets = []
         }
-        BuildProfile.mark("search postings+masks", since: postingsStart)
+        // Frozen snapshots for the parallel phases: no mutation happens past this point, and
+        // concurrently-executing closures may only capture immutable bindings.
+        let frozenBytes = allBytes, frozenOffsets = allOffsets, frozenWordBase = wordBase, frozenChunks = chunks
+        let frozenWordsInChunk = wordsInChunk, frozenEntryOffsets = entryWordOffsets
+        guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search table assembly", since: assemblyStart)
+        let mergeStart = ContinuousClock.now
+
+        // MARK: k-way merge of sorted runs into global bytewise order (deduplicating).
+        // Pairwise merge rounds like `parallelSortedIndices`: pairing is positional, so the
+        // result is deterministic. Equal words collapse to one copy and the dropped reference
+        // records an alias to the survivor: after the final flatten, a short chain chase maps
+        // every chunk position to its rank — no per-word search anywhere.
+        // `alias[x] == 0` means "no alias", otherwise the aliased position plus one.
+        let alias = UnsafeMutableBufferPointer<Int32>.allocate(capacity: max(totalChunkWords, 1))
+        let survivorRank = UnsafeMutableBufferPointer<Int32>.allocate(capacity: max(totalChunkWords, 1))
+        alias.initialize(repeating: 0)
+        survivorRank.initialize(repeating: 0)
+        defer { alias.deallocate(); survivorRank.deallocate() }
+        let sharedAlias = DisjointBuffer(buffer: alias)
+        var runs: [ArraySlice<Int32>] = []
+        runs.reserveCapacity(chunkCount)
+        for chunkIndex in 0..<chunkCount where wordsInChunk[chunkIndex] > 0 {
+            let lower = wordBase[chunkIndex]
+            runs.append(runPositions[lower..<(lower + wordsInChunk[chunkIndex])])
+        }
+        while runs.count > 1 {
+            let current = runs
+            runs = await withTaskGroup(of: (Int, ArraySlice<Int32>).self) { group in
+                for pair in stride(from: 0, to: current.count, by: 2) {
+                    group.addTask {
+                        guard pair + 1 < current.count, !Task.isCancelled else { return (pair, current[pair]) }
+                        return (pair, ArraySlice(mergeWordRuns(current[pair], current[pair + 1], bytes: frozenBytes, offsets: frozenOffsets, alias: sharedAlias)))
+                    }
+                }
+                var parts: [(Int, ArraySlice<Int32>)] = []
+                for await part in group { parts.append(part) }
+                return parts.sorted { $0.0 < $1.0 }.map(\.1)
+            }
+        }
+        let finalRefs = runs.first ?? []
+        let wordCount = finalRefs.count
+        guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search word merge (\(wordCount) unique)", since: mergeStart)
+        let flattenStart = ContinuousClock.now
+
+        // MARK: Flatten the merged run into the final table (+ byte-class masks + survivor ranks).
+        // Two passes over contiguous partitions: byte counts first, then disjoint writes at
+        // exact positions — masks are free since the pass reads every word byte anyway.
+        let sharedSurvivorRank = DisjointBuffer(buffer: survivorRank)
+        var wordBytes = [UInt8](repeating: 0, count: 0)
+        var wordOffsets = [Int32](repeating: 0, count: wordCount + 1)
+        var wordMasks = [UInt64](repeating: 0, count: wordCount)
+        if wordCount > 0 {
+            let partitions = min(workers, wordCount)
+            let sliceSize = (wordCount + partitions - 1) / partitions
+            let byteCounts = await withTaskGroup(of: (Int, Int).self) { group in
+                for slice in stride(from: 0, to: wordCount, by: sliceSize) {
+                    group.addTask {
+                        var count = 0
+                        frozenOffsets.withUnsafeBufferPointer { offsets in
+                            for index in slice..<min(slice + sliceSize, wordCount) {
+                                let ref = Int(finalRefs[index])
+                                count += Int(offsets[ref + 1]) - Int(offsets[ref])
+                            }
+                        }
+                        return (slice, count)
+                    }
+                }
+                var parts: [(Int, Int)] = []
+                for await part in group { parts.append(part) }
+                return parts.sorted { $0.0 < $1.0 }
+            }
+            var byteCount = 0
+            var bases: [Int: Int] = [:]
+            bases.reserveCapacity(byteCounts.count)
+            for (slice, count) in byteCounts {
+                bases[slice] = byteCount
+                byteCount += count
+            }
+            let sliceBases = bases
+            wordBytes = [UInt8](repeating: 0, count: byteCount)
+            guard !Task.isCancelled else { return .empty }
+            // Disjoint writes into the shared arrays (each slice owns its byte range and its
+            // rank positions): `concurrentPerform` stays inside the synchronous buffer scope,
+            // so no pointer escapes — the same parallel primitive EPGGuide uses.
+            let slices = stride(from: 0, to: wordCount, by: sliceSize).map { $0 }
+            wordBytes.withUnsafeMutableBufferPointer { bytesOut in
+                wordOffsets.withUnsafeMutableBufferPointer { offsetsOut in
+                    wordMasks.withUnsafeMutableBufferPointer { masksOut in
+                        let sharedBytes = DisjointBuffer(buffer: bytesOut)
+                        let sharedOffsets = DisjointBuffer(buffer: offsetsOut)
+                        let sharedMasks = DisjointBuffer(buffer: masksOut)
+                        DispatchQueue.concurrentPerform(iterations: slices.count) { iteration in
+                            let slice = slices[iteration]
+                            let base = sliceBases[slice] ?? 0
+                            frozenBytes.withUnsafeBufferPointer { bytes in
+                                frozenOffsets.withUnsafeBufferPointer { offsets in
+                                    var cursor = base
+                                    let upper = min(slice + sliceSize, wordCount)
+                                    for rank in slice..<upper {
+                                        let ref = Int(finalRefs[rank])
+                                        let w0 = Int(offsets[ref]), w1 = Int(offsets[ref + 1])
+                                        var mask: UInt64 = 0
+                                        if let target = sharedBytes.baseAddress {
+                                            memcpy(target + cursor, bytes.baseAddress.unsafelyUnwrapped + w0, w1 - w0)
+                                        }
+                                        for position in w0..<w1 {
+                                            mask |= UInt64(1) << (bytes[position] & 63)
+                                        }
+                                        cursor += w1 - w0
+                                        sharedOffsets[rank] = Int32(cursor) - Int32(w1 - w0)
+                                        sharedMasks[rank] = mask
+                                        sharedSurvivorRank[ref] = Int32(rank + 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            wordOffsets[wordCount] = Int32(byteCount)
+        }
+        guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search flatten+masks", since: flattenStart)
+        let remapStart = ContinuousClock.now
+
+        // MARK: Per-chunk remap to ranks + posting-count histograms (parallel).
+        // chunkHistograms is chunk-major raw memory: chunk c owns [c*wordCount, (c+1)*wordCount).
+        // Every chunk position resolves its rank by chasing a handful of aliases (zero byte
+        // comparisons), then the entry scan writes final ranks straight into the output array
+        // (positions are known from entryWordOffsets) and counts every instance per rank.
+        let histograms = UnsafeMutableBufferPointer<Int32>.allocate(capacity: max(chunkCount * wordCount, 1))
+        defer { histograms.deallocate() }
+        var entryWords = [Int32](repeating: 0, count: totalInstances)
+        entryWords.withUnsafeMutableBufferPointer { entryWordsOut in
+            let sharedEntryWords = DisjointBuffer(buffer: entryWordsOut)
+            let sharedHistograms = DisjointBuffer(buffer: histograms)
+            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+                let chunk = frozenChunks[chunkIndex]
+                let histogramBase = chunkIndex * wordCount
+                if wordCount > 0 {
+                    for position in 0..<wordCount { sharedHistograms[histogramBase + position] = 0 }
+                }
+                let entries = chunk.wordCounts.count
+                guard entries > 0 else { return }
+                let wordsInChunk = frozenWordsInChunk[chunkIndex]
+                var rankOfPosition = [Int32](repeating: 0, count: wordsInChunk)
+                let wordBase = frozenWordBase[chunkIndex]
+                for position in 0..<wordsInChunk {
+                    var ref = wordBase + position
+                    while sharedAlias[ref] != 0 { ref = Int(sharedAlias[ref]) - 1 }
+                    rankOfPosition[position] = sharedSurvivorRank[ref] - 1
+                }
+                rankOfPosition.withUnsafeBufferPointer { ranks in
+                    chunk.entryWords.withUnsafeBufferPointer { positions in
+                        var local = 0
+                        for entry in 0..<entries {
+                            var out = Int(frozenEntryOffsets[chunk.start + entry])
+                            let count = Int(chunk.wordCounts[entry])
+                            for _ in 0..<count {
+                                let rank = Int(ranks[Int(positions[local])])
+                                local += 1
+                                sharedEntryWords[out] = Int32(rank)
+                                sharedHistograms[histogramBase + rank] += 1
+                                out += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        guard !Task.isCancelled else { return .empty }
+        BuildProfile.mark("search remap+histograms", since: remapStart)
+        let inversionStart = ContinuousClock.now
+
+        // MARK: Posting inversion (parallel counting sort).
+        // Pass 1 turns the histograms into per-chunk bases relative to the rank start, emitting
+        // per-rank totals; pass 2 scatters entries. Chunks own disjoint entry ranges and write
+        // ascending entries within each rank — the exact output of the serial counting sort.
+        // Pass 1 walks rank tiles of 256 with the chunk loop inside: every (chunk, tile) step
+        // is a contiguous 1 KB run instead of a cache-line-strided column scan.
+        var totals = [Int32](repeating: 0, count: wordCount)
+        if wordCount > 0 {
+            let tileSize = 256
+            let tileCount = (wordCount + tileSize - 1) / tileSize
+            totals.withUnsafeMutableBufferPointer { totalsOut in
+                let sharedTotals = DisjointBuffer(buffer: totalsOut)
+                let sharedHistograms = DisjointBuffer(buffer: histograms)
+                DispatchQueue.concurrentPerform(iterations: tileCount) { tile in
+                    let lower = tile * tileSize
+                    let width = min(tileSize, wordCount - lower)
+                    var running = [Int32](repeating: 0, count: width)
+                    for chunk in 0..<chunkCount {
+                        let base = chunk * wordCount + lower
+                        for offset in 0..<width {
+                            let cell = base + offset
+                            let count = sharedHistograms[cell]
+                            sharedHistograms[cell] = running[offset]
+                            running[offset] += count
+                        }
+                    }
+                    for offset in 0..<width {
+                        sharedTotals[lower + offset] = running[offset]
+                    }
+                }
+            }
+        }
+        var postingOffsets = [Int32](repeating: 0, count: wordCount + 1)
+        totals.withUnsafeBufferPointer { counts in
+            for rank in 0..<wordCount {
+                postingOffsets[rank + 1] = postingOffsets[rank] + counts[rank]
+            }
+        }
+        var postings = [Int32](repeating: 0, count: totalInstances)
+        let frozenRanks = entryWords, frozenPostingOffsets = postingOffsets
+        if totalInstances > 0 {
+            postings.withUnsafeMutableBufferPointer { postingsOut in
+                let sharedPostings = DisjointBuffer(buffer: postingsOut)
+                let sharedHistograms = DisjointBuffer(buffer: histograms)
+                DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+                    let chunk = frozenChunks[chunkIndex]
+                    guard !chunk.wordCounts.isEmpty else { return }
+                    let histogramBase = chunkIndex * wordCount
+                    frozenRanks.withUnsafeBufferPointer { words in
+                        frozenPostingOffsets.withUnsafeBufferPointer { offsets in
+                            var position = Int(frozenEntryOffsets[chunk.start])
+                            for entry in 0..<chunk.wordCounts.count {
+                                let globalEntry = chunk.start + entry
+                                let end = position + Int(chunk.wordCounts[entry])
+                                while position < end {
+                                    let rank = Int(words[position])
+                                    let cell = histogramBase + rank
+                                    sharedPostings[Int(offsets[rank]) + Int(sharedHistograms[cell])] = Int32(globalEntry)
+                                    sharedHistograms[cell] += 1
+                                    position += 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        BuildProfile.mark("search postings inversion", since: inversionStart)
 
         return SearchIndex(
             channels: channels, movies: movies, series: series,
@@ -288,6 +538,42 @@ public final class SearchIndex: Sendable {
         )
     }
 
+    /// Stable merge of two runs of word positions, each sorted bytewise. Equal words keep the
+    /// left copy (bytes are identical either way); the dropped reference records an alias to
+    /// the survivor (+1 encoded) so the rank remap can chase it instead of searching. Output
+    /// is sorted, unique — deterministic.
+    private static func mergeWordRuns(
+        _ left: ArraySlice<Int32>, _ right: ArraySlice<Int32>,
+        bytes: [UInt8], offsets: [Int32], alias: DisjointBuffer<Int32>
+    ) -> [Int32] {
+        bytes.withUnsafeBufferPointer { bytes in
+            offsets.withUnsafeBufferPointer { offsets in
+                var result: [Int32] = []
+                result.reserveCapacity(left.count + right.count)
+                let left = left[...], right = right[...]
+                var i = left.startIndex, j = right.startIndex
+                while i < left.endIndex, j < right.endIndex {
+                    let a = left[i], b = right[j]
+                    let a0 = Int(offsets[Int(a)]), a1 = Int(offsets[Int(a) + 1])
+                    let b0 = Int(offsets[Int(b)]), b1 = Int(offsets[Int(b) + 1])
+                    let ordering = compareBytes(bytes, a0, a1 - a0, bytes, b0, b1 - b0)
+                    if ordering < 0 {
+                        result.append(a); i += 1
+                    } else if ordering > 0 {
+                        result.append(b); j += 1
+                    } else {
+                        result.append(a)
+                        alias[Int(b)] = a &+ 1
+                        i += 1; j += 1
+                    }
+                }
+                result.append(contentsOf: left[i...])
+                result.append(contentsOf: right[j...])
+                return result
+            }
+        }
+    }
+
     private static func processChunk(range: Range<Int>, describe: (Int) -> Source) -> Chunk {
         var chunk = Chunk(start: range.lowerBound)
         chunk.baseScores.reserveCapacity(range.count)
@@ -295,14 +581,15 @@ public final class SearchIndex: Sendable {
         chunk.wordCounts.reserveCapacity(range.count)
         chunk.entryWords.reserveCapacity(range.count * 3)
         var localIDs: [String: Int32] = Dictionary(minimumCapacity: range.count)
+        var localWords: [String] = []
         var entry: [Int32] = []
         var wordBuffer: [UInt8] = []
         wordBuffer.reserveCapacity(32)
         func localID(_ word: String) -> Int32 {
             if let id = localIDs[word] { return id }
-            let id = Int32(chunk.localWords.count)
+            let id = Int32(localWords.count)
             localIDs[word] = id
-            chunk.localWords.append(word)
+            localWords.append(word)
             return id
         }
         for index in range {
@@ -329,6 +616,45 @@ public final class SearchIndex: Sendable {
             chunk.entryWords.append(contentsOf: entry)
             chunk.nameLengths.append(Int32(chunk.nameBytes.count - start))
             chunk.wordCounts.append(Int32(entry.count))
+        }
+
+        // Finish the chunk with its unique words in bytewise order (the global table is then a
+        // merge of sorted runs instead of a serial interning + sort), and entry words already
+        // re-expressed as positions into that sorted table. Word order is total and elements
+        // are unique, so the unstable sort cannot diverge from the serial semantics.
+        let wordCount = localWords.count
+        var idBytes: [UInt8] = []
+        var idOffsets: [Int32] = [0]
+        idOffsets.reserveCapacity(wordCount + 1)
+        for word in localWords {
+            idBytes.append(contentsOf: word.utf8)
+            idOffsets.append(Int32(idBytes.count))
+        }
+        var order = (0..<Int32(wordCount)).map { $0 }
+        idBytes.withUnsafeBufferPointer { bytes in
+            idOffsets.withUnsafeBufferPointer { offsets in
+                order.sort { a, b in
+                    let a0 = Int(offsets[Int(a)]), a1 = Int(offsets[Int(a) + 1])
+                    let b0 = Int(offsets[Int(b)]), b1 = Int(offsets[Int(b) + 1])
+                    return compareBytes(bytes, a0, a1 - a0, bytes, b0, b1 - b0) < 0
+                }
+            }
+        }
+        var positionOfLocalID = [Int32](repeating: 0, count: wordCount)
+        chunk.sortedWordBytes.reserveCapacity(idBytes.count)
+        chunk.sortedWordOffsets.reserveCapacity(wordCount + 1)
+        chunk.sortedWordOffsets.append(0)
+        for (position, id) in order.enumerated() {
+            positionOfLocalID[Int(id)] = Int32(position)
+            chunk.sortedWordBytes.append(contentsOf: idBytes[Int(idOffsets[Int(id)])..<Int(idOffsets[Int(id) + 1])])
+            chunk.sortedWordOffsets.append(Int32(chunk.sortedWordBytes.count))
+        }
+        positionOfLocalID.withUnsafeBufferPointer { map in
+            chunk.entryWords.withUnsafeMutableBufferPointer { words in
+                for index in words.indices {
+                    words[index] = map[Int(words[index])]
+                }
+            }
         }
         return chunk
     }

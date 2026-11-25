@@ -21,19 +21,36 @@ public actor CatalogRepository {
 
     /// Cached catalogs in source order. Decode one source at a time to bound launch memory.
     public func cachedCatalogs(for sources: [Source]) async -> [SourceCatalog] {
+        // Sources load strictly in order but in overlapping pairs: the heavy decode work of a
+        // segment archive runs on the parallel executor, so two concurrent loads overlap their
+        // CPU time while memory stays bounded to at most two in-flight catalogs. Most installs
+        // have one or two sources, where this already removes most of the serialization.
         var loaded: [SourceCatalog] = []
-        for source in sources {
+        var index = 0
+        while index < sources.count {
             guard !Task.isCancelled else { return [] }
-            if DemoContent.isDemo(source) {
-                loaded.append(DemoContent.makeCatalog())
-            } else if let catalog = await cache.load(source.id) {
-                loaded.append(catalog)
-            }
+            let firstSource = sources[index]
+            let secondSource = index + 1 < sources.count ? sources[index + 1] : nil
+            async let first = cachedCatalog(firstSource)
+            async let second = cachedCatalogOrNil(secondSource)
+            if let catalog = await first { loaded.append(catalog) }
+            if let catalog = await second { loaded.append(catalog) }
+            index += 2
         }
         for catalog in loaded where lastCatalogs[catalog.sourceID] == nil {
             lastCatalogs[catalog.sourceID] = catalog
         }
         return loaded
+    }
+
+    private func cachedCatalog(_ source: Source) async -> SourceCatalog? {
+        if DemoContent.isDemo(source) { return DemoContent.makeCatalog() }
+        return await cache.load(source.id)
+    }
+
+    private func cachedCatalogOrNil(_ source: Source?) async -> SourceCatalog? {
+        guard let source else { return nil }
+        return await cachedCatalog(source)
     }
 
     /// The most recent catalog refreshed or loaded for `id` during this session.
@@ -90,7 +107,7 @@ public actor CatalogRepository {
                     // is persisted with the cache, instead of in every launch's catalogue build.
                     catalog = await catalog.cleaningPlots()
                     try Task.checkCancellation()
-                    catalog.shareRepeatedValues()
+                    catalog.shareRepeatedValuesParallel()
                     if !DemoContent.isDemo(source) {
                         do {
                             try await self.cache.save(catalog)
@@ -363,25 +380,80 @@ public actor CatalogRepository {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue(Self.userAgent(userAgent), forHTTPHeaderField: "User-Agent")
         request.setValue("bytes=0-8191", forHTTPHeaderField: "Range")
+        // Chunks are accumulated in the data delegate and the task is cancelled once the
+        // prefix is complete (many servers ignore the Range header and stream the whole
+        // playlist). Iterating `AsyncBytes` byte by byte costs milliseconds of CPU per KB.
+        let collector = SniffCollector(limit: 8_192)
         do {
-            let (bytes, response) = try await session.bytes(for: request)
-            if let http = response as? HTTPURLResponse { try SourceError.check(status: http.statusCode) }
-            var prefix = Data()
-            prefix.reserveCapacity(8_192)
-            for try await byte in bytes {
-                prefix.append(byte)
-                if prefix.count >= 8_192 { break }
+            // A short response completes before the cap: the returned body is the prefix.
+            let (data, _) = try await session.data(for: request, delegate: collector)
+            return Self.inflatedPrefix(collector.collected.isEmpty ? data : collector.collected)
+        } catch {
+            // Cancellation at the cap throws; the partial body the delegate collected is the prefix.
+            guard !collector.isComplete else {
+                return Self.inflatedPrefix(collector.collected)
             }
-            bytes.task.cancel()
-            // Gzipped playlists decompress partially from the first chunk: enough to see
-            // the #EXTM3U header a few KB in.
-            if Gzip.isCompressed(prefix), let inflated = try? Gzip.decompress(prefix) {
-                prefix = inflated
+            if let status = collector.badStatus {
+                try SourceError.check(status: status)
             }
-            return prefix
-        } catch let error as URLError {
-            throw SourceError.from(error)
+            if let error = error as? URLError {
+                throw SourceError.from(error)
+            }
+            throw error
         }
+    }
+
+    /// Gzipped playlists decompress partially from the first chunk: enough to see
+    /// the #EXTM3U header a few KB in.
+    private static func inflatedPrefix(_ prefix: Data) -> Data {
+        if Gzip.isCompressed(prefix), let inflated = try? Gzip.decompress(prefix) {
+            return inflated
+        }
+        return prefix
+    }
+}
+
+/// Accumulates a response body chunk by chunk and cancels the task once `limit` bytes have
+/// arrived, so sniffing a playlist never downloads more than the first few KB even when the
+/// server ignores the Range header. Bad status codes fail the task before any accumulation.
+private final class SniffCollector: NSObject, URLSessionDataDelegate, Sendable {
+    private struct State {
+        var buffer = Data()
+        var complete = false
+        var badStatus: Int?
+    }
+
+    private let state = Mutex(State())
+    let limit: Int
+
+    init(limit: Int) {
+        self.limit = limit
+        state.withLock { $0.buffer.reserveCapacity(limit) }
+    }
+
+    var collected: Data { state.withLock { $0.buffer } }
+    var isComplete: Bool { state.withLock { $0.complete } }
+    var badStatus: Int? { state.withLock { $0.badStatus } }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse) async -> URLSession.ResponseDisposition {
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            state.withLock { $0.badStatus = http.statusCode }
+            return .cancel
+        }
+        return .allow
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let full = state.withLock { state -> Bool in
+            guard !state.complete else { return true }
+            state.buffer.append(data)
+            if state.buffer.count >= limit {
+                state.complete = true
+                return true
+            }
+            return false
+        }
+        if full { dataTask.cancel() }
     }
 }
 

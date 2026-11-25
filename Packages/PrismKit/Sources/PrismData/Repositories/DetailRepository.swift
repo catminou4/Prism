@@ -181,43 +181,92 @@ public actor DetailRepository {
 
 /// Insertion-ordered LRU cache: reads and writes mark the key as most recently used, and the
 /// oldest entries are dropped past `limit`. Bounds repository memory caches.
+///
+/// Recency is a doubly-linked list of nodes (indexes into `nodes`, key→node in `index`):
+/// reads used to scan the order array for the key — up to `limit` string comparisons per hit.
+/// Every operation is O(1) now; eviction order is unchanged.
 struct BoundedCache<Key: Hashable, Value> {
-    private(set) var values: [Key: Value] = [:]
-    private var order: [Key] = []
+    private struct Node {
+        var key: Key
+        var value: Value
+        /// Toward the least recently used end; -1 when this node is the oldest.
+        var older: Int
+        /// Toward the most recently used end; -1 when this node is the newest.
+        var newer: Int
+    }
+
+    private var nodes: [Node] = []
+    private var index: [Key: Int] = [:]
+    private var freeNodes: [Int] = []
+    /// List ends: eviction takes from `oldest`, reads/inserts move nodes to `newest`.
+    private var oldest = -1
+    private var newest = -1
     let limit: Int
 
     init(limit: Int) { self.limit = limit }
 
-    var count: Int { values.count }
+    var count: Int { index.count }
 
     /// Returns the value and marks it as recently used.
     mutating func value(for key: Key) -> Value? {
-        guard let value = values[key] else { return nil }
-        touch(key)
+        guard let node = index[key] else { return nil }
+        let value = nodes[node].value
+        markRecent(node)
         return value
     }
 
     /// Stores `value`, marks it as most recently used and evicts the oldest entries.
     mutating func insert(_ value: Value, for key: Key) {
-        if values[key] == nil {
-            order.append(key)
+        if let node = index[key] {
+            nodes[node].value = value
+            markRecent(node)
         } else {
-            touch(key)
+            let node: Int
+            if let reused = freeNodes.popLast() {
+                node = reused
+                nodes[node] = Node(key: key, value: value, older: -1, newer: -1)
+            } else {
+                node = nodes.count
+                nodes.append(Node(key: key, value: value, older: -1, newer: -1))
+            }
+            index[key] = node
+            appendNewest(node)
         }
-        values[key] = value
-        while order.count > limit {
-            values.removeValue(forKey: order.removeFirst())
+        while index.count > limit, oldest >= 0 {
+            let evicted = oldest
+            unlink(evicted)
+            index.removeValue(forKey: nodes[evicted].key)
+            freeNodes.append(evicted)
         }
     }
 
     mutating func removeAll() {
-        values.removeAll()
-        order.removeAll()
+        nodes.removeAll()
+        index.removeAll()
+        freeNodes.removeAll()
+        oldest = -1
+        newest = -1
     }
 
-    private mutating func touch(_ key: Key) {
-        guard let index = order.firstIndex(of: key) else { return }
-        order.remove(at: index)
-        order.append(key)
+    /// Moves a linked node to the most-recently-used end.
+    private mutating func markRecent(_ node: Int) {
+        guard node != newest else { return }
+        unlink(node)
+        appendNewest(node)
+    }
+
+    private mutating func unlink(_ node: Int) {
+        let older = nodes[node].older, newer = nodes[node].newer
+        if older >= 0 { nodes[older].newer = newer } else { oldest = newer }
+        if newer >= 0 { nodes[newer].older = older } else { newest = older }
+        nodes[node].older = -1
+        nodes[node].newer = -1
+    }
+
+    private mutating func appendNewest(_ node: Int) {
+        nodes[node].older = newest
+        nodes[node].newer = -1
+        if newest >= 0 { nodes[newest].newer = node } else { oldest = node }
+        newest = node
     }
 }

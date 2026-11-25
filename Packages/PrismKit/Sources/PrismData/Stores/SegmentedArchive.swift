@@ -58,11 +58,21 @@ enum SegmentedArchive {
         for name in names where name.hasSuffix("." + suffix) {
             let url = directory.appending(path: name)
             guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey]), values.isDirectory != true else { continue }
-            let header = (try? Data(contentsOf: url, options: [.mappedIfSafe]))?.prefix(8) ?? Data()
+            // A bounded read of just the header bytes: `Data(contentsOf: .mappedIfSafe)` maps
+            // the whole archive (hundreds of megabytes of address space / page-table work per
+            // file) to inspect 8 bytes.
+            let header = readHeader(url, count: 8)
             let current = header.count == 8 && Array(header.prefix(4)) == magic
                 && readUInt32([UInt8](header.dropFirst(4)), at: 0) == version
             if !current { try? FileManager.default.removeItem(at: url) }
         }
+    }
+
+    /// The first `count` bytes of a file, without mapping it.
+    private static func readHeader(_ url: URL, count: Int) -> Data {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: count)) ?? Data()
     }
 
     // MARK: Segments
