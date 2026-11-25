@@ -51,12 +51,19 @@ struct XMLTVParserTests {
     }
 
     @Test func gzipIsTransparent() throws {
-        let plain = try XMLTVParser.parse(try Fixture.data("epg", "xml"))
+        let plainData = try Fixture.data("epg", "xml")
+        let plain = try XMLTVParser.parse(plainData)
         let compressed = try Fixture.data("epg.xml", "gz")
         #expect(Gzip.isCompressed(compressed))
         let gz = try XMLTVParser.parse(compressed)
         #expect(gz.programs == plain.programs)
         #expect(gz.channels == plain.channels)
+
+        let window = DateInterval(start: date("2025-01-01T12:30:00Z"), end: date("2025-01-02T00:00:00Z"))
+        let windowedPlain = try XMLTVParser.parse(plainData, window: window)
+        let windowedGzip = try XMLTVParser.parse(compressed, window: window)
+        #expect(windowedGzip.programs == windowedPlain.programs)
+        #expect(windowedGzip.channels == windowedPlain.channels)
     }
 
     @Test func zlibIsTransparentAndRejectsOversizedOutput() throws {
@@ -66,6 +73,32 @@ struct XMLTVParserTests {
         #expect(throws: XMLTVError.decompressionFailed) {
             try Gzip.decompress(compressed, maximumOutputSize: 10)
         }
+    }
+
+    @Test func concatenatedGzipMembersInflateAsOneDocument() throws {
+        // Two independent gzip members whose plaintexts are halves of one XMLTV document.
+        let combined = try #require(Data(base64Encoded: "H4sIAAAAAAAC/7MpKbOzSc5IzMtLzVHITLFVSlSys0nJLC7ISazUzUvMTbVztNFH4dvoQ5XbAQDJQpFnPAAAAB+LCAAAAAAAAv+zKSjKTy9KzM1NVUjOSMzLS82xVUpUUiguSSwqsVUyMjAyNTA0MDQ0MgACBW0QCZLML0CWM0bI2dmUZJbkpNqF2OhDGDb6cAuA7JIyOwBEEp/4cQAAAA=="))
+        let document = try XMLTVParser.parse(combined)
+        #expect(document.channels.map(\.id) == ["a"])
+        #expect(document.programs.map(\.title) == ["T"])
+        #expect(document.programs.first?.start == date("2025-01-01T12:00:00Z"))
+        #expect(document.programs.first?.end == date("2025-01-01T12:30:00Z"))
+    }
+
+    @Test func emptyCompressedDocumentIsInvalidData() throws {
+        let emptyGzip = try #require(Data(base64Encoded: "H4sIAAAAAAAC/wMAAAAAAAAAAAA="))
+        #expect(throws: XMLTVError.invalidData) { try XMLTVParser.parse(emptyGzip) }
+    }
+
+    @Test func truncatedGzipMatchesTheSameInflatedPrefix() throws {
+        var truncated = try Fixture.data("epg.xml", "gz")
+        truncated.removeLast(100)
+        let inflatedPrefix = try Gzip.decompress(truncated)
+        let expected = try XMLTVParser.parse(inflatedPrefix)
+        let streamed = try XMLTVParser.parse(truncated)
+        #expect(streamed.channels == expected.channels)
+        #expect(streamed.programs == expected.programs)
+        #expect(streamed.programs.count == 2)
     }
 
     @Test func namespacedProgrammesWithTheSameStartUseTheNextDistinctStart() throws {

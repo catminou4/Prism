@@ -202,9 +202,11 @@ private struct ParserState {
         let urlString = M3UBytes.string(b, start, urlEnd)
         guard let url = M3UBytes.makeURL(urlString) else { return }
 
-        var headers = pendingHeaders
+        // `pendingHeaders` is discarded by the defer above as soon as this URL is consumed.
+        // Use it as the entry header buffer directly instead of copying it first: copy-on-write
+        // would otherwise duplicate the dictionary on the first pipe/attribute header merge.
         if pipe >= 0, pipe + 1 < end {
-            M3UHeaders.parsePipeHeaders(M3UBytes.string(b, pipe + 1, end), into: &headers)
+            M3UHeaders.parsePipeHeaders(M3UBytes.string(b, pipe + 1, end), into: &pendingHeaders)
         }
 
         let entry: M3UEntry
@@ -212,16 +214,16 @@ private struct ParserState {
             var group = info.attributes["group-title"]
             if group?.isEmpty ?? true { group = pendingGroup }
             let attributes = info.attributes
-            for key in M3UBytes.userAgentKeys where headers["User-Agent"] == nil {
-                if let ua = attributes[key], !ua.isEmpty { headers["User-Agent"] = ua }
+            for key in M3UBytes.userAgentKeys where pendingHeaders["User-Agent"] == nil {
+                if let ua = attributes[key], !ua.isEmpty { pendingHeaders["User-Agent"] = ua }
             }
-            for key in M3UBytes.refererKeys where headers["Referer"] == nil {
-                if let ref = attributes[key], !ref.isEmpty { headers["Referer"] = ref }
+            for key in M3UBytes.refererKeys where pendingHeaders["Referer"] == nil {
+                if let ref = attributes[key], !ref.isEmpty { pendingHeaders["Referer"] = ref }
             }
             let name = info.name.isEmpty ? M3UBytes.fallbackName(url) : info.name
-            entry = M3UEntry(name: name, url: url, duration: info.duration, attributes: attributes, group: group, headers: headers)
+            entry = M3UEntry(name: name, url: url, duration: info.duration, attributes: attributes, group: group, headers: pendingHeaders)
         } else {
-            entry = M3UEntry(name: M3UBytes.fallbackName(url), url: url, duration: -1, attributes: [:], group: pendingGroup, headers: headers)
+            entry = M3UEntry(name: M3UBytes.fallbackName(url), url: url, duration: -1, attributes: [:], group: pendingGroup, headers: pendingHeaders)
         }
         entries.append(entry)
     }

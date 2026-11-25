@@ -142,6 +142,26 @@ struct M3UParserTests {
         #expect(playlist.entries[2].name == "Name")
     }
 
+    @Test func pendingPipeAndAttributeHeadersKeepTheirPrecedence() {
+        let playlist = M3UParser.parse("""
+        #EXTM3U
+        #EXTINF:-1 user-agent="Attribute UA",First
+        #EXTVLCOPT:http-user-agent=Pending UA
+        #EXTVLCOPT:http-origin=https://origin.example.com
+        https://h.example.com/a.ts|user-agent=Pipe%20UA&referer=https%3A%2F%2Freferer.example.com%2F
+        #EXTINF:-1 user-agent="Attribute UA",Second
+        https://h.example.com/b.ts
+        """)
+        #expect(playlist.entries.count == 2)
+        #expect(playlist.entries[0].headers == [
+            "User-Agent": "Pipe UA",
+            "Referer": "https://referer.example.com/",
+            "Origin": "https://origin.example.com",
+        ])
+        // Header directives are consumed by the first URL; attributes alone still seed the second.
+        #expect(playlist.entries[1].headers == ["User-Agent": "Attribute UA"])
+    }
+
     @Test func plainURLListAndUnsupportedLines() {
         let text = "http://h.example.com/movies/My%20Movie.mp4\nftp://x/y\nrelative/path.ts\nudp://@239.0.0.1:1234\n"
         let playlist = M3UParser.parse(text)

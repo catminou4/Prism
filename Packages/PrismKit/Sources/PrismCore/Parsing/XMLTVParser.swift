@@ -1,4 +1,5 @@
 import Foundation
+import zlib
 
 public struct XMLTVChannel: Sendable, Hashable {
     public var id: String
@@ -39,11 +40,30 @@ public enum XMLTVParser {
     /// Programmes ending before `window.start` or starting after `window.end` are dropped (memory).
     /// `timeShiftHours` is added to every time.
     public static func parse(_ data: Data, window: DateInterval? = nil, timeShiftHours: Double = 0) throws -> XMLTVDocument {
-        let xml = Gzip.isCompressed(data) ? try Gzip.decompress(data) : data
-        guard !xml.isEmpty else { throw XMLTVError.invalidData }
+        guard !data.isEmpty else { throw XMLTVError.invalidData }
+        if Gzip.isCompressed(data) {
+            return try parseCompressed(data, window: window, timeShiftHours: timeShiftHours)
+        }
+        return try parse(XMLParser(data: data), window: window, timeShiftHours: timeShiftHours)
+    }
 
+    /// Inflates compressed input to a temporary file in fixed-size chunks, then lets XMLParser
+    /// read that file incrementally. The document itself therefore never materializes in memory:
+    /// peak usage stays bounded by zlib/XMLParser buffers plus the programmes retained by `window`.
+    private static func parseCompressed(_ data: Data, window: DateInterval?, timeShiftHours: Double) throws -> XMLTVDocument {
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prism-xmltv-\(UUID().uuidString)", isDirectory: false)
+        // Covers every exit path, including decompression, I/O and parser errors.
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+        let inflatedSize = try XMLTVStreamingInflater.inflate(data, to: temporaryURL, maximumOutputSize: 1 << 30)
+        guard inflatedSize > 0 else { throw XMLTVError.invalidData }
+        guard let stream = InputStream(url: temporaryURL) else { throw XMLTVError.invalidData }
+        return try parse(XMLParser(stream: stream), window: window, timeShiftHours: timeShiftHours)
+    }
+
+    private static func parse(_ parser: XMLParser, window: DateInterval?, timeShiftHours: Double) throws -> XMLTVDocument {
         let delegate = XMLTVParserDelegate(window: window, shift: timeShiftHours * 3600)
-        let parser = XMLParser(data: xml)
         parser.shouldResolveExternalEntities = false
         // XMLTV uses no namespaces (`xmltv_ns` is a plain attribute value). Skipping namespace
         // processing avoids a per-element qname split + prefix→URI resolution inside XMLParser;
@@ -52,6 +72,7 @@ public enum XMLTVParser {
         parser.shouldProcessNamespaces = false
         parser.delegate = delegate
         let ok = parser.parse()
+        if Task.isCancelled { throw CancellationError() }
         if !ok && delegate.channels.isEmpty && delegate.programs.isEmpty {
             throw XMLTVError.invalidData
         }
@@ -147,6 +168,92 @@ public enum XMLTVParser {
     }
 }
 
+// MARK: - Bounded gzip/zlib inflation
+
+/// File-writing counterpart of `Gzip.decompress`: same zlib auto-detection, multi-member
+/// concatenation and tolerant truncated-input behavior, but with a fixed 256 KB output buffer.
+private enum XMLTVStreamingInflater {
+    private static let chunkSize = 1 << 18
+
+    /// Returns the inflated byte count. Throws `decompressionFailed` when no usable output can
+    /// be decoded, when output exceeds `maximumOutputSize`, or when the temporary file cannot be written.
+    static func inflate(_ data: Data, to url: URL, maximumOutputSize: Int) throws -> Int {
+        guard !data.isEmpty else { return 0 }
+        var stream = z_stream()
+        // 32 + MAX_WBITS: auto-detect gzip or zlib headers, exactly like `Gzip.decompress`.
+        guard inflateInit2_(&stream, 32 + MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw XMLTVError.decompressionFailed
+        }
+        defer { inflateEnd(&stream) }
+
+        guard let output = OutputStream(url: url, append: false) else { throw XMLTVError.decompressionFailed }
+        output.open()
+        defer { output.close() }
+        guard output.streamStatus != .error else { throw XMLTVError.decompressionFailed }
+
+        let chunk = UnsafeMutablePointer<Bytef>.allocate(capacity: chunkSize)
+        defer { chunk.deallocate() }
+        var totalOutput = 0
+        var failed = false
+
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.bindMemory(to: Bytef.self).baseAddress else { return }
+            var offset = 0
+            let total = raw.count
+            while true {
+                if stream.avail_in == 0, offset < total {
+                    let take = min(total - offset, Int(UInt32.max / 2))
+                    stream.next_in = UnsafeMutablePointer(mutating: base + offset)
+                    stream.avail_in = uInt(take)
+                    offset += take
+                }
+                stream.next_out = chunk
+                stream.avail_out = uInt(chunkSize)
+                let status = zlib.inflate(&stream, Z_NO_FLUSH)
+                let produced = chunkSize - Int(stream.avail_out)
+                guard produced <= maximumOutputSize - totalOutput else { throw XMLTVError.decompressionFailed }
+                if produced > 0 {
+                    try writeAll(chunk, count: produced, to: output)
+                    totalOutput += produced
+                }
+
+                if status == Z_STREAM_END {
+                    // Another gzip/zlib member may follow. Invalid trailing bytes are treated
+                    // like the in-memory inflater: partial output already decoded stays usable.
+                    if stream.avail_in > 0 || offset < total {
+                        if inflateReset(&stream) != Z_OK { break }
+                        continue
+                    }
+                    break
+                }
+                if status == Z_BUF_ERROR {
+                    if stream.avail_in == 0 && offset >= total { break } // truncated input
+                    if produced == 0 { failed = true; break }
+                    continue
+                }
+                if status != Z_OK {
+                    failed = true
+                    break
+                }
+                // One cancellation checkpoint per output chunk keeps a cancelled refresh from
+                // writing hundreds of megabytes first; normal parsing semantics are unchanged.
+                if Task.isCancelled { throw CancellationError() }
+            }
+        }
+        if failed && totalOutput == 0 { throw XMLTVError.decompressionFailed }
+        return totalOutput
+    }
+
+    private static func writeAll(_ buffer: UnsafeMutablePointer<Bytef>, count: Int, to output: OutputStream) throws {
+        var written = 0
+        while written < count {
+            let amount = output.write(buffer + written, maxLength: count - written)
+            guard amount > 0 else { throw XMLTVError.decompressionFailed }
+            written += amount
+        }
+    }
+}
+
 // MARK: - Delegate
 
 private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
@@ -186,6 +293,8 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
     var isNew = false
     var inRating = false
     var rating: String?
+    /// Cancellation is checked once per 64 completed programmes.
+    var programmesSinceCancellationCheck = 0
 
     init(window: DateInterval?, shift: TimeInterval) {
         self.window = window
@@ -263,6 +372,11 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
             if elementName == "programme" {
                 endProgramme()
                 context = .none
+                programmesSinceCancellationCheck += 1
+                if programmesSinceCancellationCheck >= 64 {
+                    programmesSinceCancellationCheck = 0
+                    if Task.isCancelled { parser.abortParsing() }
+                }
                 return
             }
             guard !skip else { return }
@@ -382,8 +496,16 @@ private final class XMLTVParserDelegate: NSObject, XMLParserDelegate {
     /// Fills missing `stop` times with the next programme start of the same channel, then applies the window.
     func finishPrograms() -> [EPGProgram] {
         if !missingStop.isEmpty {
+            // Only channels containing a stop-less programme need their timeline ordered.
+            // Large guides commonly have one bad channel among hundreds; sorting the others
+            // was pure allocation/CPU overhead and could not change their programmes.
+            var affectedChannels = Set<String>()
+            for index in missingStop { affectedChannels.insert(programs[index].channelID) }
+
             var byChannel: [String: [Int]] = [:]
-            for (index, program) in programs.enumerated() { byChannel[program.channelID, default: []].append(index) }
+            for (index, program) in programs.enumerated() where affectedChannels.contains(program.channelID) {
+                byChannel[program.channelID, default: []].append(index)
+            }
             let needsStop = Set(missingStop)
             for indices in byChannel.values {
                 let sorted = indices.sorted { programs[$0].start < programs[$1].start }
