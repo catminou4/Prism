@@ -1,11 +1,12 @@
 import Foundation
 
-/// Versioned container of independently compressed JSON segments, so that large caches are encoded
-/// and decoded in parallel (one JSONDecoder per segment).
+/// Versioned container of independently compressed segments, so that large caches are encoded
+/// and decoded in parallel. Version 1 payloads are LZFSE-compressed JSON (one decoder per
+/// segment); version 2 payloads are the `BinaryArchive` encoding — the container is unchanged.
 ///
 /// Layout: `"PRSG"` magic · format version (UInt32 LE) · segment count (UInt32 LE) ·
-/// per segment: tag (UInt8) + byte length (UInt32 LE) · then the LZFSE-compressed JSON payloads.
-/// Any mismatch (magic, version, truncated data) makes `segments(in:version:)` return `nil`.
+/// per segment: tag (UInt8) + byte length (UInt32 LE) · then the compressed payloads.
+/// Any mismatch (magic, version, truncated data) makes unpacking return `nil`.
 enum SegmentedArchive {
     struct Segment: Sendable {
         var tag: UInt8
@@ -30,9 +31,13 @@ enum SegmentedArchive {
         return data
     }
 
-    static func unpack(_ data: Data, version: UInt32) -> [Segment]? {
+    /// Unpacks any well-formed archive, reporting the version read from its header. Callers
+    /// pick the codec from that version: caches decode every format they still understand
+    /// instead of only their own, which is what makes in-place migration possible.
+    static func unpack(_ data: Data) -> (version: UInt32, segments: [Segment])? {
         let bytes = [UInt8](data.prefix(12))
-        guard bytes.count == 12, Array(bytes[0..<4]) == magic, readUInt32(bytes, at: 4) == version else { return nil }
+        guard bytes.count == 12, Array(bytes[0..<4]) == magic else { return nil }
+        let version = readUInt32(bytes, at: 4)
         let count = Int(readUInt32(bytes, at: 8))
         let tableSize = count * 5
         guard count >= 0, count < 100_000, data.count >= 12 + tableSize else { return nil }
@@ -47,13 +52,19 @@ enum SegmentedArchive {
             segments.append(Segment(tag: tag, payload: data[offset ..< offset + length]))
             offset += length
         }
-        return segments
+        return (version, segments)
     }
 
-    /// Deletes `*.<suffix>` archives in `directory` whose embedded version differs from `version`
-    /// (or that are truncated/foreign — they can never be decoded). Reads only the 8-byte header
-    /// of each file; cheap enough to run once at launch, off the main actor.
-    static func purgeObsoleteFiles(in directory: URL, version: UInt32, suffix: String) {
+    static func unpack(_ data: Data, version: UInt32) -> [Segment]? {
+        guard let unpacked = unpack(data), unpacked.version == version else { return nil }
+        return unpacked.segments
+    }
+
+    /// Deletes `*.<suffix>` archives in `directory` whose embedded version is not in `versions`
+    /// — the versions this build can still decode, including migratable legacy ones — or that
+    /// are truncated/foreign (they can never be decoded). Reads only the 8-byte header of each
+    /// file; cheap enough to run once at launch, off the main actor.
+    static func purgeObsoleteFiles(in directory: URL, versions: Set<UInt32>, suffix: String) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path(percentEncoded: false)) else { return }
         for name in names where name.hasSuffix("." + suffix) {
             let url = directory.appending(path: name)
@@ -62,9 +73,9 @@ enum SegmentedArchive {
             // the whole archive (hundreds of megabytes of address space / page-table work per
             // file) to inspect 8 bytes.
             let header = readHeader(url, count: 8)
-            let current = header.count == 8 && Array(header.prefix(4)) == magic
-                && readUInt32([UInt8](header.dropFirst(4)), at: 0) == version
-            if !current { try? FileManager.default.removeItem(at: url) }
+            let readable = header.count == 8 && Array(header.prefix(4)) == magic
+                && versions.contains(readUInt32([UInt8](header.dropFirst(4)), at: 0))
+            if !readable { try? FileManager.default.removeItem(at: url) }
         }
     }
 
@@ -91,32 +102,62 @@ enum SegmentedArchive {
         }
     }
 
-    /// Expands chunks a few at a time, then appends them in archive order. JSON decoding is
-    /// CPU-bound and single-threaded per chunk, so the batch tracks the core count (capped):
-    /// 39 catalog segments at 4-wide left most cores idle during the ~2 s decode.
+    /// Expands chunks a few at a time, then appends them in archive order. Chunk decoding is
+    /// CPU-bound and single-threaded per chunk, so the window tracks the core count (capped):
+    /// 77 catalog segments at 4-wide left most cores idle during the decode.
+    ///
+    /// The pipeline is a rolling window inside a single task group: as soon as one chunk
+    /// finishes, its slot is refilled *before* the finished chunks are appended in archive
+    /// order — so the serial append/copy work (retain traffic on every reference in every
+    /// item) overlaps the parallel decoding instead of serializing wave after wave.
     static func decodeChunks<Chunk: Sendable, Result>(
         _ segments: ArraySlice<Segment>, into initial: Result,
         decode: @escaping @Sendable (Segment) -> Chunk?, append: (inout Result, Chunk) -> Void
     ) async -> Result? {
         var result = initial
-        let batchSize = min(max(4, ProcessInfo.processInfo.activeProcessorCount), 10)
-        for lower in stride(from: segments.startIndex, to: segments.endIndex, by: batchSize) {
-            guard !Task.isCancelled else { return nil }
-            let batch = segments[lower..<min(lower + batchSize, segments.endIndex)]
-            let chunks = await withTaskGroup(of: (Int, Chunk?).self) { group in
-                for (index, segment) in batch.enumerated() {
-                    group.addTask { (index, Task.isCancelled ? nil : decode(segment)) }
+        let window = min(max(4, ProcessInfo.processInfo.activeProcessorCount), 10)
+        return await withTaskGroup(of: (Int, Chunk?).self) { group in
+            var nextSubmission = segments.startIndex
+            var inFlight = 0
+            func submit() {
+                let segment = segments[nextSubmission]
+                let index = nextSubmission
+                group.addTask { (index, Task.isCancelled ? nil : decode(segment)) }
+                inFlight += 1
+                nextSubmission += 1
+            }
+            while inFlight < window, nextSubmission < segments.endIndex { submit() }
+            // Chunks completed out of order, waiting for their predecessors to be appended.
+            // A nil chunk (corrupt segment) poisons the archive wherever it lands, so it is
+            // handled on arrival instead of entering the reorder buffer — which also keeps
+            // the buffer free of the dictionary nil-assignment trap.
+            var pending: [Int: Chunk] = [:]
+            var nextAppend = segments.startIndex
+            var failed = false
+            while let (index, chunk) = await group.next() {
+                inFlight -= 1
+                if Task.isCancelled { group.cancelAll() }
+                if chunk == nil { failed = true }
+                // Refill first: the append below is serial work on this task, and the
+                // window must stay saturated while it runs. Once the archive is poisoned
+                // the window only drains.
+                if !failed, !Task.isCancelled {
+                    while inFlight < window, nextSubmission < segments.endIndex { submit() }
+                } else {
+                    group.cancelAll()
                 }
-                var chunks = [Chunk?](repeating: nil, count: batch.count)
-                for await (index, chunk) in group { chunks[index] = chunk }
-                return chunks
+                if let chunk { pending[index] = chunk }
+                while let ready = pending.removeValue(forKey: nextAppend) {
+                    guard !failed else { break }
+                    append(&result, ready)
+                    nextAppend += 1
+                }
             }
-            for chunk in chunks {
-                guard let chunk else { return nil }
-                append(&result, chunk)
-            }
+            // A corrupt chunk (nil) or cancellation poison the whole archive: partial
+            // catalogs must never reach the caller.
+            guard !failed, !Task.isCancelled, nextAppend == segments.endIndex else { return nil }
+            return result
         }
-        return result
     }
 
     private struct Chunk<Item: Encodable>: Encodable {
@@ -129,9 +170,20 @@ enum SegmentedArchive {
     }
 
     /// Encodes `items` in chunks of `chunkSize`, at most six chunks in flight (each holds a full
-    /// JSON document plus its compressed form, so an unbounded group multiplied peak memory by
+    /// document plus its compressed form, so an unbounded group multiplied peak memory by
     /// the chunk count), preserving archive order.
     static func encodeChunks<T: Encodable & Sendable>(_ items: [T], tag: UInt8, chunkSize: Int) async throws -> [Segment] {
+        try await encodeChunks(items, chunkSize: chunkSize) { slice in
+            try encodeSegment(Chunk(items: slice), tag: tag)
+        }
+    }
+
+    /// Chunked parallel encode with the segment encoding left to the caller — version 1 passes
+    /// the JSON encoder above, version 2 the binary codec. Same batching, same order.
+    static func encodeChunks<T: Sendable>(
+        _ items: [T], chunkSize: Int,
+        encode: @escaping @Sendable (ArraySlice<T>) throws -> Segment
+    ) async throws -> [Segment] {
         let batchSize = 6
         // The batch span multiplies chunkSize by batchSize: keep it far from Int.max.
         precondition(chunkSize > 0 && chunkSize <= Int.max / batchSize)
@@ -146,7 +198,7 @@ enum SegmentedArchive {
                     let end = min(start + chunkSize, items.count)
                     group.addTask {
                         try Task.checkCancellation()
-                        return (start, try encodeSegment(Chunk(items: items[start..<end]), tag: tag))
+                        return (start, try encode(items[start..<end]))
                     }
                 }
                 var parts: [(Int, Segment)] = []

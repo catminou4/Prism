@@ -73,7 +73,7 @@ struct BoundedCachesTests {
         try FileManager.default.createDirectory(at: directory.appending(path: "dir.catalog"), withIntermediateDirectories: true)
 
         await Task.detached(priority: .utility) {
-            SegmentedArchive.purgeObsoleteFiles(in: directory, version: CatalogCache.formatVersion, suffix: "catalog")
+            SegmentedArchive.purgeObsoleteFiles(in: directory, versions: CatalogCache.readableVersions, suffix: "catalog")
         }.value
 
         #expect(FileManager.default.fileExists(atPath: directory.appending(path: "good.catalog").path))

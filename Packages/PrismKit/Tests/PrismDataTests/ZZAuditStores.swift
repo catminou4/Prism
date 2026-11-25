@@ -57,22 +57,46 @@ struct ZZAuditStores {
 
         // 2. unpack.
         t = ContinuousClock.now
-        guard let segments = SegmentedArchive.unpack(data, version: CatalogCache.formatVersion) else {
+        guard let unpacked = SegmentedArchive.unpack(data) else {
             Issue.record("unpack failed")
             return
         }
+        let segments = unpacked.segments
         let unpackMS = Self.ms(t)
-        print("ZZAUDIT-STORE   unpack: \(String(format: "%.1f", unpackMS)) ms → \(segments.count) segments")
+        print("ZZAUDIT-STORE   unpack: \(String(format: "%.1f", unpackMS)) ms → \(segments.count) segments, format v\(unpacked.version)")
         var tagCounts: [UInt8: Int] = [:]
         for s in segments { tagCounts[s.tag, default: 0] += 1 }
         print("ZZAUDIT-STORE   tags: \(tagCounts.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: " "))")
 
-        guard let first = segments.first,
-              let meta = SegmentedArchive.decodeSegment(CatalogCache.Meta.self, from: first) else {
+        guard let first = segments.first else {
+            Issue.record("no segments")
+            return
+        }
+        // The phase breakdown below replicates the v1 (JSON) pipeline; on a v2 archive only
+        // the production-path measurements are meaningful.
+        let meta: CatalogCache.Meta?
+        switch unpacked.version {
+        case 1:
+            meta = SegmentedArchive.decodeSegment(CatalogCache.Meta.self, from: first)
+        case 2:
+            meta = CatalogCache.expandedBinaryPayload(of: first).flatMap(BinaryArchive.decodeMeta)
+        default:
+            meta = nil
+        }
+        guard let meta else {
             Issue.record("meta decode failed")
             return
         }
         print("ZZAUDIT-STORE   meta: \(meta.channelCount)ch \(meta.movieCount)mv \(meta.seriesCount)sr, fetched \(meta.fetchedAt)")
+        guard unpacked.version == 1 else {
+            t = ContinuousClock.now
+            let decodedV2 = await CatalogCache.decode(data, version: CatalogCache.formatVersion, expecting: source.id)
+            print("ZZAUDIT-STORE   CatalogCache.decode total (v2 binary): \(String(format: "%.1f", Self.ms(t))) ms → \(decodedV2?.movies.count ?? -1)mv")
+            t = ContinuousClock.now
+            _ = await CatalogCache.decode(data, version: CatalogCache.formatVersion, expecting: source.id)
+            print("ZZAUDIT-STORE   decode again (warm): \(String(format: "%.1f", Self.ms(t))) ms")
+            return
+        }
 
         // 3. Whole decode through the production path (includes refine + share).
         t = ContinuousClock.now

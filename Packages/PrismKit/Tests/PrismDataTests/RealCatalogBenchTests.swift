@@ -127,7 +127,8 @@ struct RealCatalogBenchTests {
         for source in sources {
             let url = directories.catalogCacheFile(for: source.id)
             guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-                  let segments = SegmentedArchive.unpack(data, version: CatalogCache.formatVersion) else { continue }
+                  let unpacked = SegmentedArchive.unpack(data), unpacked.version == 1 else { continue }
+            let segments = unpacked.segments
             var byTag: [UInt8: (decompress: Double, parse: Double, intern: Double, jsonBytes: Int)] = [:]
             var seen: [UInt8: Int] = [:]
             for segment in segments.dropFirst() {

@@ -3,14 +3,24 @@ import PrismCore
 
 /// Disk cache of per-source catalogs.
 ///
-/// Format: a `SegmentedArchive` of LZFSE-compressed JSON chunks (metadata, then channels / movies /
-/// series in chunks of `chunkSize`), encoded and decoded concurrently. JSON was measured faster
-/// than binary property lists (≈3× on encode and decode, 2.5× smaller compressed). Versioned:
-/// bumping `formatVersion` makes older caches ignored.
+/// Format: a `SegmentedArchive` of compressed chunks (metadata, then channels / movies /
+/// series in chunks of `chunkSize`), encoded and decoded concurrently. Version 1 payloads are
+/// JSON (measured faster than binary property lists: ≈3× on encode and decode, 2.5× smaller
+/// compressed); version 2 payloads are the `BinaryArchive` encoding, because JSON parsing was
+/// measured at 85 % of the launch-critical decode on a 300k-item catalogue.
+///
+/// Migration: version 1 archives still decode — the cache reads the version from the file
+/// header, picks the matching codec, and re-saves as version 2 in the background so the next
+/// launch skips the JSON parse. Nothing is ever re-downloaded or emptied. Only archives from
+/// a *newer* format than this build are ignored (they may use codecs it does not have).
 public actor CatalogCache {
     /// Bump when `SourceCatalog` (or any nested model) changes shape: older caches are ignored.
-    public static let formatVersion: UInt32 = 1
-    // Smaller chunks keep concurrently expanded JSON and encoder state below their previous peak.
+    public static let formatVersion: UInt32 = 2
+    /// Versions this build can decode, including migratable legacy ones. Drives both the
+    /// decode dispatch and the purge policy: v1 catalog archives are never purged, they are
+    /// upgraded on read instead.
+    public static let readableVersions: Set<UInt32> = [1, 2]
+    // Smaller chunks keep concurrently expanded payloads and encoder state below their previous peak.
     static let chunkSize = 6_000
 
     enum Tag: UInt8 {
@@ -37,28 +47,67 @@ public actor CatalogCache {
 
     public nonisolated let directories: AppDirectories
     nonisolated let version: UInt32
+    /// Whether loading a legacy (v1) archive re-saves it in the current format in the
+    /// background. Disabled by the versioned test init so read-only harnesses never write.
+    nonisolated let migratesLegacyArchives: Bool
 
     public init(directories: AppDirectories) {
-        self.init(directories: directories, version: Self.formatVersion)
-        // Archives written by another format version can never be decoded: drop them once,
-        // off the main actor (the versioned test init skips this on purpose).
+        self.init(directories: directories, version: Self.formatVersion, migratesLegacyArchives: true)
+        // Archives written in a format this build cannot decode are useless: drop them once,
+        // off the main actor. Migratable v1 archives survive (the versioned test init skips
+        // this task on purpose).
         let directory = directories.caches.appending(path: "Catalogs", directoryHint: .isDirectory)
         Task.detached(priority: .utility) {
-            SegmentedArchive.purgeObsoleteFiles(in: directory, version: Self.formatVersion, suffix: "catalog")
+            SegmentedArchive.purgeObsoleteFiles(in: directory, versions: Self.readableVersions, suffix: "catalog")
         }
     }
 
-    init(directories: AppDirectories, version: UInt32) {
+    init(directories: AppDirectories, version: UInt32, migratesLegacyArchives: Bool = false) {
         self.directories = directories
         self.version = version
+        self.migratesLegacyArchives = migratesLegacyArchives
     }
 
-    /// Cached catalog, or `nil` when missing, unreadable or from another format version.
-    /// Runs off the actor; segments are decoded in parallel.
+    /// Cached catalog, or `nil` when missing, unreadable or written by a newer format.
+    /// Runs off the actor; segments are decoded in parallel. A successful legacy-format
+    /// read schedules its re-encode in the current format, off the caller's path.
     @concurrent
     public nonisolated func load(_ id: SourceID) async -> SourceCatalog? {
-        guard let data = try? Data(contentsOf: directories.catalogCacheFile(for: id), options: [.mappedIfSafe]) else { return nil }
-        return await Self.decode(data, version: version, expecting: id)
+        let url = directories.catalogCacheFile(for: id)
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return nil }
+        guard let catalog = await Self.decode(data, version: version, expecting: id) else { return nil }
+        if migratesLegacyArchives, Self.embeddedVersion(of: data) == 1 {
+            let modification = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            // Priority .background: the upgrade re-encode is pure profit for the *next*
+            // launch and must never steal CPU from this one.
+            Task.detached(priority: .background) {
+                await self.reencodeAsCurrentVersion(catalog, id: id, unchangedSince: modification)
+            }
+        }
+        return catalog
+    }
+
+    /// Re-writes a legacy archive in the current format. The heavy encode runs off-actor;
+    /// the write itself happens here — serialized against `save`/`remove` — and only when the
+    /// file is still the exact v1 archive the load read, so a concurrent refresh always wins.
+    private func reencodeAsCurrentVersion(_ catalog: SourceCatalog, id: SourceID, unchangedSince modification: Date?) async {
+        guard let data = try? await Self.encode(catalog, version: version) else { return }
+        let url = directories.catalogCacheFile(for: id)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        let header = (try? handle.read(upToCount: 8)) ?? Data()
+        try? handle.close()
+        guard header.count == 8, Array(header.prefix(4)) == SegmentedArchive.magic,
+              SegmentedArchive.readUInt32([UInt8](header.dropFirst(4)), at: 0) == 1,
+              (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate == modification
+        else { return }
+        try? data.write(to: url, options: [.atomic])
+    }
+
+    /// The archive version stamped in the header, or `nil` when the file is not a segmented archive.
+    static func embeddedVersion(of data: Data) -> UInt32? {
+        let bytes = [UInt8](data.prefix(8))
+        guard bytes.count == 8, Array(bytes[0..<4]) == SegmentedArchive.magic else { return nil }
+        return SegmentedArchive.readUInt32([UInt8](bytes.dropFirst(4)), at: 0)
     }
 
     public func save(_ catalog: SourceCatalog) async throws {
@@ -78,16 +127,20 @@ public actor CatalogCache {
 
     // MARK: - Coding
 
+    /// Version selects the payload codec: 1 is the legacy JSON encoding (kept so tests and
+    /// fixtures can still produce migratable archives), anything else is written binary.
+    /// Stamping a newer-than-2 version is a test hook producing unreadable foreign archives.
     @concurrent
     static func encode(_ catalog: SourceCatalog, version: UInt32) async throws -> Data {
-        let meta = Meta(
-            sourceID: catalog.sourceID, categories: catalog.categories, account: catalog.account, fetchedAt: catalog.fetchedAt,
-            channelCount: catalog.channels.count, movieCount: catalog.movies.count, seriesCount: catalog.series.count,
-            // Catalogs reach `save` already refined: provider decoders run
-            // `TitleRefinement.refine` and cache decodes refine legacy archives.
-            titlesRefined: true,
-            plotsCleaned: catalog.plotsCleaned
-        )
+        if version == 1 {
+            return try await encodeJSON(catalog, version: version)
+        }
+        return try await encodeBinary(catalog, version: version)
+    }
+
+    @concurrent
+    private static func encodeJSON(_ catalog: SourceCatalog, version: UInt32) async throws -> Data {
+        let meta = makeMeta(for: catalog)
         async let channels = SegmentedArchive.encodeChunks(catalog.channels, tag: Tag.channels.rawValue, chunkSize: chunkSize)
         async let movies = SegmentedArchive.encodeChunks(catalog.movies, tag: Tag.movies.rawValue, chunkSize: chunkSize)
         async let series = SegmentedArchive.encodeChunks(catalog.series, tag: Tag.series.rawValue, chunkSize: chunkSize / 4)
@@ -96,26 +149,102 @@ public actor CatalogCache {
         return SegmentedArchive.pack(segments, version: version)
     }
 
+    @concurrent
+    private static func encodeBinary(_ catalog: SourceCatalog, version: UInt32) async throws -> Data {
+        let meta = makeMeta(for: catalog)
+        async let channels = SegmentedArchive.encodeChunks(catalog.channels, chunkSize: chunkSize) { slice in
+            try compressedBinarySegment(BinaryArchive.encodeChannels(slice), tag: Tag.channels.rawValue)
+        }
+        async let movies = SegmentedArchive.encodeChunks(catalog.movies, chunkSize: chunkSize) { slice in
+            try compressedBinarySegment(BinaryArchive.encodeMovies(slice), tag: Tag.movies.rawValue)
+        }
+        async let series = SegmentedArchive.encodeChunks(catalog.series, chunkSize: chunkSize / 4) { slice in
+            try compressedBinarySegment(BinaryArchive.encodeSeries(slice), tag: Tag.series.rawValue)
+        }
+        let metaSegment = try compressedBinarySegment(BinaryArchive.encodeMeta(meta), tag: Tag.meta.rawValue)
+        let segments = try await [metaSegment] + channels + movies + series
+        return SegmentedArchive.pack(segments, version: version)
+    }
+
+    private static func makeMeta(for catalog: SourceCatalog) -> Meta {
+        Meta(
+            sourceID: catalog.sourceID, categories: catalog.categories, account: catalog.account, fetchedAt: catalog.fetchedAt,
+            channelCount: catalog.channels.count, movieCount: catalog.movies.count, seriesCount: catalog.series.count,
+            // Catalogs reach `save` already refined: provider decoders run
+            // `TitleRefinement.refine` and cache decodes refine legacy archives.
+            titlesRefined: true,
+            plotsCleaned: catalog.plotsCleaned
+        )
+    }
+
+    /// Binary payloads are LZFSE-compressed like the JSON ones were: measured cheaper to
+    /// decompress the smaller binary stream than to page in the larger uncompressed file.
+    static func compressedBinarySegment(_ payload: Data, tag: UInt8) throws -> SegmentedArchive.Segment {
+        try SegmentedArchive.Segment(tag: tag, payload: (payload as NSData).compressed(using: .lzfse) as Data)
+    }
+
+    /// The binary payload of a segment: raw when it already opens with the codec byte,
+    /// LZFSE-compressed otherwise (compressed streams never do — they start with `bvx`).
+    /// Being self-describing keeps the compression choice a pure encode-side decision.
+    static func expandedBinaryPayload(of segment: SegmentedArchive.Segment) -> Data? {
+        if segment.payload.first == BinaryArchive.codecByte { return segment.payload }
+        return try? (segment.payload as NSData).decompressed(using: .lzfse) as Data
+    }
+
     private enum Decoded: Sendable {
         case channels([Channel])
         case movies([Movie])
         case series([Series])
     }
 
+    /// Decodes any readable archive version: the version comes from the file header, not the
+    /// caller. Archives newer than `version` (this cache's write format) may use codecs this
+    /// build does not have — they are ignored, and a refresh will rewrite them.
     @concurrent
     static func decode(_ data: Data, version: UInt32, expecting id: SourceID? = nil) async -> SourceCatalog? {
-        guard let segments = SegmentedArchive.unpack(data, version: version),
-              let first = segments.first, first.tag == Tag.meta.rawValue,
+        guard let unpacked = SegmentedArchive.unpack(data), unpacked.version <= version else { return nil }
+        switch unpacked.version {
+        case 1:
+            return await decodeJSONSegments(unpacked.segments, expecting: id)
+        case 2:
+            return await decodeBinarySegments(unpacked.segments, expecting: id)
+        default:
+            return nil
+        }
+    }
+
+    @concurrent
+    private static func decodeJSONSegments(_ segments: [SegmentedArchive.Segment], expecting id: SourceID?) async -> SourceCatalog? {
+        guard let first = segments.first, first.tag == Tag.meta.rawValue,
               let meta = SegmentedArchive.decodeSegment(Meta.self, from: first),
-              id == nil || meta.sourceID == id else { return nil }
+              validate(meta, expecting: id) != nil else { return nil }
+        return await decodeItems(segments: segments, meta: meta, binary: false)
+    }
+
+    @concurrent
+    private static func decodeBinarySegments(_ segments: [SegmentedArchive.Segment], expecting id: SourceID?) async -> SourceCatalog? {
+        guard let first = segments.first, first.tag == Tag.meta.rawValue,
+              let payload = expandedBinaryPayload(of: first),
+              let meta = BinaryArchive.decodeMeta(payload),
+              validate(meta, expecting: id) != nil else { return nil }
+        return await decodeItems(segments: segments, meta: meta, binary: true)
+    }
+
+    /// Meta counts feed `reserveCapacity` in decode: reject absurd values from a corrupt
+    /// archive before they turn into a giant allocation (or a negative-count trap).
+    private static func validate(_ meta: Meta, expecting id: SourceID?) -> Meta? {
+        guard id == nil || meta.sourceID == id,
+              meta.channelCount >= 0, meta.movieCount >= 0, meta.seriesCount >= 0,
+              meta.channelCount <= 2_000_000, meta.movieCount <= 2_000_000,
+              meta.seriesCount <= 2_000_000 else { return nil }
+        return meta
+    }
+
+    @concurrent
+    private static func decodeItems(segments: [SegmentedArchive.Segment], meta: Meta, binary: Bool) async -> SourceCatalog? {
         // Archives flagged `titlesRefined` hold provider/decoder-refined titles: the
         // per-title pass (≈1 s on 250k titles) is skipped. Legacy archives pay it once.
         let refineTitles = meta.titlesRefined != true
-        // Meta counts feed reserveCapacity below: reject absurd values from a corrupt
-        // archive before they turn into a giant allocation (or a negative-count trap).
-        guard meta.channelCount >= 0, meta.movieCount >= 0, meta.seriesCount >= 0,
-              meta.channelCount <= 2_000_000, meta.movieCount <= 2_000_000,
-              meta.seriesCount <= 2_000_000 else { return nil }
         var empty = SourceCatalog(sourceID: meta.sourceID, categories: meta.categories, account: meta.account, fetchedAt: meta.fetchedAt)
         empty.plotsCleaned = meta.plotsCleaned == true
         // The meta counts are exact (verified below): reserve once instead of paying
@@ -124,7 +253,9 @@ public actor CatalogCache {
         empty.movies.reserveCapacity(meta.movieCount)
         empty.series.reserveCapacity(meta.seriesCount)
         guard let catalog = await SegmentedArchive.decodeChunks(segments.dropFirst(), into: empty, decode: { segment in
-            decodePart(segment, sourceID: meta.sourceID, refineTitles: refineTitles)
+            binary
+                ? decodeBinaryPart(segment, sourceID: meta.sourceID, refineTitles: refineTitles)
+                : decodePart(segment, sourceID: meta.sourceID, refineTitles: refineTitles)
         }, append: { catalog, part in
             switch part {
             case .channels(let value): catalog.channels += value
@@ -134,6 +265,39 @@ public actor CatalogCache {
         }), catalog.channels.count == meta.channelCount, catalog.movies.count == meta.movieCount,
             catalog.series.count == meta.seriesCount else { return nil }
         return catalog
+    }
+
+    /// Decodes one binary segment. Nothing else: the string/list/header tables already
+    /// deduplicate repeated values per segment, which is exactly what the v1 path paid a
+    /// `shareRepeatedValues()` pass for — equal lists even decode to the same array value.
+    private static func decodeBinaryPart(_ segment: SegmentedArchive.Segment, sourceID: SourceID, refineTitles: Bool) -> Decoded? {
+        guard let payload = expandedBinaryPayload(of: segment) else { return nil }
+        switch Tag(rawValue: segment.tag) {
+        case .channels:
+            guard let channels = BinaryArchive.decodeChannels(payload) else { return nil }
+            return .channels(channels)
+        case .movies:
+            guard var movies = BinaryArchive.decodeMovies(payload) else { return nil }
+            if refineTitles {
+                // Catalogues cached before a naming fix get it without a network refresh.
+                for offset in movies.indices {
+                    let refined = TitleRefinement.refine(movies[offset].title)
+                    if refined != movies[offset].title { movies[offset].title = refined }
+                }
+            }
+            return .movies(movies)
+        case .series:
+            guard var series = BinaryArchive.decodeSeries(payload) else { return nil }
+            if refineTitles {
+                for offset in series.indices {
+                    let refined = TitleRefinement.refine(series[offset].title)
+                    if refined != series[offset].title { series[offset].title = refined }
+                }
+            }
+            return .series(series)
+        case .meta, nil:
+            return nil
+        }
     }
 
     /// Decodes one segment, then shares its repeated values (category ids, tag/genre
@@ -218,7 +382,7 @@ public actor EPGCache {
         self.init(directories: directories, version: Self.formatVersion)
         let directory = directories.caches.appending(path: "EPG", directoryHint: .isDirectory)
         Task.detached(priority: .utility) {
-            SegmentedArchive.purgeObsoleteFiles(in: directory, version: Self.formatVersion, suffix: "epg")
+            SegmentedArchive.purgeObsoleteFiles(in: directory, versions: [Self.formatVersion], suffix: "epg")
         }
     }
 

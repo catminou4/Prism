@@ -57,22 +57,26 @@ struct StoreTests {
         #expect(loaded.fetchedAt == catalog.fetchedAt)
         #expect(cache.cachedAt(F.a) != nil)
 
-        let bumped = CatalogCache(directories: directories, version: CatalogCache.formatVersion + 1)
-        #expect(await bumped.load(F.a) == nil, "older format is ignored")
+        // Archives written by a newer format than this build are ignored: they may use codecs
+        // it does not have. Older-but-readable versions decode instead of being dropped.
+        let foreign = try await CatalogCache.encode(catalog, version: CatalogCache.formatVersion + 1)
+        try foreign.write(to: directories.catalogCacheFile(for: F.a), options: [.atomic])
+        #expect(await cache.load(F.a) == nil, "a newer format version is ignored")
 
         await cache.remove(F.a)
         #expect(await cache.load(F.a) == nil)
     }
 
     /// Archives flagged `titlesRefined` skip the per-title migration pass on decode;
-    /// archives written before the flag existed (no key → `nil`) still get it.
+    /// archives written before the flag existed (no key → `nil`) still get it. The legacy
+    /// fixtures here are version 1: JSON payloads are what those archives actually contain.
     @Test func catalogCacheTitleRefinementFlag() async throws {
         let rawTitle = "Narcos SPANISH MULTI SUB"
         let catalog = SourceCatalog(sourceID: F.a, movies: [F.movie(F.a, "1", rawTitle)])
 
         // New archives carry the flag: the stored title round-trips untouched.
-        let flagged = try await CatalogCache.encode(catalog, version: CatalogCache.formatVersion)
-        let flaggedSegments = try #require(SegmentedArchive.unpack(flagged, version: CatalogCache.formatVersion))
+        let flagged = try await CatalogCache.encode(catalog, version: 1)
+        let flaggedSegments = try #require(SegmentedArchive.unpack(flagged, version: 1))
         let flaggedMeta = try #require(SegmentedArchive.decodeSegment(CatalogCache.Meta.self, from: flaggedSegments[0]))
         #expect(flaggedMeta.titlesRefined == true)
         let decodedFlagged = try #require(await CatalogCache.decode(flagged, version: CatalogCache.formatVersion))
@@ -87,7 +91,7 @@ struct StoreTests {
         let movieSegments = try await SegmentedArchive.encodeChunks(
             catalog.movies, tag: CatalogCache.Tag.movies.rawValue, chunkSize: CatalogCache.chunkSize
         )
-        let legacy = SegmentedArchive.pack([metaSegment] + movieSegments, version: CatalogCache.formatVersion)
+        let legacy = SegmentedArchive.pack([metaSegment] + movieSegments, version: 1)
         let decodedLegacy = try #require(await CatalogCache.decode(legacy, version: CatalogCache.formatVersion))
         #expect(decodedLegacy.movies.first?.title == "Narcos")
     }
