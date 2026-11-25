@@ -342,14 +342,29 @@ public actor CatalogCache {
 }
 
 /// Disk cache of per-source EPG programmes (same segmented format as `CatalogCache`).
+///
+/// Version 1 payloads are JSON; version 2 payloads are the `BinaryArchive` encoding — JSON
+/// parsing dominated the decode cost exactly like it did for the catalogue cache, and the
+/// programme channel ids repeat ~73 times per channel, which the per-segment string table
+/// collapses to a single instance. Migration mirrors `CatalogCache`: v1 archives decode
+/// through the version in the file header and are re-saved as v2 in the background.
 public actor EPGCache {
-    public static let formatVersion: UInt32 = 1
+    /// Bump when `EPGProgram`/`XMLTVChannel` (or the meta shape) change: older caches are ignored.
+    public static let formatVersion: UInt32 = 2
+    /// Versions this build can decode, including migratable legacy ones. Drives both the
+    /// decode dispatch and the purge policy: v1 archives are never purged, they are
+    /// upgraded on read instead.
+    public static let readableVersions: Set<UInt32> = [1, 2]
     /// ~8k programmes/segment: `decodeChunks` decodes ≤10 segments concurrently, so
     /// 40k chunks let a 278k-programme feed expand ~entirely in flight (~400-500 MB
     /// transient measured); 8k bounds it to ~80k programmes per batch. Segments are
     /// self-describing — old caches still decode, they just keep the old profile
     /// until the next save.
     static let chunkSize = 8_000
+
+    enum Tag: UInt8 {
+        case meta = 0, programs = 1
+    }
 
     public struct Entry: Sendable {
         public var programs: [EPGProgram]
@@ -377,49 +392,169 @@ public actor EPGCache {
 
     public nonisolated let directories: AppDirectories
     nonisolated let version: UInt32
+    /// Whether loading a legacy (v1) archive re-saves it in the current format in the
+    /// background. Disabled by the versioned test init so read-only harnesses never write.
+    nonisolated let migratesLegacyArchives: Bool
 
     public init(directories: AppDirectories) {
-        self.init(directories: directories, version: Self.formatVersion)
+        self.init(directories: directories, version: Self.formatVersion, migratesLegacyArchives: true)
         let directory = directories.caches.appending(path: "EPG", directoryHint: .isDirectory)
         Task.detached(priority: .utility) {
-            SegmentedArchive.purgeObsoleteFiles(in: directory, versions: [Self.formatVersion], suffix: "epg")
+            SegmentedArchive.purgeObsoleteFiles(in: directory, versions: Self.readableVersions, suffix: "epg")
         }
     }
 
-    init(directories: AppDirectories, version: UInt32) {
+    init(directories: AppDirectories, version: UInt32, migratesLegacyArchives: Bool = false) {
         self.directories = directories
         self.version = version
+        self.migratesLegacyArchives = migratesLegacyArchives
     }
 
-    /// Archive header (meta segment + raw segments), or `nil` when missing/unreadable/foreign.
-    private static func header(in data: Data, version: UInt32, expecting id: SourceID) -> (meta: Meta, segments: [SegmentedArchive.Segment])? {
-        guard let segments = SegmentedArchive.unpack(data, version: version),
-              let first = segments.first, first.tag == 0,
-              let meta = SegmentedArchive.decodeSegment(Meta.self, from: first), meta.sourceID == id
+    /// Decodes the meta segment with the codec of the archive version that carries it.
+    private static func decodeMetaSegment(_ segment: SegmentedArchive.Segment, version: UInt32) -> Meta? {
+        switch version {
+        case 1:
+            return SegmentedArchive.decodeSegment(Meta.self, from: segment)
+        case 2:
+            guard let payload = CatalogCache.expandedBinaryPayload(of: segment) else { return nil }
+            return BinaryArchive.decodeEPGMeta(payload)
+        default:
+            return nil
+        }
+    }
+
+    /// Archive header meta, or `nil` when missing/unreadable/foreign/newer. The version comes
+    /// from the file header, not the caller, so legacy archives are readable everywhere.
+    private static func header(in data: Data, version: UInt32, expecting id: SourceID) -> Meta? {
+        guard let unpacked = SegmentedArchive.unpack(data), unpacked.version <= version,
+              let first = unpacked.segments.first, first.tag == Tag.meta.rawValue,
+              let meta = decodeMetaSegment(first, version: unpacked.version), meta.sourceID == id
         else { return nil }
-        return (meta, segments)
+        return meta
     }
 
     /// Fetch date stored in the archive header, without decoding the programme segments.
     @concurrent
     public nonisolated func fetchedAt(_ id: SourceID) async -> Date? {
         guard let data = try? Data(contentsOf: directories.epgCacheFile(for: id), options: [.mappedIfSafe]),
-              let header = Self.header(in: data, version: version, expecting: id) else { return nil }
-        return header.meta.fetchedAt
+              let meta = Self.header(in: data, version: version, expecting: id) else { return nil }
+        return meta.fetchedAt
+    }
+
+    /// Cached entry, or `nil` when missing, unreadable or written by a newer format.
+    /// Runs off the actor; segments are decoded in parallel. A successful legacy-format
+    /// read schedules its re-encode in the current format, off the caller's path.
+    @concurrent
+    public nonisolated func load(_ id: SourceID) async -> Entry? {
+        let url = directories.epgCacheFile(for: id)
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return nil }
+        guard let entry = await Self.decode(data, version: version, expecting: id) else { return nil }
+        if migratesLegacyArchives, CatalogCache.embeddedVersion(of: data) == 1 {
+            let modification = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            // Priority .background: the upgrade re-encode is pure profit for the *next*
+            // launch and must never steal CPU from this one.
+            Task.detached(priority: .background) {
+                await self.reencodeAsCurrentVersion(entry, id: id, unchangedSince: modification)
+            }
+        }
+        return entry
+    }
+
+    /// Re-writes a legacy archive in the current format. The heavy encode runs off-actor;
+    /// the write itself happens here — serialized against `save`/`remove` — and only when the
+    /// file is still the exact v1 archive the load read, so a concurrent refresh always wins.
+    private func reencodeAsCurrentVersion(_ entry: Entry, id: SourceID, unchangedSince modification: Date?) async {
+        guard let data = try? await Self.encode(entry, for: id, version: version) else { return }
+        let url = directories.epgCacheFile(for: id)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        let header = (try? handle.read(upToCount: 8)) ?? Data()
+        try? handle.close()
+        guard header.count == 8, Array(header.prefix(4)) == SegmentedArchive.magic,
+              SegmentedArchive.readUInt32([UInt8](header.dropFirst(4)), at: 0) == 1,
+              (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate == modification
+        else { return }
+        try? data.write(to: url, options: [.atomic])
+    }
+
+    public func save(_ entry: Entry, for id: SourceID) async throws {
+        let data = try await Self.encode(entry, for: id, version: version)
+        try data.write(to: directories.epgCacheFile(for: id), options: [.atomic])
+    }
+
+    public func remove(_ id: SourceID) {
+        try? FileManager.default.removeItem(at: directories.epgCacheFile(for: id))
+    }
+
+    // MARK: - Coding
+
+    /// Version selects the payload codec: 1 is the legacy JSON encoding (kept so tests and
+    /// fixtures can still produce migratable archives), anything else is written binary.
+    /// Stamping a newer-than-2 version is a test hook producing unreadable foreign archives.
+    @concurrent
+    static func encode(_ entry: Entry, for id: SourceID, version: UInt32) async throws -> Data {
+        if version == 1 {
+            return try await encodeJSON(entry, for: id, version: version)
+        }
+        return try await encodeBinary(entry, for: id, version: version)
+    }
+
+    private static func makeMeta(_ entry: Entry, for id: SourceID) -> Meta {
+        Meta(
+            sourceID: id,
+            channels: entry.channels.map { .init(id: $0.id, displayNames: $0.displayNames, iconURL: $0.iconURL) },
+            fetchedAt: entry.fetchedAt, programCount: entry.programs.count
+        )
     }
 
     @concurrent
-    public nonisolated func load(_ id: SourceID) async -> Entry? {
-        guard let data = try? Data(contentsOf: directories.epgCacheFile(for: id), options: [.mappedIfSafe]),
-              let header = Self.header(in: data, version: version, expecting: id) else { return nil }
-        let meta = header.meta
+    private static func encodeJSON(_ entry: Entry, for id: SourceID, version: UInt32) async throws -> Data {
+        let metaSegment = try SegmentedArchive.encodeSegment(makeMeta(entry, for: id), tag: Tag.meta.rawValue)
+        let chunks = try await SegmentedArchive.encodeChunks(entry.programs, tag: Tag.programs.rawValue, chunkSize: Self.chunkSize)
+        return SegmentedArchive.pack([metaSegment] + chunks, version: version)
+    }
+
+    @concurrent
+    private static func encodeBinary(_ entry: Entry, for id: SourceID, version: UInt32) async throws -> Data {
+        async let chunks = SegmentedArchive.encodeChunks(entry.programs, chunkSize: Self.chunkSize) { slice in
+            try CatalogCache.compressedBinarySegment(BinaryArchive.encodePrograms(slice), tag: Tag.programs.rawValue)
+        }
+        let metaSegment = try CatalogCache.compressedBinarySegment(BinaryArchive.encodeEPGMeta(makeMeta(entry, for: id)), tag: Tag.meta.rawValue)
+        let segments = try await [metaSegment] + chunks
+        return SegmentedArchive.pack(segments, version: version)
+    }
+
+    /// Decodes any readable archive version: the version comes from the file header, not the
+    /// caller. Archives newer than `version` (this cache's write format) may use codecs this
+    /// build does not have — they are ignored, and a refresh will rewrite them.
+    @concurrent
+    static func decode(_ data: Data, version: UInt32, expecting id: SourceID) async -> Entry? {
+        guard let unpacked = SegmentedArchive.unpack(data), unpacked.version <= version else { return nil }
+        switch unpacked.version {
+        case 1:
+            return await decodeSegments(unpacked.segments, binary: false, expecting: id)
+        case 2:
+            return await decodeSegments(unpacked.segments, binary: true, expecting: id)
+        default:
+            return nil
+        }
+    }
+
+    @concurrent
+    private static func decodeSegments(_ segments: [SegmentedArchive.Segment], binary: Bool, expecting id: SourceID) async -> Entry? {
+        guard let first = segments.first, first.tag == Tag.meta.rawValue,
+              let meta = decodeMetaSegment(first, version: binary ? 2 : 1), meta.sourceID == id
+        else { return nil }
         // programCount feeds reserveCapacity: reject absurd values from a corrupt
         // archive before they become a giant allocation (or a negative-count trap).
         guard meta.programCount >= 0, meta.programCount <= 5_000_000 else { return nil }
         var emptyPrograms: [EPGProgram] = []
         emptyPrograms.reserveCapacity(meta.programCount)
-        guard let programs = await SegmentedArchive.decodeChunks(header.segments.dropFirst(), into: emptyPrograms, decode: { segment in
-            guard segment.tag == 1 else { return nil }
+        guard let programs = await SegmentedArchive.decodeChunks(segments.dropFirst(), into: emptyPrograms, decode: { segment in
+            guard segment.tag == Tag.programs.rawValue else { return nil }
+            if binary {
+                guard let payload = CatalogCache.expandedBinaryPayload(of: segment) else { return nil }
+                return BinaryArchive.decodePrograms(payload)
+            }
             return SegmentedArchive.decodeSegment([EPGProgram].self, from: segment)
         }, append: { $0 += $1 }), programs.count == meta.programCount else { return nil }
         return Entry(
@@ -427,21 +562,5 @@ public actor EPGCache {
             channels: meta.channels.map { XMLTVChannel(id: $0.id, displayNames: $0.displayNames, iconURL: $0.iconURL) },
             fetchedAt: meta.fetchedAt
         )
-    }
-
-    public func save(_ entry: Entry, for id: SourceID) async throws {
-        let meta = Meta(
-            sourceID: id,
-            channels: entry.channels.map { .init(id: $0.id, displayNames: $0.displayNames, iconURL: $0.iconURL) },
-            fetchedAt: entry.fetchedAt, programCount: entry.programs.count
-        )
-        let metaSegment = try SegmentedArchive.encodeSegment(meta, tag: 0)
-        let chunks = try await SegmentedArchive.encodeChunks(entry.programs, tag: 1, chunkSize: Self.chunkSize)
-        let data = SegmentedArchive.pack([metaSegment] + chunks, version: version)
-        try data.write(to: directories.epgCacheFile(for: id), options: [.atomic])
-    }
-
-    public func remove(_ id: SourceID) {
-        try? FileManager.default.removeItem(at: directories.epgCacheFile(for: id))
     }
 }

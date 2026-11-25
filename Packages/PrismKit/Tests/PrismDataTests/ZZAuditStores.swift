@@ -235,7 +235,7 @@ struct ZZAuditStores {
         print("ZZAUDIT-STORE   EPGGuide build: \(String(format: "%.1f", Self.ms(t))) ms → \(guide.channelCount) channels")
 
         t = ContinuousClock.now
-        let entry = await EPGCache(directories: Self.directories).load(source.id)
+        let entry = await EPGCache(directories: Self.directories, version: EPGCache.formatVersion).load(source.id)
         print("ZZAUDIT-STORE   EPGCache.load total: \(String(format: "%.1f", Self.ms(t))) ms → \(entry?.programs.count ?? -1) programmes")
         withExtendedLifetime(guide) {}
     }

@@ -129,7 +129,7 @@ struct ZZAuditLiveTests {
         }
 
         // ---- EPG guide -------------------------------------------------------
-        let epgCache = EPGCache(directories: Self.directories)
+        let epgCache = EPGCache(directories: Self.directories, version: EPGCache.formatVersion)
         var guides: [EPGGuide] = []
         for source in enabled {
             guard let entry = await epgCache.load(source.id) else { continue }

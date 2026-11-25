@@ -901,6 +901,131 @@ enum BinaryArchive {
         }
     }
 
+    // MARK: - EPG
+
+    // Mask bits, in write order of the optional fields.
+    private enum ProgramBit {
+        static let subtitle = 0, summary = 1, category = 2, categoryLabels = 3
+        static let iconURL = 4, episodeLabel = 5, rating = 6, isNew = 7
+    }
+
+    private enum XMLTVChannelBit {
+        static let iconURL = 0
+    }
+
+    /// Encodes one programme chunk. Record order is fixed: mask, the required fields
+    /// (channelID, title, then the exact bit-pattern doubles of both dates — the same
+    /// `timeIntervalSinceReferenceDate` JSON encodes, so v1 and v2 decode to identical
+    /// values), then the optional fields in bit order. The channel id repeats for every
+    /// programme of a channel (~73 per channel on real feeds): the per-segment string
+    /// table collapses it to one written instance, one decoded instance.
+    static func encodePrograms(_ programs: ArraySlice<EPGProgram>) -> Data {
+        var tables = Tables()
+        var records = Writer()
+        records.reserveCapacity(programs.count * 40)
+        records.writeCount(programs.count)
+        for program in programs {
+            var mask: UInt8 = 0
+            if program.subtitle != nil { mask |= 1 << ProgramBit.subtitle }
+            if program.summary != nil { mask |= 1 << ProgramBit.summary }
+            if program.category != nil { mask |= 1 << ProgramBit.category }
+            if program.categoryLabels != nil { mask |= 1 << ProgramBit.categoryLabels }
+            if program.iconURL != nil { mask |= 1 << ProgramBit.iconURL }
+            if program.episodeLabel != nil { mask |= 1 << ProgramBit.episodeLabel }
+            if program.rating != nil { mask |= 1 << ProgramBit.rating }
+            if program.isNew { mask |= 1 << ProgramBit.isNew }
+            records.writeByte(mask)
+            records.writeVarint(UInt64(tables.intern(program.channelID)))
+            records.writeVarint(UInt64(tables.intern(program.title)))
+            records.writeDouble(program.start.timeIntervalSinceReferenceDate)
+            records.writeDouble(program.end.timeIntervalSinceReferenceDate)
+            if let subtitle = program.subtitle { records.writeVarint(UInt64(tables.intern(subtitle))) }
+            if let summary = program.summary { records.writeVarint(UInt64(tables.intern(summary))) }
+            if let category = program.category { records.writeVarint(UInt64(tables.intern(category))) }
+            if let labels = program.categoryLabels { records.writeVarint(UInt64(tables.intern(labels))) }
+            // Plain `URL?` like `Season.posterURL`: the absolute string, reparsed at decode.
+            if let icon = program.iconURL { records.writeVarint(UInt64(tables.intern(icon.absoluteString))) }
+            if let episode = program.episodeLabel { records.writeVarint(UInt64(tables.intern(episode))) }
+            if let rating = program.rating { records.writeVarint(UInt64(tables.intern(rating))) }
+        }
+        return finish(tables: &tables, records: records)
+    }
+
+    static func decodePrograms(_ payload: Data) -> [EPGProgram]? {
+        decode(payload) { reader, strings, lists, _ in
+            let count = try reader.readCount()
+            var programs: [EPGProgram] = []
+            programs.reserveCapacity(count)
+            for _ in 0..<count {
+                let mask = try reader.readByte()
+                let channelID = strings[try reader.readReference(tableSize: strings.count)]
+                let title = strings[try reader.readReference(tableSize: strings.count)]
+                let start = Date(timeIntervalSinceReferenceDate: try reader.readDouble())
+                let end = Date(timeIntervalSinceReferenceDate: try reader.readDouble())
+                var program = EPGProgram(channelID: channelID, start: start, end: end, title: title, isNew: mask & (1 << ProgramBit.isNew) != 0)
+                if mask & (1 << ProgramBit.subtitle) != 0 { program.subtitle = strings[try reader.readReference(tableSize: strings.count)] }
+                if mask & (1 << ProgramBit.summary) != 0 { program.summary = strings[try reader.readReference(tableSize: strings.count)] }
+                if mask & (1 << ProgramBit.category) != 0 { program.category = strings[try reader.readReference(tableSize: strings.count)] }
+                if mask & (1 << ProgramBit.categoryLabels) != 0 { program.categoryLabels = lists[try reader.readReference(tableSize: lists.count)] }
+                if mask & (1 << ProgramBit.iconURL) != 0 {
+                    let text = strings[try reader.readReference(tableSize: strings.count)]
+                    guard let url = URL(string: text) else { throw DecodeError.corrupt }
+                    program.iconURL = url
+                }
+                if mask & (1 << ProgramBit.episodeLabel) != 0 { program.episodeLabel = strings[try reader.readReference(tableSize: strings.count)] }
+                if mask & (1 << ProgramBit.rating) != 0 { program.rating = strings[try reader.readReference(tableSize: strings.count)] }
+                programs.append(program)
+            }
+            return programs
+        }
+    }
+
+    /// The EPG meta segment: source id, fetch date, programme count, then the XMLTV channels
+    /// (id, display-name list interned like every string list, optional icon). Small next to
+    /// the programme segments, but binary keeps the version dispatch uniform: a v2 archive is
+    /// binary in every segment, a v1 archive is JSON in every segment.
+    static func encodeEPGMeta(_ meta: EPGCache.Meta) -> Data {
+        var tables = Tables()
+        var records = Writer()
+        records.writeVarint(UInt64(tables.intern(meta.sourceID.rawValue)))
+        records.writeDouble(meta.fetchedAt.timeIntervalSinceReferenceDate)
+        records.writeZigzag(meta.programCount)
+        records.writeCount(meta.channels.count)
+        for channel in meta.channels {
+            var mask: UInt8 = 0
+            if channel.iconURL != nil { mask |= 1 << XMLTVChannelBit.iconURL }
+            records.writeByte(mask)
+            records.writeVarint(UInt64(tables.intern(channel.id)))
+            records.writeVarint(UInt64(tables.intern(channel.displayNames)))
+            if let icon = channel.iconURL { records.writeVarint(UInt64(tables.intern(icon.absoluteString))) }
+        }
+        return finish(tables: &tables, records: records)
+    }
+
+    static func decodeEPGMeta(_ payload: Data) -> EPGCache.Meta? {
+        decode(payload) { reader, strings, lists, _ in
+            let source = strings[try reader.readReference(tableSize: strings.count)]
+            let fetchedAt = Date(timeIntervalSinceReferenceDate: try reader.readDouble())
+            let programCount = try reader.readZigzag()
+            let channelCount = try reader.readCount()
+            var channels: [EPGCache.Meta.StoredChannel] = []
+            channels.reserveCapacity(channelCount)
+            for _ in 0..<channelCount {
+                let mask = try reader.readByte()
+                let id = strings[try reader.readReference(tableSize: strings.count)]
+                let names = lists[try reader.readReference(tableSize: lists.count)]
+                var icon: URL?
+                if mask & (1 << XMLTVChannelBit.iconURL) != 0 {
+                    let text = strings[try reader.readReference(tableSize: strings.count)]
+                    guard let url = URL(string: text) else { throw DecodeError.corrupt }
+                    icon = url
+                }
+                channels.append(EPGCache.Meta.StoredChannel(id: id, displayNames: names, iconURL: icon))
+            }
+            return EPGCache.Meta(sourceID: SourceID(source), channels: channels, fetchedAt: fetchedAt, programCount: programCount)
+        }
+    }
+
     // MARK: - Assembly
 
     /// Never opened by a player: the required-URL inits are fed this placeholder and the exact

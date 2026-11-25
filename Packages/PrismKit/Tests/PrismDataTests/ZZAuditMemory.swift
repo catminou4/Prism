@@ -88,7 +88,7 @@ struct ZZAuditMemory {
         Self.mark("after CurationIndex.build", "\(Int(Date().timeIntervalSince(curStart) * 1000))ms")
 
         // ---- EPG ------------------------------------------------------------
-        let epgCache = EPGCache(directories: directories)
+        let epgCache = EPGCache(directories: directories, version: EPGCache.formatVersion)
         var guides: [EPGGuide] = []
         var rawEntries: [EPGCache.Entry] = []
         for source in sources where source.isEnabled {
@@ -125,7 +125,7 @@ struct ZZAuditMemory {
         )
         Self.mark("EPG-only baseline")
         let sources = SourceStore(directories: directories).load()
-        let epgCache = EPGCache(directories: directories)
+        let epgCache = EPGCache(directories: directories, version: EPGCache.formatVersion)
         var guides: [EPGGuide] = []
         var entries: [EPGCache.Entry] = []
         for source in sources where source.isEnabled {
