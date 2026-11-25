@@ -282,17 +282,20 @@ public actor MetadataRepository {
         try? data.write(to: file(key), options: [.atomic])
     }
 
-    private static var encoder: JSONEncoder {
+    /// Shared coders, configured once and never mutated: JSON coders are thread-safe for
+    /// concurrent encode/decode once frozen, so a `static let` avoids allocating a fresh
+    /// one (with its iso8601 date strategy) on every disk access.
+    private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         return encoder
-    }
+    }()
 
-    private static var decoder: JSONDecoder {
+    private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
-    }
+    }()
 }
 
 // MARK: - Codable mirrors of the TMDB models

@@ -147,23 +147,34 @@ public actor DetailRepository {
         directories.detailCacheDirectory.appending(path: "\(kind)-\(SafeFileName.make(id.rawValue)).json", directoryHint: .notDirectory)
     }
 
+    /// Shared coders: configured once, never mutated afterwards — JSON coders are thread-safe
+    /// for concurrent encode/decode once their configuration is frozen, so a `static let`
+    /// avoids allocating a fresh one (with its iso8601 date strategy) on every disk access.
+    private static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }()
+
     /// Disk IO runs off the actor: a synchronous `Data(contentsOf:)` + decode used to block it
     /// for milliseconds on every detail open.
     @concurrent
     private nonisolated func read<Value: Codable & Sendable>(_ kind: String, _ id: ContentID, allowStale: Bool) async -> Value? {
         guard let data = try? Data(contentsOf: file(kind, id)) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let stored = try? decoder.decode(Stored<Value>.self, from: data) else { return nil }
+        guard let stored = try? Self.decoder.decode(Stored<Value>.self, from: data) else { return nil }
         if !allowStale && Date.now.timeIntervalSince(stored.savedAt) > Self.timeToLive { return nil }
         return stored.value
     }
 
     @concurrent
     private nonisolated func write<Value: Codable & Sendable>(_ value: Value, kind: String, id: ContentID) async {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(Stored(savedAt: .now, value: value)) else { return }
+        guard let data = try? Self.encoder.encode(Stored(savedAt: .now, value: value)) else { return }
         try? data.write(to: file(kind, id), options: [.atomic])
     }
 }

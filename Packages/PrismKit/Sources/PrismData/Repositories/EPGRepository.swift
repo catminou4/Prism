@@ -36,21 +36,43 @@ public actor EPGRepository {
 
     /// Merged guide of every enabled source from the disk caches (source order = priority).
     public func cachedGuide(for sources: [Source]) async -> EPGGuide {
+        struct Loaded: Sendable {
+            var index: Int
+            var guide: EPGGuide
+            var fetchedAt: Date
+        }
+        let enabled = sources.filter(\.isEnabled)
+        // Disk reads and guide decoding run per source concurrently (the decode is itself
+        // parallel internally); the merge below consumes them in source order either way.
+        let loaded: [Int: Loaded] = await withTaskGroup(of: Loaded?.self) { group in
+            for (index, source) in enabled.enumerated() {
+                group.addTask {
+                    guard let entry = await self.cache.load(source.id) else { return nil }
+                    let guide = await Self.makeGuide(entry.programs, channels: entry.channels)
+                    return Loaded(index: index, guide: guide, fetchedAt: entry.fetchedAt)
+                }
+            }
+            var collected: [Int: Loaded] = [:]
+            for await result in group {
+                if let result { collected[result.index] = result }
+            }
+            return collected
+        }
+        guard !Task.isCancelled else { return .empty }
+
         var ordered: [EPGGuide] = []
-        for source in sources where source.isEnabled {
-            guard !Task.isCancelled else { return .empty }
-            if let entry = await cache.load(source.id) {
-                let guide = await Self.makeGuide(entry.programs, channels: entry.channels)
+        for (index, source) in enabled.enumerated() {
+            if let entry = loaded[index] {
                 // Bootstrap now awaits this after `.ready`: a refresh that landed while
                 // the entry was being read must not be overwritten by the older disk
                 // snapshot. The decoded guide still feeds the merge when nothing fresher
                 // is in memory.
                 if let known = fetchedAt[source.id], known > entry.fetchedAt {
-                    ordered.append(guides[source.id] ?? guide)
+                    ordered.append(guides[source.id] ?? entry.guide)
                 } else {
-                    guides[source.id] = guide
+                    guides[source.id] = entry.guide
                     fetchedAt[source.id] = entry.fetchedAt
-                    ordered.append(guide)
+                    ordered.append(entry.guide)
                 }
             } else if DemoContent.isDemo(source) {
                 let guide = DemoContent.makeGuide()

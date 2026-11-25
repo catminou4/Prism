@@ -372,6 +372,191 @@ public enum CatalogBuilder {
         }
     }
 
+    /// Everything the grouping phase needs about one visible item, extracted during the
+    /// sequential partition scan so shard tasks never re-read the scattered source items.
+    struct MediaRef: Sendable {
+        var key: String
+        var ref: Ref
+        var year: Int?
+    }
+
+    /// Per-item results of the grouping pre-pass plus the per-shard ref buckets.
+    struct MediaPartition: Sendable {
+        /// Resolved visible category per item, positional with the input lists.
+        var cats: [[String?]] = []
+        var adult: [[Bool]] = []
+        /// Refs of the visible items per shard, each bucket in scan order (catalog, then item).
+        var shardRefs: [[MediaRef]] = []
+        var hasTaggedEditions = false
+        var hasTMDBIdentity = false
+    }
+
+    /// Grouping output of one shard: dated groups first (creation order), then undated ones.
+    /// `datedGroups` indexes `groups` and is kept for the editorial-alias lookup: rebuilding
+    /// one global dictionary would re-hash every key for the sake of a few hundred lookups.
+    struct MediaShardGroups: Sendable {
+        var groups: [MediaGroup] = []
+        var datedCount = 0
+        var datedGroups: [NameIdentity: Int] = [:]
+    }
+
+    /// Stable shard index of a normalized key: FNV-1a over the UTF-8 bytes with a murmur-style
+    /// finalizer. Unlike `hashValue` this is deterministic across runs and processes, and it is
+    /// a pure function of the key — every item sharing a key lands in the same shard, keeping
+    /// the dated/undated reconciliation shard-local.
+    static func shardIndex(for key: String, shards: Int) -> Int {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        if let contiguous = key.utf8.withContiguousStorageIfAvailable({ buffer -> UInt64 in
+            var fast: UInt64 = 0xcbf2_9ce4_8422_2325
+            for byte in buffer {
+                fast ^= UInt64(byte)
+                fast &*= 0x0000_0100_0000_01b3
+            }
+            return fast
+        }) {
+            hash = contiguous
+        } else {
+            for byte in key.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 0x0000_0100_0000_01b3
+            }
+        }
+        hash ^= hash >> 33
+        hash &*= 0xff51_afd7_ed55_8ccd
+        hash ^= hash >> 33
+        return Int(hash % UInt64(shards))
+    }
+
+    /// Per-chunk output of the media partition scan.
+    struct MediaPartitionChunk: Sendable {
+        var listIndex = 0
+        var lower = 0
+        var cats: [String?] = []
+        var adult: [Bool] = []
+        var buckets: [[MediaRef]] = []
+        var tagged = false
+        var tmdb = false
+    }
+
+    /// Parallel scan reproducing the serial grouping loop's per-item work: category resolution,
+    /// adult flags and filtering — except that instead of grouping, each visible item is appended
+    /// to the bucket of its key's shard. Concatenating the per-chunk buckets in (catalog, offset)
+    /// order yields every shard's refs in the exact scan order of the former serial loop.
+    static func partitionMedia<V: GroupableMedia>(
+        lists: [[V]], keys: [[String]], context: Context, kind: MediaKind, shards: Int
+    ) async -> MediaPartition {
+        let total = lists.reduce(0) { $0 + $1.count }
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
+        let chunk = max(2_048, total / (workers * 2))
+
+        let chunks: [MediaPartitionChunk] = await withTaskGroup(of: MediaPartitionChunk.self) { group in
+            for (listIndex, list) in lists.enumerated() {
+                let resolver = context.resolver(catalog: listIndex, kind: kind)
+                let listKeys = keys[listIndex]
+                var start = 0
+                while start < list.count {
+                    let end = min(start + chunk, list.count)
+                    let lower = start
+                    group.addTask {
+                        var out = MediaPartitionChunk(listIndex: listIndex, lower: lower)
+                        out.cats = [String?](repeating: nil, count: end - lower)
+                        out.adult = [Bool](repeating: false, count: end - lower)
+                        out.buckets = [[MediaRef]](repeating: [], count: shards)
+                        guard !Task.isCancelled else { return out }
+                        // Indexed field reads, exactly like the former serial loop: binding the
+                        // element would copy the whole struct per item.
+                        for index in lower..<end {
+                            let category = list[index].categoryID.flatMap { resolver[$0] }
+                            let isAdult = list[index].isAdult || category?.isAdult == true
+                            if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
+                            if !out.tagged, !list[index].tags.isEmpty { out.tagged = true }
+                            out.adult[index - lower] = isAdult
+                            out.cats[index - lower] = category?.visibleID
+                            if !out.tmdb, let tmdbID = list[index].tmdbID, tmdbID > 0 { out.tmdb = true }
+                            let shard = shardIndex(for: listKeys[index], shards: shards)
+                            out.buckets[shard].append(MediaRef(
+                                key: listKeys[index],
+                                ref: Ref(catalog: Int32(listIndex), item: Int32(index)),
+                                year: list[index].year
+                            ))
+                        }
+                        return out
+                    }
+                    start = end
+                }
+            }
+            var collected: [MediaPartitionChunk] = []
+            for await chunk in group { collected.append(chunk) }
+            return collected.sorted { ($0.listIndex, $0.lower) < ($1.listIndex, $1.lower) }
+        }
+
+        var partition = MediaPartition()
+        partition.cats = lists.map { [String?](repeating: nil, count: $0.count) }
+        partition.adult = lists.map { [Bool](repeating: false, count: $0.count) }
+        partition.shardRefs = [[MediaRef]](repeating: [], count: shards)
+        let average = max(1, total / shards)
+        for shard in partition.shardRefs.indices { partition.shardRefs[shard].reserveCapacity(average) }
+        let writebackStart = ContinuousClock.now
+        for chunk in chunks {
+            partition.cats[chunk.listIndex].replaceSubrange(chunk.lower..<(chunk.lower + chunk.cats.count), with: chunk.cats)
+            partition.adult[chunk.listIndex].replaceSubrange(chunk.lower..<(chunk.lower + chunk.adult.count), with: chunk.adult)
+            for shard in chunk.buckets.indices where !chunk.buckets[shard].isEmpty {
+                partition.shardRefs[shard].append(contentsOf: chunk.buckets[shard])
+            }
+            partition.hasTaggedEditions = partition.hasTaggedEditions || chunk.tagged
+            partition.hasTMDBIdentity = partition.hasTMDBIdentity || chunk.tmdb
+        }
+        BuildProfile.mark("partition writeback (\(total))", since: writebackStart)
+        return partition
+    }
+
+    /// The exact grouping logic of the former serial loop, restricted to one shard's entries
+    /// (already in scan order). All grouping state is keyed by the normalized title, which a
+    /// shard owns exclusively, so the per-shard result is identical to what the serial pass
+    /// produced for these keys — including refs order within each group. Entries carry their
+    /// key and year, so this scans contiguous memory instead of re-reading scattered items.
+    static func groupMediaShard(entries: [MediaRef]) -> MediaShardGroups {
+        var output = MediaShardGroups()
+        output.groups.reserveCapacity(entries.count)
+        // Most keys create their own group: reserve once instead of rehashing repeatedly.
+        output.datedGroups = Dictionary(minimumCapacity: entries.count)
+        /// Normalized title → its only dated group, or -1 when several years exist.
+        var yearsByKey: [String: Int] = [:]
+        var undatedGroups: [String: Int] = [:]
+        var pendingNoYear: [Int] = []
+
+        // Indexed field reads: binding each element would copy the key string per item.
+        for offset in entries.indices {
+            guard let year = entries[offset].year else {
+                pendingNoYear.append(offset)
+                continue
+            }
+            let dated = NameIdentity(key: entries[offset].key, year: year)
+            if let group = output.datedGroups[dated] {
+                output.groups[group].refs.append(entries[offset].ref)
+            } else {
+                let group = output.groups.count
+                output.groups.append(MediaGroup(name: dated, refs: [entries[offset].ref]))
+                output.datedGroups[dated] = group
+                yearsByKey[entries[offset].key] = yearsByKey[entries[offset].key] == nil ? group : -1
+            }
+        }
+        output.datedCount = output.groups.count
+        // A variant without a year joins the only dated group with the same key; otherwise an undated group.
+        for offset in pendingNoYear {
+            if let group = yearsByKey[entries[offset].key], group >= 0 {
+                output.groups[group].refs.append(entries[offset].ref)
+            } else if let group = undatedGroups[entries[offset].key] {
+                output.groups[group].refs.append(entries[offset].ref)
+            } else {
+                let group = output.groups.count
+                output.groups.append(MediaGroup(name: NameIdentity(key: entries[offset].key, year: nil), refs: [entries[offset].ref]))
+                undatedGroups[entries[offset].key] = group
+            }
+        }
+        return output
+    }
+
     static func groupMedia<V: GroupableMedia>(kind: MediaKind, lists: [[V]], keys: [[String]], context: Context) async -> MediaGroups {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return MediaGroups() }
@@ -379,76 +564,89 @@ public enum CatalogBuilder {
         let label = kind == .movie ? "movies" : "series"
         let phaseStart = ContinuousClock.now
 
-        var datedGroups: [NameIdentity: Int] = Dictionary(minimumCapacity: total)
-        /// Normalized title → its only dated group, or -1 when several years exist.
-        var yearsByKey: [String: Int] = Dictionary(minimumCapacity: total)
-        var undatedGroups: [String: Int] = [:]
+        // Sharded grouping: items partition by normalized key (same key → same shard, so the
+        // dated/undated reconciliation stays shard-local), shards group concurrently, and the
+        // merge reproduces the exact serial order — dated groups by first appearance in scan
+        // order, then undated groups by first appearance in the no-year scan.
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
+        let shards = max(2, workers * 2)
+        let partitionStart = ContinuousClock.now
+        let partition = await partitionMedia(lists: lists, keys: keys, context: context, kind: categoryKind, shards: shards)
+        BuildProfile.mark("\(label) partition scan", since: partitionStart)
+        guard !Task.isCancelled else { return MediaGroups() }
+        let shardStart = ContinuousClock.now
+        let shardGroups: [MediaShardGroups] = await withTaskGroup(of: (Int, MediaShardGroups, Double).self) { group in
+            for (shard, refs) in partition.shardRefs.enumerated() {
+                group.addTask {
+                    let start = ContinuousClock.now
+                    let groups = groupMediaShard(entries: refs)
+                    let elapsed = ContinuousClock.now - start
+                    return (shard, groups, Double(elapsed.components.seconds) * 1_000 + Double(elapsed.components.attoseconds) / 1e15)
+                }
+            }
+            var results = [MediaShardGroups?](repeating: nil, count: shards)
+            var times: [Double] = []
+            for await (shard, groups, elapsed) in group {
+                results[shard] = groups
+                times.append(elapsed)
+            }
+            if BuildProfile.enabled {
+                let slowest = times.sorted(by: >).prefix(4).map { String(format: "%.0f", $0) }.joined(separator: ",")
+                let totalMS = times.reduce(0, +)
+                FileHandle.standardError.write(Data("[profile] \(label) shards: \(times.count) tasks, total \(String(format: "%.0f", totalMS)) ms; slowest ms: \(slowest)\n".utf8))
+            }
+            return results.map { $0 ?? MediaShardGroups() }
+        }
+        BuildProfile.mark("\(label) shard tasks", since: shardStart)
+        let mergeGroupsStart = ContinuousClock.now
+        // Merge: the serial pass ordered groups by first appearance — dated groups in scan
+        // order, then undated groups in no-year scan order. The first ref of a group is the
+        // item that created it, so one composite ordinal (undated sets bit 62, sorting after
+        // every dated ordinal) reproduces that sequence with a single index sort. Only small
+        // tuples move here; the groups themselves are copied exactly once, in the permutation.
+        var flat: [(key: Int64, shard: Int32, group: Int32)] = []
+        var groupedCount = 0
+        for output in shardGroups { groupedCount += output.groups.count }
+        flat.reserveCapacity(groupedCount)
+        for (shard, output) in shardGroups.enumerated() {
+            for groupIndex in output.groups.indices {
+                let first = output.groups[groupIndex].refs[0]
+                var composite = Int64(first.catalog) << 32 | Int64(UInt32(bitPattern: first.item))
+                if groupIndex >= output.datedCount { composite |= 1 << 62 }
+                flat.append((composite, Int32(shard), Int32(groupIndex)))
+            }
+        }
+        let frozenFlat = flat
+        let mergeOrder = await parallelSortedIndices(count: frozenFlat.count) { frozenFlat[$0].key < frozenFlat[$1].key }
         var mediaGroups: [MediaGroup] = []
-        mediaGroups.reserveCapacity(total)
-        var pendingNoYear: [(key: String, ref: Ref)] = []
-        var resolvedCategories: [[String?]] = []
-        var adultFlags: [[Bool]] = []
-        var hasTMDBIdentity = false
-        var hasTaggedEditions = false
-
-        for (catalogIndex, list) in lists.enumerated() {
-            var cats = [String?](repeating: nil, count: list.count)
-            var adult = [Bool](repeating: false, count: list.count)
-            let resolver = context.resolver(catalog: catalogIndex, kind: categoryKind)
-            let listKeys = keys[catalogIndex]
-            // Indexed field reads: `enumerated()` would copy every whole item (see makeTitle).
-            for itemIndex in list.indices {
-                let category = list[itemIndex].categoryID.flatMap { resolver[$0] }
-                let isAdult = list[itemIndex].isAdult || category?.isAdult == true
-                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
-                if !hasTaggedEditions, !list[itemIndex].tags.isEmpty { hasTaggedEditions = true }
-                adult[itemIndex] = isAdult
-                cats[itemIndex] = category?.visibleID
-                if !hasTMDBIdentity, let tmdbID = list[itemIndex].tmdbID, tmdbID > 0 { hasTMDBIdentity = true }
-                let key = listKeys[itemIndex]
-                let ref = Ref(catalog: Int32(catalogIndex), item: Int32(itemIndex))
-                guard let year = list[itemIndex].year else {
-                    pendingNoYear.append((key, ref))
-                    continue
-                }
-                let dated = NameIdentity(key: key, year: year)
-                if let group = datedGroups[dated] {
-                    mediaGroups[group].refs.append(ref)
-                } else {
-                    let group = mediaGroups.count
-                    mediaGroups.append(MediaGroup(name: dated, refs: [ref]))
-                    datedGroups[dated] = group
-                    yearsByKey[key] = yearsByKey[key] == nil ? group : -1
-                }
-            }
-            resolvedCategories.append(cats)
-            adultFlags.append(adult)
+        mediaGroups.reserveCapacity(groupedCount)
+        // Per-shard map of local group index → merged position, for the editorial-alias lookup.
+        var positions = shardGroups.map { [Int](repeating: 0, count: $0.groups.count) }
+        for flatIndex in mergeOrder {
+            let entry = flat[flatIndex]
+            positions[Int(entry.shard)][Int(entry.group)] = mediaGroups.count
+            mediaGroups.append(shardGroups[Int(entry.shard)].groups[Int(entry.group)])
         }
-        // A variant without a year joins the only dated group with the same key; otherwise an undated group.
-        for (key, ref) in pendingNoYear {
-            if let group = yearsByKey[key], group >= 0 {
-                mediaGroups[group].refs.append(ref)
-            } else if let group = undatedGroups[key] {
-                mediaGroups[group].refs.append(ref)
-            } else {
-                let group = mediaGroups.count
-                mediaGroups.append(MediaGroup(name: NameIdentity(key: key, year: nil), refs: [ref]))
-                undatedGroups[key] = group
-            }
-        }
-        BuildProfile.mark("\(label) group-loop", since: phaseStart)
+        let datedLookup = DatedGroupLookup(shards: shards, dictionaries: shardGroups.map(\.datedGroups), positions: positions)
+        BuildProfile.mark("\(label) merge groups", since: mergeGroupsStart)
+        let resolvedCategories = partition.cats
+        let adultFlags = partition.adult
+        let hasTMDBIdentity = partition.hasTMDBIdentity
+        let hasTaggedEditions = partition.hasTaggedEditions
+        BuildProfile.mark("\(label) group-loop (sharded)", since: phaseStart)
 
         // Build titles in parallel chunks (variant sorting + metadata merge).
         guard !Task.isCancelled else { return MediaGroups() }
         let mergeStart = ContinuousClock.now
-        let namedGroups = mergeEditorialAliases(mediaGroups, datedGroups: datedGroups, kind: kind, lists: lists)
+        let namedGroups = mergeEditorialAliases(mediaGroups, lookup: datedLookup, kind: kind, lists: lists)
         BuildProfile.mark("\(label) editorial-aliases", since: mergeStart)
         let reconcileStart = ContinuousClock.now
         let frozenGroups = hasTMDBIdentity ? await reconcileMediaIdentities(namedGroups, lists: lists) : namedGroups
         BuildProfile.mark("\(label) reconcile-ids", since: reconcileStart)
         let groupCount = frozenGroups.count
-        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
-        let chunk = max(2_048, groupCount / (workers * 2))
+        // Smaller chunks even out the load: multi-variant groups cluster in real catalogs, and
+        // with only ~2 chunks per worker one heavy chunk otherwise bounds the whole phase.
+        let chunk = max(1_024, groupCount / (workers * 6))
         let frozenCategories = resolvedCategories, frozenAdult = adultFlags
         let plotsCleaned = context.catalogs.map(\.plotsCleaned)
         // Variant ordering hoisted out of the comparator: every item of a catalog shares its
@@ -519,48 +717,69 @@ public enum CatalogBuilder {
         guard !Task.isCancelled else { return MediaGroups() }
         let added = chunks.flatMap(\.added)
 
-        // Order: addedAt desc, then normalized title, then year.
+        // Order: addedAt desc, then normalized title, then year. Fields are compared through
+        // the subscripts: binding `let group = frozenGroups[…]` inside the comparator copies
+        // the struct (retaining its shared strings) millions of times per sort.
         let sortStart = ContinuousClock.now
         let order = await parallelSortedIndices(count: groupCount) { lhs, rhs in
             let a = added[lhs], b = added[rhs]
             if a != b { return a > b }
-            let left = frozenGroups[lhs], right = frozenGroups[rhs]
-            if left.name.key != right.name.key { return left.name.key < right.name.key }
-            if left.name.year != right.name.year { return (left.name.year ?? .min) < (right.name.year ?? .min) }
-            return (left.tmdbID ?? 0) < (right.tmdbID ?? 0)
+            if frozenGroups[lhs].name.key != frozenGroups[rhs].name.key { return frozenGroups[lhs].name.key < frozenGroups[rhs].name.key }
+            if frozenGroups[lhs].name.year != frozenGroups[rhs].name.year {
+                return (frozenGroups[lhs].name.year ?? .min) < (frozenGroups[rhs].name.year ?? .min)
+            }
+            return (frozenGroups[lhs].tmdbID ?? 0) < (frozenGroups[rhs].tmdbID ?? 0)
         }
         BuildProfile.mark("\(label) sort order", since: sortStart)
         guard !Task.isCancelled else { return MediaGroups() }
 
         let finalStart = ContinuousClock.now
 
-        @Sendable func title(at offset: Int) -> MediaTitle {
-            chunks[offset / chunk].titles[offset % chunk]
+        // Field reads through chained subscripts, never a binding of the whole MediaTitle
+        // (copying it costs ~10 retains of catalogue-shared strings/arrays, contended across
+        // cores — see the makeTitle chunks). The two dictionaries build in parallel over
+        // contiguous position ranges merged in order, which reproduces the serial pass exactly
+        // — even when a key collides (a tmdbID shared by year-conflicting groups), since later
+        // positions overwrite earlier ones in both the serial loop and the ordered merge.
+        let orderFrozen = order
+        let frozenChunks = chunks
+        async let titleIndex: [TitleID: Int] = parallelPositionIndex(positions: groupCount, workers: workers, minimumCapacity: groupCount) { position, index in
+            let groupIndex = orderFrozen[position]
+            let chunkIndex = groupIndex / chunk, offset = groupIndex % chunk
+            index[frozenChunks[chunkIndex].titles[offset].id] = position
+            if !frozenGroups[groupIndex].ambiguousName, !frozenGroups[groupIndex].aliases.isEmpty {
+                index[frozenGroups[groupIndex].name.id(kind: kind)] = position
+            }
+            for aliasIndex in frozenGroups[groupIndex].aliases.indices {
+                index[frozenGroups[groupIndex].aliases[aliasIndex].id(kind: kind)] = position
+            }
+            if let tmdbID = frozenGroups[groupIndex].tmdbID { index[TitleID(kind: kind, tmdbID: tmdbID)] = position }
         }
-        async let titles = order.map { title(at: $0) }
-        async let categories = order.map { title(at: $0).categoryIDs }
-        async let titleIndex: [TitleID: Int] = {
-            var index: [TitleID: Int] = Dictionary(minimumCapacity: groupCount)
-            for (position, group) in order.enumerated() {
-                let media = frozenGroups[group]
-                let id = title(at: group).id
-                index[id] = position
-                if !media.ambiguousName, !media.aliases.isEmpty { index[media.name.id(kind: kind)] = position }
-                for alias in media.aliases { index[alias.id(kind: kind)] = position }
-                if let tmdbID = media.tmdbID { index[TitleID(kind: kind, tmdbID: tmdbID)] = position }
+        async let contentIndex: [ContentID: Int] = parallelPositionIndex(positions: groupCount, workers: workers, minimumCapacity: total) { position, index in
+            let groupIndex = orderFrozen[position]
+            let variants = frozenChunks[groupIndex / chunk].titles[groupIndex % chunk].variants
+            for variantIndex in variants.indices {
+                index[variants[variantIndex].id] = position
             }
-            return index
-        }()
-        async let contentIndex: [ContentID: Int] = {
-            var index: [ContentID: Int] = Dictionary(minimumCapacity: total)
-            for (position, group) in order.enumerated() {
-                for variant in title(at: group).variants { index[variant.id] = position }
+        }
+        // Permutation: one copy per title (not two — the categories extraction is fused in).
+        async let permutation: (titles: [MediaTitle], categories: [Set<String>]) = {
+            var titles: [MediaTitle] = []
+            titles.reserveCapacity(groupCount)
+            var categories: [Set<String>] = []
+            categories.reserveCapacity(groupCount)
+            for position in 0..<groupCount {
+                let groupIndex = orderFrozen[position]
+                let chunkIndex = groupIndex / chunk, offset = groupIndex % chunk
+                categories.append(frozenChunks[chunkIndex].titles[offset].categoryIDs)
+                titles.append(frozenChunks[chunkIndex].titles[offset])
             }
-            return index
+            return (titles, categories)
         }()
-        let result = await MediaGroups(
-            titles: titles, titleIndex: titleIndex, contentIndex: contentIndex,
-            categoryIDs: categories, hasTaggedEditions: hasTaggedEditions
+        let permuted = await permutation
+        let result = MediaGroups(
+            titles: permuted.titles, titleIndex: await titleIndex, contentIndex: await contentIndex,
+            categoryIDs: permuted.categories, hasTaggedEditions: hasTaggedEditions
         )
         BuildProfile.mark("\(label) final indexes", since: finalStart)
         return result
@@ -568,8 +787,25 @@ public enum CatalogBuilder {
 
     /// Link known translations only when the exact release year agrees and provider IDs don't conflict.
     /// Saved versions keep resolving through the old grouping keys.
+    /// Index of a dated group in the merged array, served by the per-shard grouping
+    /// dictionaries (the shard of a key is a pure function of the key). Rebuilding one global
+    /// dictionary would re-hash every normalized title for the sake of the few hundred
+    /// editorial-alias lookups.
+    struct DatedGroupLookup: Sendable {
+        var shards: Int
+        var dictionaries: [[NameIdentity: Int]]
+        /// Per shard: local group index → position in the merged array.
+        var positions: [[Int]]
+
+        func group(for name: NameIdentity) -> Int? {
+            let shard = shardIndex(for: name.key, shards: shards)
+            guard shard < dictionaries.count, let local = dictionaries[shard][name], local < positions[shard].count else { return nil }
+            return positions[shard][local]
+        }
+    }
+
     private static func mergeEditorialAliases<V: GroupableMedia>(
-        _ groups: [MediaGroup], datedGroups: [NameIdentity: Int], kind: MediaKind, lists: [[V]]
+        _ groups: [MediaGroup], lookup: DatedGroupLookup, kind: MediaKind, lists: [[V]]
     ) -> [MediaGroup] {
         var replacements: [Int: MediaGroup] = [:]
         var removed: Set<Int> = []
@@ -577,7 +813,7 @@ public enum CatalogBuilder {
             for entry in shelf where entry.kind == kind {
                 var offsets: [Int] = []
                 for key in entry.aliasKeys {
-                    guard let offset = datedGroups[NameIdentity(key: key, year: entry.year)],
+                    guard let offset = lookup.group(for: NameIdentity(key: key, year: entry.year)),
                           !removed.contains(offset), replacements[offset] == nil, !offsets.contains(offset)
                     else { continue }
                     offsets.append(offset)
@@ -759,6 +995,41 @@ public enum CatalogBuilder {
             }
         }
         return runs.first ?? []
+    }
+
+    /// Lookup table built in parallel over contiguous position ranges. Each range inserts into
+    /// a partial dictionary in position order; partials then merge in range order with later
+    /// positions winning — the exact overwrite sequence of the serial loop, so even colliding
+    /// keys resolve identically. Insertion is the expensive part on string keys (150k+ entries),
+    /// and it dominates the serial merge of the small partials.
+    static func parallelPositionIndex<Key: Hashable & Sendable>(
+        positions: Int, workers: Int, minimumCapacity: Int,
+        inserts: @escaping @Sendable (Int, inout [Key: Int]) -> Void
+    ) async -> [Key: Int] {
+        guard positions >= 8_192, workers > 1 else {
+            var index: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity)
+            for position in 0..<positions { inserts(position, &index) }
+            return index
+        }
+        let chunk = (positions + workers - 1) / workers
+        let partials: [(Int, [Key: Int])] = await withTaskGroup(of: (Int, [Key: Int]).self) { group in
+            for lower in stride(from: 0, to: positions, by: chunk) {
+                let upper = min(lower + chunk, positions)
+                group.addTask {
+                    var partial: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity / workers + 1)
+                    for position in lower..<upper { inserts(position, &partial) }
+                    return (lower, partial)
+                }
+            }
+            var parts: [(Int, [Key: Int])] = []
+            for await part in group { parts.append(part) }
+            return parts
+        }
+        var index: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity)
+        for (_, partial) in partials.sorted(by: { $0.0 < $1.0 }) {
+            index.merge(partial) { _, new in new }
+        }
+        return index
     }
 
     /// Stable merge of two sorted runs (ties keep `left` first).
@@ -1010,40 +1281,157 @@ public enum CatalogBuilder {
         var categoryIDs: [Set<String>] = []
     }
 
+    /// A visible channel reference with its resolved grouping inputs, pre-computed in the
+    /// parallel partition scan so shard grouping never re-reads the scattered source items.
+    struct ChannelRef: Sendable {
+        var key: String
+        var ref: Ref
+        var visibleCategory: String?
+        var isAdult: Bool
+    }
+
+    /// Per-chunk output of the channel partition scan.
+    struct ChannelPartitionChunk: Sendable {
+        var listIndex = 0
+        var lower = 0
+        var buckets: [[ChannelRef]] = []
+    }
+
+    /// Grouping output of one channel shard, in local first-appearance order.
+    struct ChannelShardGroups: Sendable {
+        var keys: [String] = []
+        /// Scan position (catalog, item packed) of each group's first channel: orders the merge.
+        var ordinals: [Int64] = []
+        var members: [[Channel]] = []
+        var categoryIDs: [Set<String>] = []
+        var adultFlags: [Bool] = []
+    }
+
+    /// The exact grouping logic of the former serial channel loop, restricted to one shard's
+    /// entries (already in scan order): group creation order and per-group member order match
+    /// what the serial pass produced for these keys.
+    static func groupChannelShard(entries: [ChannelRef], lists: [[Channel]]) -> ChannelShardGroups {
+        var groupIndex: [String: Int] = [:]
+        var output = ChannelShardGroups()
+        // Indexed reads: binding each entry would copy its key string per item. Copying the
+        // channel itself into its group is inherent — `ChannelGroup` owns its variants.
+        for offset in entries.indices {
+            let key = entries[offset].key
+            let group: Int
+            if let existing = groupIndex[key] {
+                group = existing
+            } else {
+                group = output.keys.count
+                groupIndex[key] = group
+                output.keys.append(key)
+                output.ordinals.append(Int64(entries[offset].ref.catalog) << 32 | Int64(UInt32(bitPattern: entries[offset].ref.item)))
+                output.members.append([])
+                output.categoryIDs.append([])
+                output.adultFlags.append(false)
+            }
+            output.members[group].append(lists[Int(entries[offset].ref.catalog)][Int(entries[offset].ref.item)])
+            if let visible = entries[offset].visibleCategory { output.categoryIDs[group].insert(visible) }
+            if entries[offset].isAdult { output.adultFlags[group] = true }
+        }
+        return output
+    }
+
     static func groupChannels(lists: [[Channel]], keys: [[String]], context: Context) async -> ChannelGroups {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return ChannelGroups() }
         let phaseStart = ContinuousClock.now
-        var groupIndex: [String: Int] = Dictionary(minimumCapacity: total)
-        var groupKeys: [String] = []
-        var members: [[Channel]] = []
-        var categoryIDs: [Set<String>] = []
-        var adultFlags: [Bool] = []
 
-        for (catalogIndex, list) in lists.enumerated() {
-            let resolver = context.resolver(catalog: catalogIndex, kind: .live)
-            for (itemIndex, channel) in list.enumerated() {
-                let category = channel.categoryID.flatMap { resolver[$0] }
-                let isAdult = channel.isAdult || category?.isAdult == true
-                if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
-                let key = keys[catalogIndex][itemIndex]
-                let group: Int
-                if let existing = groupIndex[key] {
-                    group = existing
-                } else {
-                    group = groupKeys.count
-                    groupIndex[key] = group
-                    groupKeys.append(key)
-                    members.append([])
-                    categoryIDs.append([])
-                    adultFlags.append(false)
+        // Same sharding as the media grouping: the parallel scan filters and buckets channel
+        // refs per key shard, shards group concurrently, and merging by first-appearance
+        // ordinal reproduces the exact serial group and member order.
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 12))
+        let shards = max(2, workers * 2)
+        let chunk = max(2_048, total / (workers * 2))
+
+        let chunks: [ChannelPartitionChunk] = await withTaskGroup(of: ChannelPartitionChunk.self) { group in
+            for (listIndex, list) in lists.enumerated() {
+                let resolver = context.resolver(catalog: listIndex, kind: .live)
+                let listKeys = keys[listIndex]
+                var start = 0
+                while start < list.count {
+                    let end = min(start + chunk, list.count)
+                    let lower = start
+                    group.addTask {
+                        var out = ChannelPartitionChunk(listIndex: listIndex, lower: lower)
+                        out.buckets = [[ChannelRef]](repeating: [], count: shards)
+                        guard !Task.isCancelled else { return out }
+                        // Indexed reads: `enumerated()` would copy every whole `Channel`
+                        // (a large struct) just for the scan.
+                        for index in lower..<end {
+                            let category = list[index].categoryID.flatMap { resolver[$0] }
+                            let isAdult = list[index].isAdult || category?.isAdult == true
+                            if category?.isHidden == true || (isAdult && context.options.hideAdult) { continue }
+                            let shard = shardIndex(for: listKeys[index], shards: shards)
+                            out.buckets[shard].append(ChannelRef(
+                                key: listKeys[index],
+                                ref: Ref(catalog: Int32(listIndex), item: Int32(index)),
+                                visibleCategory: category?.visibleID, isAdult: isAdult
+                            ))
+                        }
+                        return out
+                    }
+                    start = end
                 }
-                members[group].append(channel)
-                if let visible = category?.visibleID { categoryIDs[group].insert(visible) }
-                if isAdult { adultFlags[group] = true }
+            }
+            var collected: [ChannelPartitionChunk] = []
+            for await chunk in group { collected.append(chunk) }
+            return collected.sorted { ($0.listIndex, $0.lower) < ($1.listIndex, $1.lower) }
+        }
+
+        var shardRefs = [[ChannelRef]](repeating: [], count: shards)
+        let average = max(1, total / shards)
+        for shard in shardRefs.indices { shardRefs[shard].reserveCapacity(average) }
+        for chunk in chunks {
+            for shard in chunk.buckets.indices where !chunk.buckets[shard].isEmpty {
+                shardRefs[shard].append(contentsOf: chunk.buckets[shard])
             }
         }
-        BuildProfile.mark("channels group-loop", since: phaseStart)
+        guard !Task.isCancelled else { return ChannelGroups() }
+
+        let shardGroups: [ChannelShardGroups] = await withTaskGroup(of: (Int, ChannelShardGroups).self) { group in
+            for (shard, entries) in shardRefs.enumerated() {
+                group.addTask { (shard, groupChannelShard(entries: entries, lists: lists)) }
+            }
+            var results = [ChannelShardGroups?](repeating: nil, count: shards)
+            for await (shard, groups) in group { results[shard] = groups }
+            return results.map { $0 ?? ChannelShardGroups() }
+        }
+
+        // Merge in first-appearance order: within a shard groups are already ordered, the
+        // ordinal sort restores the exact serial sequence across shards.
+        var positions: [(ordinal: Int64, shard: Int32, group: Int32)] = []
+        var groupTotal = 0
+        for (shard, output) in shardGroups.enumerated() {
+            groupTotal += output.keys.count
+            for groupIndex in output.keys.indices {
+                positions.append((output.ordinals[groupIndex], Int32(shard), Int32(groupIndex)))
+            }
+        }
+        let frozenPositions = positions
+        let mergeOrder = await parallelSortedIndices(count: frozenPositions.count) { frozenPositions[$0].ordinal < frozenPositions[$1].ordinal }
+        var groupKeys: [String] = []
+        groupKeys.reserveCapacity(groupTotal)
+        var members: [[Channel]] = []
+        members.reserveCapacity(groupTotal)
+        var categoryIDs: [Set<String>] = []
+        categoryIDs.reserveCapacity(groupTotal)
+        var adultFlags: [Bool] = []
+        adultFlags.reserveCapacity(groupTotal)
+        for index in mergeOrder {
+            let position = positions[index]
+            let output = shardGroups[Int(position.shard)]
+            let groupIndex = Int(position.group)
+            groupKeys.append(output.keys[groupIndex])
+            members.append(output.members[groupIndex])
+            categoryIDs.append(output.categoryIDs[groupIndex])
+            adultFlags.append(output.adultFlags[groupIndex])
+        }
+        BuildProfile.mark("channels group-loop (sharded)", since: phaseStart)
 
         let buildStart = ContinuousClock.now
         var groups: [ChannelGroup] = []
@@ -1121,7 +1509,7 @@ public enum CatalogBuilder {
         var members: [String: [Int32]] = [:]
     }
 
-    static func categoryGroups(kind: MediaKind, context: Context, memberCategoryIDs: [Set<String>]) -> CategoryResult {
+    static func categoryGroups(kind: MediaKind, context: Context, memberCategoryIDs: [Set<String>]) async -> CategoryResult {
         let start = ContinuousClock.now
         var output = CategoryResult()
         var groups: [CategoryGroup] = []
@@ -1157,21 +1545,54 @@ public enum CatalogBuilder {
         }
         guard !groups.isEmpty else { return output }
 
-        var members = [[Int32]](repeating: [], count: groups.count)
-        for (index, categoryIDs) in memberCategoryIDs.enumerated() where !categoryIDs.isEmpty {
-            if categoryIDs.count == 1, let only = categoryIDs.first {
-                if let groupID = output.categoryToGroup[only], let group = groupByKey[groupID] {
-                    members[group].append(Int32(index))
+        // Titles are bucketed into member lists in index order. The loop parallelizes over
+        // contiguous index ranges, each producing per-group partial lists concatenated in range
+        // order afterwards — the same ascending member lists as the serial pass.
+        let categoryToGroup = output.categoryToGroup
+        let frozenGroupByKey = groupByKey
+        func collect(into members: inout [[Int32]], range: Range<Int>) {
+            for index in range where !memberCategoryIDs[index].isEmpty {
+                let categoryIDs = memberCategoryIDs[index]
+                if categoryIDs.count == 1, let only = categoryIDs.first {
+                    if let groupID = categoryToGroup[only], let group = frozenGroupByKey[groupID] {
+                        members[group].append(Int32(index))
+                    }
+                    continue
                 }
-                continue
-            }
-            var seen: Set<Int> = []
-            for categoryID in categoryIDs {
-                guard let groupID = output.categoryToGroup[categoryID], let group = groupByKey[groupID] else { continue }
-                if seen.insert(group).inserted { members[group].append(Int32(index)) }
+                var seen: Set<Int> = []
+                for categoryID in categoryIDs {
+                    guard let groupID = categoryToGroup[categoryID], let group = frozenGroupByKey[groupID] else { continue }
+                    if seen.insert(group).inserted { members[group].append(Int32(index)) }
+                }
             }
         }
-        // Titles are visited in catalog order, so every member list is already sorted.
+        let groupTotal = groups.count
+        var members = [[Int32]](repeating: [], count: groupTotal)
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        if memberCategoryIDs.count >= 8_192, workers > 1 {
+            let chunk = (memberCategoryIDs.count + workers * 2 - 1) / (workers * 2)
+            var partials: [(Int, [[Int32]])] = await withTaskGroup(of: (Int, [[Int32]]).self) { taskGroup in
+                for lower in stride(from: 0, to: memberCategoryIDs.count, by: chunk) {
+                    let upper = min(lower + chunk, memberCategoryIDs.count)
+                    taskGroup.addTask {
+                        var partial = [[Int32]](repeating: [], count: groupTotal)
+                        collect(into: &partial, range: lower..<upper)
+                        return (lower, partial)
+                    }
+                }
+                var collected: [(Int, [[Int32]])] = []
+                for await part in taskGroup { collected.append(part) }
+                return collected
+            }
+            partials.sort { $0.0 < $1.0 }
+            for (_, partial) in partials {
+                for group in partial.indices where !partial[group].isEmpty {
+                    members[group].append(contentsOf: partial[group])
+                }
+            }
+        } else {
+            collect(into: &members, range: 0..<memberCategoryIDs.count)
+        }
 
         var result: [CategoryGroup] = []
         result.reserveCapacity(groups.count)
@@ -1188,39 +1609,71 @@ public enum CatalogBuilder {
 
     // MARK: - Rankings
 
-    static func featuredRanking(_ titles: [MediaTitle], poolSize: Int = 60) -> [Int32] {
+    /// Per-title scoring in parallel chunks with indexed field reads — binding each MediaTitle
+    /// would copy a struct with ~15 catalogue-shared references per title, contended across
+    /// cores. The entries feed `topIndices`, whose tie-break on the title index makes the
+    /// outcome a pure function of the entry set: chunking cannot change the result.
+    static func parallelScored(
+        _ count: Int,
+        score: @escaping @Sendable (Int) -> (score: Double, index: Int32)?
+    ) async -> [(score: Double, index: Int32)] {
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        guard count >= 8_192, workers > 1 else {
+            var scored: [(score: Double, index: Int32)] = []
+            scored.reserveCapacity(count)
+            for index in 0..<count { if let entry = score(index) { scored.append(entry) } }
+            return scored
+        }
+        let chunk = (count + workers * 4 - 1) / (workers * 4)
+        let parts: [(Int, [(score: Double, index: Int32)])] = await withTaskGroup(of: (Int, [(score: Double, index: Int32)]).self) { group in
+            for lower in stride(from: 0, to: count, by: chunk) {
+                let upper = min(lower + chunk, count)
+                group.addTask {
+                    var scored: [(score: Double, index: Int32)] = []
+                    scored.reserveCapacity(upper - lower)
+                    for index in lower..<upper { if let entry = score(index) { scored.append(entry) } }
+                    return (lower, scored)
+                }
+            }
+            var collected: [(Int, [(score: Double, index: Int32)])] = []
+            for await part in group { collected.append(part) }
+            return collected
+        }
+        return parts.sorted { $0.0 < $1.0 }.flatMap(\.1)
+    }
+
+    static func featuredRanking(_ titles: [MediaTitle], poolSize: Int = 60) async -> [Int32] {
         guard !titles.isEmpty else { return [] }
         let newest = titles.lazy.compactMap(\.addedAt).max()
-        var scored: [(score: Double, index: Int32)] = []
-        scored.reserveCapacity(titles.count)
-        for (index, title) in titles.enumerated() {
+        let frozenTitles = titles
+        let scored = await parallelScored(titles.count) { index in
             var score = 0.0
-            if title.$backdropURL != nil { score += 100 }
-            if title.$posterURL != nil {
-                score += (title.plot?.utf8.count ?? 0) >= 40 ? 40 : 10
-            } else if (title.plot?.utf8.count ?? 0) >= 40 {
+            if frozenTitles[index].$backdropURL != nil { score += 100 }
+            if frozenTitles[index].$posterURL != nil {
+                score += (frozenTitles[index].plot?.utf8.count ?? 0) >= 40 ? 40 : 10
+            } else if (frozenTitles[index].plot?.utf8.count ?? 0) >= 40 {
                 score += 5
             }
-            if let rating = title.rating { score += min(max(rating, 0), 10) * 2 }
-            if let newest, let added = title.addedAt {
+            if let rating = frozenTitles[index].rating { score += min(max(rating, 0), 10) * 2 }
+            if let newest, let added = frozenTitles[index].addedAt {
                 let days = max(0, newest.timeIntervalSince(added) / 86_400)
                 score += max(0, 30 - days / 6)
             }
-            score += Double(min(title.variants.count, 4))
-            if title.isAdult { score -= 1_000 }
-            scored.append((score, Int32(index)))
+            score += Double(min(frozenTitles[index].variants.count, 4))
+            if frozenTitles[index].isAdult { score -= 1_000 }
+            return (score, Int32(index))
         }
         return topIndices(scored, count: poolSize)
     }
 
-    static func ratingRanking(_ titles: [MediaTitle], poolSize: Int = 300) -> [Int32] {
-        var scored: [(score: Double, index: Int32)] = []
-        for (index, title) in titles.enumerated() {
-            guard let rating = title.rating, rating > 0, !title.isAdult else { continue }
+    static func ratingRanking(_ titles: [MediaTitle], poolSize: Int = 300) async -> [Int32] {
+        let frozenTitles = titles
+        let scored = await parallelScored(titles.count) { index in
+            guard let rating = frozenTitles[index].rating, rating > 0, !frozenTitles[index].isAdult else { return nil }
             var score = min(rating, 10) * 1_000
-            if title.$posterURL != nil { score += 10 }
-            score += Double(min(title.variants.count, 9))
-            scored.append((score, Int32(index)))
+            if frozenTitles[index].$posterURL != nil { score += 10 }
+            score += Double(min(frozenTitles[index].variants.count, 9))
+            return (score, Int32(index))
         }
         return topIndices(scored, count: poolSize)
     }
