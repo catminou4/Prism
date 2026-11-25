@@ -90,9 +90,12 @@ public enum RecommendationBuilder {
             ], editorialCopy: [:])
         }
         var editorialCopy: [TitleID: Recommendations.EditorialCopy] = [:]
+        let matchStart = ContinuousClock.now
+        var candidates = 0
         let editorial = EditorialSelection.shelves.map { shelf in
             shelf.map { entry in
                 entry.matches(in: catalog).map { title in
+                    candidates += 1
                     let copy = editorialCopy[title.id] ?? .init(
                         title: entry.name, plot: homePlot(for: title), originalLanguage: entry.originalLanguage
                     )
@@ -104,6 +107,7 @@ public enum RecommendationBuilder {
                 }
             }
         }
+        BuildProfile.mark("editorial matches+candidates (\(candidates))", since: matchStart)
 
         let choices: [Set<HomeAudioLanguage>] = [HomeAudioLanguage.defaults, [.french], [.english]]
         let curatedChoices = choices.map { languages in
@@ -121,6 +125,7 @@ public enum RecommendationBuilder {
             }
         }
 
+        let assemblyStart = ContinuousClock.now
         var selections: [Set<HomeAudioLanguage>: RecommendationSelection] = [:]
         for (languages, curated) in zip(choices, curatedChoices) {
             let spotlight = interleaved(curated.map(artworkFirst), limit: 7)
@@ -129,6 +134,7 @@ public enum RecommendationBuilder {
                 french: curated[0], american: curated[1], discoveries: curated[2], wellRated: []
             )
         }
+        BuildProfile.mark("editorial selection assembly", since: assemblyStart)
         return Recommendations(selections: selections, editorialCopy: editorialCopy)
     }
 
