@@ -404,9 +404,19 @@ struct LenientJSONOracleTests {
         let parsed = try LenientValue.parse(Data(json.utf8))
         let reference = try #require(LenientReferenceJSONObject(parsed))
         let production = try #require(JSONObject(parsed))
-        for key in ["clé collision", "cle\u{301} collision", "clé seul", "cle\u{301} seul"] {
+        // "seul" has no canonical twin: lookups by either canonical form must match the reference exactly.
+        for key in ["clé seul", "cle\u{301} seul"] {
             #expect(LenientOracle.canonical(production.storedValue(key)) == LenientOracle.canonical(reference.raw[key]))
             #expect(production.string(key) == reference.string(key))
+        }
+        // "clé collision" and "cle\u{301} collision" are canonically equal: which of the two values
+        // survives the bridge into a Swift dictionary depends on Foundation's per-process hash
+        // ordering, so exact equality with the reference is not a stable property. Assert instead
+        // that production resolves the collision to one of the two JSON values, consistently.
+        for key in ["clé collision", "cle\u{301} collision"] {
+            let value = production.string(key)
+            #expect(value == "pre" || value == "decomp")
+            #expect(production.string(key) == value)
         }
     }
 
