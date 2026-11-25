@@ -20,14 +20,7 @@ public struct EPGGuide: Sendable {
 
     public init(programs: [EPGProgram], channels: [XMLTVChannel] = []) {
         let grouped = Self.groupPrograms(programs)
-        var cleaned: [String: [EPGProgram]] = Dictionary(minimumCapacity: grouped.count)
-        var count = 0
-        for (id, list) in grouped {
-            let normalized = Self.normalize(list)
-            guard !normalized.isEmpty else { continue }
-            cleaned[id] = normalized
-            count += normalized.count
-        }
+        let (cleaned, count) = Self.normalizeChannels(grouped)
         var channelsByID: [String: XMLTVChannel] = [:]
         for channel in channels {
             let id = channel.id.trimmingCharacters(in: .whitespaces).lowercased()
@@ -122,26 +115,82 @@ public struct EPGGuide: Sendable {
     public static func merged(_ guides: [EPGGuide]) -> EPGGuide {
         let filled = guides.filter { !$0.programsByChannel.isEmpty || !$0.channelsByID.isEmpty }
         guard filled.count > 1 else { return filled.first ?? .empty }
-        var programs = filled[0].programsByChannel
         var channels = filled[0].channelsByID
-        var count = filled[0].programCount
         for other in filled.dropFirst() {
-            for (id, list) in other.programsByChannel {
-                if let existing = programs[id] {
-                    // Both lists are already sorted and cleaned: a linear merge replaces a re-sort.
-                    let merged = clean(mergeSorted(existing, list))
-                    count += merged.count - existing.count
-                    programs[id] = merged
-                } else {
-                    programs[id] = list
-                    count += list.count
-                }
-            }
             for (id, channel) in other.channelsByID where channels[id] == nil {
                 channels[id] = channel
             }
         }
+        let (programs, count) = mergePrograms(filled)
         return EPGGuide(programsByChannel: programs, channelsByID: channels, programCount: count)
+    }
+
+    /// Per-channel merge of the guides' programme lists. The union pass keeps the first
+    /// occurrence of a channel untouched (no copy, like the serial loop) and collects the
+    /// lists of contested channels in guide order; only those fold — `mergeSorted` is stable
+    /// with the first list winning ties, then `clean` — which is exactly the serial loop's
+    /// semantics. Contested channels are independent and ids unique, so large folds run on
+    /// contiguous id slices in parallel with a deterministic result.
+    private static func mergePrograms(_ filled: [EPGGuide]) -> (programs: [String: [EPGProgram]], count: Int) {
+        var programs: [String: [EPGProgram]] = [:]
+        programs.reserveCapacity(filled.reduce(0) { $0 + $1.channelCount })
+        var contested: [String: [[EPGProgram]]] = [:]
+        var contestedVolume = 0
+        for guide in filled {
+            for (id, list) in guide.programsByChannel {
+                if contested[id] != nil {
+                    contested[id]?.append(list)
+                    contestedVolume += list.count
+                } else if let existing = programs[id] {
+                    contested[id] = [existing, list]
+                    contestedVolume += existing.count + list.count
+                } else {
+                    programs[id] = list
+                }
+            }
+        }
+
+        func fold(_ parts: [[EPGProgram]]) -> [EPGProgram] {
+            var result = parts[parts.startIndex]
+            for list in parts.dropFirst() {
+                // Both lists are already sorted and cleaned: a linear merge replaces a re-sort.
+                result = clean(mergeSorted(result, list))
+            }
+            return result
+        }
+
+        if contestedVolume >= 32_768, contested.count >= 2 {
+            let ids = Array(contested.keys)
+            // ~4 slices per worker: uneven channel volumes balance out without tiny slices
+            // paying merge overhead. `concurrentPerform` hands slices to cores dynamically.
+            let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+            let slices = min(ids.count, workers * 4)
+            let bounds = (0...slices).map { $0 * ids.count / slices }
+            let partials: Mutex<[Int: [String: [EPGProgram]]]> = Mutex([:])
+            DispatchQueue.concurrentPerform(iterations: slices) { slice in
+                var local: [String: [EPGProgram]] = [:]
+                local.reserveCapacity(bounds[slice + 1] - bounds[slice])
+                for index in bounds[slice]..<bounds[slice + 1] {
+                    let id = ids[index]
+                    guard let parts = contested[id] else { continue }
+                    local[id] = fold(parts)
+                }
+                partials.withLock { $0[slice] = local }
+            }
+            for slice in 0..<slices {
+                guard let local = partials.withLock({ $0[slice] }) else { continue }
+                for (id, merged) in local {
+                    programs[id] = merged
+                }
+            }
+        } else {
+            for (id, parts) in contested {
+                programs[id] = fold(parts)
+            }
+        }
+        var count = 0
+        for (_, list) in programs { count += list.count }
+        return (programs, count)
     }
 
     // MARK: - Internals
@@ -219,6 +268,56 @@ public struct EPGGuide: Sendable {
             if let id = nameIndex[key] { return id }
         }
         return nil
+    }
+
+    /// Runs `normalize` over every channel of `grouped`, dropping channels left empty.
+    /// Channels are independent and ids are unique keys, so contiguous id slices normalize
+    /// in parallel and their partial maps merge deterministically regardless of scheduling.
+    private static func normalizeChannels(_ grouped: [String: [EPGProgram]]) -> (programs: [String: [EPGProgram]], count: Int) {
+        var total = 0
+        for (_, list) in grouped { total += list.count }
+        guard total >= 32_768, !grouped.isEmpty else {
+            var cleaned: [String: [EPGProgram]] = Dictionary(minimumCapacity: grouped.count)
+            var count = 0
+            for (id, list) in grouped {
+                let normalized = normalize(list)
+                guard !normalized.isEmpty else { continue }
+                cleaned[id] = normalized
+                count += normalized.count
+            }
+            return (cleaned, count)
+        }
+        let ids = Array(grouped.keys)
+        // ~4 slices per worker: uneven channel volumes balance out without tiny slices
+        // paying merge overhead. `concurrentPerform` hands slices to cores dynamically.
+        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+        let slices = min(ids.count, workers * 4)
+        let bounds = (0...slices).map { $0 * ids.count / slices }
+        let partials: Mutex<[Int: (programs: [String: [EPGProgram]], count: Int)]> = Mutex([:])
+        DispatchQueue.concurrentPerform(iterations: slices) { slice in
+            var local: [String: [EPGProgram]] = [:]
+            local.reserveCapacity(bounds[slice + 1] - bounds[slice])
+            var count = 0
+            for index in bounds[slice]..<bounds[slice + 1] {
+                let id = ids[index]
+                guard let list = grouped[id] else { continue }
+                let normalized = normalize(list)
+                guard !normalized.isEmpty else { continue }
+                local[id] = normalized
+                count += normalized.count
+            }
+            partials.withLock { $0[slice] = (local, count) }
+        }
+        var cleaned: [String: [EPGProgram]] = Dictionary(minimumCapacity: grouped.count)
+        var count = 0
+        for slice in 0..<slices {
+            guard let local = partials.withLock({ $0[slice] }) else { continue }
+            for (id, list) in local.programs {
+                cleaned[id] = list
+            }
+            count += local.count
+        }
+        return (cleaned, count)
     }
 
     /// Sorted by start; drops empty/duplicate programmes and trims overlaps (earlier programme ends
