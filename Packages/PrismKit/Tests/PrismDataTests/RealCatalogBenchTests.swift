@@ -45,6 +45,33 @@ struct RealCatalogBenchTests {
         )
     }
 
+
+    private static func expectSameCatalog(_ actual: Catalog, _ expected: Catalog) {
+        #expect(actual.sources == expected.sources)
+        #expect(actual.channels == expected.channels)
+        #expect(actual.movies == expected.movies)
+        #expect(actual.series == expected.series)
+        #expect(actual.liveCategories == expected.liveCategories)
+        #expect(actual.movieCategories == expected.movieCategories)
+        #expect(actual.seriesCategories == expected.seriesCategories)
+        #expect(actual.indexes.categories == expected.indexes.categories)
+        #expect(actual.indexes.sourceIndex == expected.indexes.sourceIndex)
+        #expect(actual.indexes.categoryGroups == expected.indexes.categoryGroups)
+        #expect(actual.indexes.categoryToGroup == expected.indexes.categoryToGroup)
+        #expect(actual.indexes.movieByTitleID == expected.indexes.movieByTitleID)
+        #expect(actual.indexes.seriesByTitleID == expected.indexes.seriesByTitleID)
+        #expect(actual.indexes.movieByContent == expected.indexes.movieByContent)
+        #expect(actual.indexes.seriesByContent == expected.indexes.seriesByContent)
+        #expect(actual.indexes.channelByContent == expected.indexes.channelByContent)
+        #expect(actual.indexes.channelByGroupID == expected.indexes.channelByGroupID)
+        #expect(actual.indexes.categoryLanguages == expected.indexes.categoryLanguages)
+        #expect(actual.indexes.groupMembers == expected.indexes.groupMembers)
+        #expect(actual.indexes.featuredMovies == expected.indexes.featuredMovies)
+        #expect(actual.indexes.featuredSeries == expected.indexes.featuredSeries)
+        #expect(actual.indexes.topRatedMovies == expected.indexes.topRatedMovies)
+        #expect(actual.indexes.topRatedSeries == expected.indexes.topRatedSeries)
+    }
+
     @Test func launchPipeline() async throws {
         let directories = Self.containerDirectories
         let store = SourceStore(directories: directories)
@@ -81,6 +108,93 @@ struct RealCatalogBenchTests {
         let buildMS = Self.ms(buildStart, clock.now)
         let buildCPUEnd = Self.cpuUserSystem
         print("[real-bench] CatalogBuilder.build: \(String(format: "%.1f", buildMS)) ms — \(catalog.movies.count) films groupés, \(catalog.series.count) séries groupées — user \(String(format: "%.0f", (buildCPUEnd.user - buildCPUStart.user) * 1000)) ms, sys \(String(format: "%.0f", (buildCPUEnd.system - buildCPUStart.system) * 1000)) ms")
+
+        // Derived-artifact probe. The real container is never written: compressed source-cache
+        // files are copied to a temporary cache root, so `BuiltCatalogCache` follows exactly its
+        // production validate → decode path (including its input fingerprint checks).
+        let artifactDirectories = AppDirectories.temporary("real-artifact-bench")
+        defer { try? FileManager.default.removeItem(at: artifactDirectories.caches); try? FileManager.default.removeItem(at: artifactDirectories.root) }
+        do {
+            for source in sources {
+                try FileManager.default.copyItem(at: directories.catalogCacheFile(for: source.id), to: artifactDirectories.catalogCacheFile(for: source.id))
+            }
+            let artifactCache = BuiltCatalogCache(directories: artifactDirectories)
+            let artifactWriteStart = clock.now
+            let artifactWriteCPUStart = Self.cpuUserSystem
+            await artifactCache.save(
+                catalog: catalog, sources: sources, catalogs: catalogs, options: CatalogBuildOptions(),
+                generation: UInt64(Date.now.timeIntervalSince1970 * 1_000_000)
+            )
+            let artifactWriteMS = Self.ms(artifactWriteStart, clock.now)
+            let artifactWriteCPUEnd = Self.cpuUserSystem
+            let artifactBytes = (try? Data(contentsOf: artifactDirectories.builtCatalogFile).count) ?? 0
+            let sourceCacheBytes = try sources.reduce(0) { $0 + (try Data(contentsOf: directories.catalogCacheFile(for: $1.id), options: [.mappedIfSafe]).count) }
+            print("[real-bench] artifact write: \(String(format: "%.1f", artifactWriteMS)) ms, CPU \(String(format: "%.0f", (artifactWriteCPUEnd.user + artifactWriteCPUEnd.system - artifactWriteCPUStart.user - artifactWriteCPUStart.system) * 1000)) ms, size \(String(format: "%.1f", Double(artifactBytes) / 1_048_576)) MiB vs \(String(format: "%.1f", Double(sourceCacheBytes) / 1_048_576)) MiB source caches")
+
+            let firstArtifactStart = clock.now
+            let firstArtifactCPUStart = Self.cpuUserSystem
+            guard let firstArtifact = await artifactCache.load(sources: sources, options: CatalogBuildOptions()) else {
+                Issue.record("real artifact did not validate/decode")
+                throw CancellationError()
+            }
+            let firstArtifactMS = Self.ms(firstArtifactStart, clock.now)
+            let firstArtifactCPUEnd = Self.cpuUserSystem
+            Self.expectSameCatalog(firstArtifact, catalog)
+            print("[real-bench] artifact oracle: exact Catalog equality on real catalog — first load \(String(format: "%.1f", firstArtifactMS)) ms, CPU \(String(format: "%.0f", (firstArtifactCPUEnd.user + firstArtifactCPUEnd.system - firstArtifactCPUStart.user - firstArtifactCPUStart.system) * 1000)) ms")
+
+            var hashMS = 0.0
+            for source in sources {
+                guard let data = try? Data(contentsOf: directories.catalogCacheFile(for: source.id), options: [.mappedIfSafe]) else { continue }
+                var best = Double.infinity
+                for _ in 0..<3 {
+                    let start = clock.now
+                    _ = BuiltCatalogCache.contentHash(data)
+                    best = min(best, Self.ms(start, clock.now))
+                }
+                hashMS += best
+            }
+            print("[real-bench] input fingerprint validation hash: \(String(format: "%.2f", hashMS)) ms for \(String(format: "%.1f", Double(sourceCacheBytes) / 1_048_576)) MiB compressed source cache")
+
+            var artifactWall: [Double] = []
+            var artifactCPU: [Double] = []
+            for _ in 0..<5 {
+                let start = clock.now
+                let cpu = Self.cpuUserSystem
+                let decoded = await artifactCache.load(sources: sources, options: CatalogBuildOptions())
+                artifactWall.append(Self.ms(start, clock.now))
+                let end = Self.cpuUserSystem
+                artifactCPU.append((end.user + end.system - cpu.user - cpu.system) * 1000)
+                try #require(decoded != nil)
+            }
+            var rawWall: [Double] = []
+            var rawCPU: [Double] = []
+            var rawDecodeWall: [Double] = []
+            var rawDecodeCPU: [Double] = []
+            var rebuildWall: [Double] = []
+            var rebuildCPU: [Double] = []
+            for _ in 0..<3 {
+                let start = clock.now
+                let cpu = Self.cpuUserSystem
+                var decodedInputs: [SourceCatalog] = []
+                for source in sources {
+                    if let input = await catalogCache.load(source.id) { decodedInputs.append(input) }
+                }
+                let decodeEnd = clock.now
+                let decodeCPUEnd = Self.cpuUserSystem
+                _ = await CatalogBuilder.build(sources: sources, catalogs: decodedInputs, options: CatalogBuildOptions())
+                rawWall.append(Self.ms(start, clock.now))
+                let end = Self.cpuUserSystem
+                rawCPU.append((end.user + end.system - cpu.user - cpu.system) * 1000)
+                rawDecodeWall.append(Self.ms(start, decodeEnd))
+                rawDecodeCPU.append((decodeCPUEnd.user + decodeCPUEnd.system - cpu.user - cpu.system) * 1000)
+                rebuildWall.append(Self.ms(decodeEnd, clock.now))
+                rebuildCPU.append((end.user + end.system - decodeCPUEnd.user - decodeCPUEnd.system) * 1000)
+            }
+            print("[real-bench] artifact load: min wall \(String(format: "%.1f", artifactWall.min() ?? 0)) ms, min CPU \(String(format: "%.0f", artifactCPU.min() ?? 0)) ms (\(artifactWall.map { String(format: "%.1f", $0) }.joined(separator: ", ")))")
+            print("[real-bench] raw decode+build same-process A/B: min wall \(String(format: "%.1f", rawWall.min() ?? 0)) ms, min CPU \(String(format: "%.0f", rawCPU.min() ?? 0)) ms — decode min \(String(format: "%.1f", rawDecodeWall.min() ?? 0))/\(String(format: "%.0f", rawDecodeCPU.min() ?? 0)) ms, warm build min \(String(format: "%.1f", rebuildWall.min() ?? 0))/\(String(format: "%.0f", rebuildCPU.min() ?? 0)) ms")
+        } catch {
+            Issue.record("artifact benchmark setup failed: \(error)")
+        }
 
         // Phase 3: editorial recommendations (launch-critical) then fallback (background).
         let editorialStart = clock.now

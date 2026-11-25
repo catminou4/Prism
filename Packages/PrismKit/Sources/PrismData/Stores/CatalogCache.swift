@@ -110,6 +110,25 @@ public actor CatalogCache {
         return SegmentedArchive.readUInt32([UInt8](bytes.dropFirst(4)), at: 0)
     }
 
+    /// Small first-segment metadata without decoding any item payload. Used by the derived
+    /// built-catalog artifact to bind its input fingerprints to the exact cached catalog.
+    static func embeddedMeta(in data: Data, expecting id: SourceID) -> Meta? {
+        guard let unpacked = SegmentedArchive.unpack(data), unpacked.version <= formatVersion,
+              let first = unpacked.segments.first, first.tag == Tag.meta.rawValue
+        else { return nil }
+        switch unpacked.version {
+        case 1:
+            guard let meta = SegmentedArchive.decodeSegment(Meta.self, from: first) else { return nil }
+            return validate(meta, expecting: id)
+        case 2:
+            guard let payload = expandedBinaryPayload(of: first),
+                  let meta = BinaryArchive.decodeMeta(payload) else { return nil }
+            return validate(meta, expecting: id)
+        default:
+            return nil
+        }
+    }
+
     public func save(_ catalog: SourceCatalog) async throws {
         let data = try await Self.encode(catalog, version: version)
         try data.write(to: directories.catalogCacheFile(for: catalog.sourceID), options: [.atomic])

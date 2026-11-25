@@ -50,6 +50,14 @@ public struct AppDirectories: Sendable, Hashable {
             .appending(path: SafeFileName.make(id.rawValue) + ".catalog", directoryHint: .notDirectory)
     }
 
+    /// Single derived snapshot of the already-grouped launch catalog. Deliberately outside the
+    /// per-source `Catalogs` directory and without the `.catalog` suffix so source-cache purge
+    /// and migration logic never treat it as an input archive.
+    public var builtCatalogFile: URL {
+        Self.ensure(caches.appending(path: "BuiltCatalog", directoryHint: .isDirectory))
+            .appending(path: "catalog.snapshot", directoryHint: .notDirectory)
+    }
+
     public func epgCacheFile(for id: SourceID) -> URL {
         Self.ensure(caches.appending(path: "EPG", directoryHint: .isDirectory))
             .appending(path: SafeFileName.make(id.rawValue) + ".epg", directoryHint: .notDirectory)

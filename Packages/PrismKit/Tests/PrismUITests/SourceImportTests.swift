@@ -48,6 +48,20 @@ struct SourceImportTests {
         }
         #expect(reopened.searchIndex?.search("premier contact").movies.count == 1)
 
+        // Once the background derived-artifact save lands, a later bootstrap publishes the
+        // same catalog through the artifact path (or the byte-exact fallback if validation
+        // rejects it). This guards the integration without depending on timing internals.
+        let artifactDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !FileManager.default.fileExists(atPath: directories.builtCatalogFile.path(percentEncoded: false)),
+              ContinuousClock.now < artifactDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(FileManager.default.fileExists(atPath: directories.builtCatalogFile.path(percentEncoded: false)))
+        let artifactReopened = AppModel(directories: directories, credentials: credentials, library: .inMemory())
+        await artifactReopened.bootstrap()
+        #expect(artifactReopened.catalog.movies.count == 1)
+        #expect(artifactReopened.catalog.movies.first?.variants.count == 2)
+
         reopened.remove(source.id)
         #expect(reopened.phase == .onboarding)
         let removalDeadline = ContinuousClock.now.advanced(by: .seconds(3))

@@ -32,6 +32,7 @@ public final class AppModel {
     @ObservationIgnored public let directories: AppDirectories
     @ObservationIgnored public let credentials: any CredentialStoring
     @ObservationIgnored public let catalogRepository: CatalogRepository
+    @ObservationIgnored private let builtCatalogCache: BuiltCatalogCache
     @ObservationIgnored public let epgRepository: EPGRepository
     @ObservationIgnored public let detailRepository: DetailRepository
     @ObservationIgnored public let metadataRepository: MetadataRepository
@@ -98,6 +99,13 @@ public final class AppModel {
     }
 
     @ObservationIgnored private var sourceCatalogs: [SourceID: SourceCatalog] = [:]
+    /// Change token for the raw-catalog dictionary. On an artifact hit that dictionary fills
+    /// in the background after the first catalog publish, so `sourceCategories` cannot depend
+    /// only on `catalogRevision`.
+    public private(set) var sourceCatalogsRevision = 0
+    /// Background warm-up of the raw per-source catalogs after a built-catalog artifact hit.
+    /// Refresh diffing and settings metadata need them, but first content does not.
+    @ObservationIgnored private var rawCatalogPreloadTask: Task<Void, Never>?
     @ObservationIgnored private var pendingSources: Set<SourceID> = []
     @ObservationIgnored private var rebuildGeneration = 0
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
@@ -140,6 +148,7 @@ public final class AppModel {
         self.isEphemeral = isEphemeral
         let cache = CatalogCache(directories: directories)
         self.catalogRepository = CatalogRepository(directories: directories, credentials: credentials, cache: cache)
+        self.builtCatalogCache = BuiltCatalogCache(directories: directories)
         self.epgRepository = EPGRepository(directories: directories, credentials: credentials)
         self.detailRepository = DetailRepository(directories: directories, credentials: credentials)
         self.metadataRepository = MetadataRepository(directories: directories, credentials: credentials)
@@ -195,6 +204,7 @@ public final class AppModel {
     /// Provider categories come from the full source, including categories filtered from the library.
     public func sourceCategories(for id: SourceID) -> [PrismCore.Category] {
         _ = catalogRevision
+        _ = sourceCatalogsRevision
         return sourceCatalogs[id]?.categories ?? []
     }
 
@@ -345,9 +355,11 @@ public final class AppModel {
         // aucune des deux ne dépend de l'autre, et l'attente ne doit pas se sérialiser
         // devant le chemin critique vers `.ready`.
         async let metadataEnabled = metadataRepository.isEnabled
-        // Le decode des caches démarre dès que `sources` est connu : il ne dépend ni de
-        // `library.json` ni des métadonnées, et chaque ms compte avant `.ready`.
-        async let cached = catalogRepository.cachedCatalogs(for: sources)
+        let options = currentBuildOptions()
+        // The derived built-catalog artifact validates its input key before paying its large
+        // decode. A miss is therefore cheap; the raw source-cache decode is started only then,
+        // so on a hit those hundreds of item allocations never compete with first content.
+        async let artifact = builtCatalogCache.load(sources: sources, options: options)
         // L'onboarding ne touche pas à la bibliothèque et les chemins d'import/rebuild
         // re-attendent tous `awaitDiskLoad` : inutile de bloquer l'affichage de
         // l'onboarding sur le decode de `library.json`.
@@ -361,13 +373,20 @@ public final class AppModel {
         // first catalog publish so no caller can mutate the store while the disk snapshot
         // is still in flight — a pre-load mutation would otherwise discard it.
         await library.awaitDiskLoad()
-        for catalog in await cached {
-            sourceCatalogs[catalog.sourceID] = catalog
-            if let account = catalog.account { accounts[catalog.sourceID] = account }
+        if let built = await artifact {
+            startRawCatalogPreload()
+            await rebuildCatalog(prebuilt: built)
+        } else {
+            // Cache-miss path unchanged: decode every source catalog, then group and index.
+            for catalog in await catalogRepository.cachedCatalogs(for: sources) {
+                sourceCatalogs[catalog.sourceID] = catalog
+                if let account = catalog.account { accounts[catalog.sourceID] = account }
+            }
+            sourceCatalogsRevision &+= 1
+            // The library decode was already awaited above; `rebuildCatalog` → `publish` →
+            // `reconcileTitles` therefore sees the real collections, not empty ones.
+            await rebuildCatalog()
         }
-        // The library decode was already awaited above; `rebuildCatalog` → `publish` →
-        // `reconcileTitles` therefore sees the real collections, not empty ones.
-        await rebuildCatalog()
         phase = .ready
         // Maintenance post-`.ready`, en tâche de fond : le decode du guide et les
         // rafraîchissements démarrent immédiatement mais à basse priorité, sans disputer
@@ -378,6 +397,9 @@ public final class AppModel {
             guard let self else { return }
             let sources = self.sources
             self.guide = await self.epgRepository.cachedGuide(for: sources)
+            // A hit on the built-catalog artifact intentionally leaves raw catalogs warming
+            // in the background. Staleness decisions and refresh diffing still need them.
+            await self.rawCatalogPreloadTask?.value
 
             let now = Date.now
             for source in sources where source.isEnabled {
@@ -729,8 +751,40 @@ public final class AppModel {
         await rebuildCatalog(includingSearch: true)
     }
 
+    private func currentBuildOptions() -> CatalogBuildOptions {
+        CatalogBuildOptions(
+            hideAdult: hideAdultContent,
+            hiddenCategoryIDs: Set(hiddenCategoriesBySource.values.joined())
+        )
+    }
+
+    /// Decode raw catalogs off the launch-critical path after a derived-artifact hit. They are
+    /// still needed soon afterwards for provider-category settings and refresh diffing, but not
+    /// to publish the already grouped catalog.
+    private func startRawCatalogPreload() {
+        rawCatalogPreloadTask?.cancel()
+        let sources = self.sources
+        let repository = catalogRepository
+        rawCatalogPreloadTask = Task.detached(priority: .background) { [weak self] in
+            let loaded = await repository.cachedCatalogs(for: sources)
+            await self?.installPreloadedCatalogs(loaded)
+        }
+    }
+
+    private func installPreloadedCatalogs(_ catalogs: [SourceCatalog]) {
+        for catalog in catalogs {
+            guard source(catalog.sourceID) != nil, sourceCatalogs[catalog.sourceID] == nil else { continue }
+            sourceCatalogs[catalog.sourceID] = catalog
+            if accounts[catalog.sourceID] == nil, let account = catalog.account {
+                accounts[catalog.sourceID] = account
+            }
+        }
+        sourceCatalogsRevision &+= 1
+        rawCatalogPreloadTask = nil
+    }
+
     /// Publish the merged catalog as soon as browsing is possible. Search indexes that snapshot separately.
-    private func rebuildCatalog(includingSearch: Bool = false) async {
+    private func rebuildCatalog(includingSearch: Bool = false, prebuilt: Catalog? = nil) async {
         // Every publish path funnels here (bootstrap, imports, removals, onboarding
         // restart, preference rebuilds): make sure the async `library.json` decode
         // landed first so `reconcileTitles` and any early mutation see real state.
@@ -741,14 +795,35 @@ public final class AppModel {
         searchTask?.cancel()
         recommendationsTask?.cancel()
         recommendationsTask = nil
+        // On a derived-artifact launch the raw catalogs may still be warming in the background.
+        // Any semantic rebuild (refresh, removal, category visibility…) needs the complete inputs;
+        // only the initial `prebuilt` publication is allowed to bypass them.
+        if prebuilt == nil {
+            await rawCatalogPreloadTask?.value
+            rawCatalogPreloadTask = nil
+        }
         let sources = self.sources
         let catalogs = sources.compactMap { sourceCatalogs[$0.id] }
-        let options = CatalogBuildOptions(
-            hideAdult: hideAdultContent,
-            hiddenCategoryIDs: Set(hiddenCategoriesBySource.values.joined())
-        )
+        let options = currentBuildOptions()
+        let artifactGeneration = UInt64(max(0, Date.now.timeIntervalSince1970) * 1_000_000)
         catalogTask = Task { [weak self] in
-            let built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
+            let built: Catalog
+            if let prebuilt {
+                built = prebuilt
+            } else {
+                built = await CatalogBuilder.build(sources: sources, catalogs: catalogs, options: options)
+                // Persist the expensive result off this publish task. The artifact writer binds
+                // the output to fingerprints of the exact cache files and revalidates them before
+                // its atomic write; the cache-miss path itself is otherwise unchanged.
+                if let artifactCache = self?.builtCatalogCache {
+                    Task.detached(priority: .background) {
+                        await artifactCache.save(
+                            catalog: built, sources: sources, catalogs: catalogs,
+                            options: options, generation: artifactGeneration
+                        )
+                    }
+                }
+            }
             guard !Task.isCancelled else { return }
             // Only the cheap editorial stage is awaited before publication: index/search/feed
             // naming consume `editorialCopy`, while the catalog-wide fallback scan is completed
