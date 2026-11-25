@@ -14,21 +14,50 @@ struct TitleGrid: View {
         let contentWidth = max(140, availableWidth - 2 * PrismMetrics.contentMargin)
         let count = max(1, Int((contentWidth + spacing) / (145 + spacing)))
         let width = (contentWidth - CGFloat(count - 1) * spacing) / CGFloat(count)
-        let columns = Array(repeating: GridItem(.fixed(width), spacing: spacing), count: count)
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 28) {
-            if ranked {
-                ForEach(Array(items.enumerated()), id: \.element.id) { offset, item in
-                    BrowsePoster(item: item, width: width, rank: offset + 1, showsTitle: true)
-                        .rowEntrance()
-                }
-            } else {
-                ForEach(items) { item in
-                    BrowsePoster(item: item, width: width)
-                        .rowEntrance()
-                }
+        let rowCount = (items.count + count - 1) / count
+        // Materialize whole rows rather than individual grid cells. Every card in a row has
+        // the same vertical geometry, so one row-level entrance is pixel-identical to six
+        // identical card-level transitions while keeping far less transition/layout state.
+        LazyVStack(alignment: .leading, spacing: 28) {
+            ForEach(0..<rowCount, id: \.self) { row in
+                TitleGridRow(
+                    items: items, row: row, columns: count, width: width,
+                    contentWidth: contentWidth, spacing: spacing, ranked: ranked
+                )
             }
         }
         .padding(.horizontal, PrismMetrics.contentMargin)
+    }
+}
+
+/// One fixed-width row of `TitleGrid`. Cards keep their item identity inside the row; only
+/// the row container is indexed, matching the stable row-major geometry of the old grid.
+private struct TitleGridRow: View {
+    let items: [MediaTitle]
+    let row: Int
+    let columns: Int
+    let width: CGFloat
+    let contentWidth: CGFloat
+    let spacing: CGFloat
+    let ranked: Bool
+
+    var body: some View {
+        let start = row * columns
+        let end = min(items.count, start + columns)
+        HStack(alignment: .top, spacing: spacing) {
+            if ranked {
+                // Rank is the global title position, not the row-local offset.
+                ForEach(Array(items[start..<end].enumerated()), id: \.element.id) { localOffset, item in
+                    BrowsePoster(item: item, width: width, rank: start + localOffset + 1, showsTitle: true)
+                }
+            } else {
+                ForEach(items[start..<end]) { item in
+                    BrowsePoster(item: item, width: width)
+                }
+            }
+        }
+        .frame(width: contentWidth, alignment: .leading)
+        .rowEntrance()
     }
 }
 

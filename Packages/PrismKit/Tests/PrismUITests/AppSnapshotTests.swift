@@ -12,6 +12,29 @@ import Testing
 @MainActor
 @Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["PRISM_APP_SNAPSHOTS"] == "1"))
 struct AppSnapshotTests {
+    /// Focused layout reference for collection grids: short/long captions, a partial row,
+    /// and ranked posters. Used for before/after pixel comparisons when grid internals change.
+    @Test func titleGridLayout() async throws {
+        let app = await AppModel.preview()
+        let navigation = NavigationModel()
+        let titles = (0..<17).map { index in
+            MediaTitle(
+                id: TitleID(rawValue: "movie:grid-\(index)"), kind: .movie,
+                title: index == 1 ? "Un titre particulièrement long qui doit être tronqué" : "Film \(index)",
+                year: 2000 + index, variants: []
+            )
+        }
+        for ranked in [false, true] {
+            try await write(
+                TitleGrid(items: titles, availableWidth: 1_170, ranked: ranked)
+                    .environment(app)
+                    .environment(navigation),
+                label: ranked ? "title-grid-ranked" : "title-grid",
+                size: CGSize(width: 1_170, height: 870), scheme: .light
+            )
+        }
+    }
+
     @Test func episodePlaybackSheet() async throws {
         let app = await AppModel.preview()
         let series = try #require(app.catalog.series.first { $0.variants.count > 1 })
