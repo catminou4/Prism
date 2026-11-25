@@ -29,12 +29,27 @@ public enum CatalogBuilder {
             catalogBySource[catalog.sourceID] = catalog
         }
         let ordered = enabled.compactMap { catalogBySource[$0.id] }
-        let context = Context(catalogs: ordered, priority: priority, options: options)
+        var context = Context(catalogs: ordered, priority: priority, options: options)
+
+        // Language evidence depends only on categories, so resolve its small lookup tables before
+        // grouping. The per-variant values are then written together with the content indexes —
+        // that index already pays the ContentID hashing/insertion cost for every variant.
+        var categoryLanguages: [String: Set<String>] = [:]
+        for category in context.categories.values where category.kind == .movie || category.kind == .series {
+            let languages = ProviderCategoryLanguage.codes(in: category.rawName)
+            if !languages.isEmpty { categoryLanguages[category.id] = languages }
+        }
+        let providerLangsStart = ContinuousClock.now
+        let languageTable = ProviderLanguageTable(categoryLanguages: categoryLanguages)
+        context.applyProviderLanguageTable(languageTable)
+        BuildProfile.mark("providerLanguages", since: providerLangsStart)
 
         // Normalization keys, then grouping — kept in one scope so the per-item key strings
         // are released when grouping finishes instead of living until `build` returns.
         let groupedStart = ContinuousClock.now
-        let (movieGroups, seriesGroups, channelGrouping) = await groupedTitles(ordered: ordered, context: context)
+        let (movieGroups, seriesGroups, channelGrouping) = await groupedTitles(
+            ordered: ordered, context: context, languageTable: languageTable
+        )
         BuildProfile.mark("groupedTitles (keys+grouping)", since: groupedStart)
         guard !Task.isCancelled else { return .empty }
         let movies = movieGroups.titles, series = seriesGroups.titles, channels = channelGrouping.groups
@@ -53,29 +68,8 @@ public enum CatalogBuilder {
         for (index, source) in enabled.enumerated() { indexes.sourceIndex[source.id] = index }
         indexes.categories = context.categories
         indexes.hasTaggedEditions = movieGroups.hasTaggedEditions || seriesGroups.hasTaggedEditions
-        for category in context.categories.values where category.kind == .movie || category.kind == .series {
-            let languages = ProviderCategoryLanguage.codes(in: category.rawName)
-            if !languages.isEmpty { indexes.categoryLanguages[category.id] = languages }
-        }
-        // Provider-language labels per variant, resolved once: `providerLanguages(for:)` sits on
-        // hot audio paths and would otherwise interpolate category prefixes on every call.
-        let providerLangsStart = ContinuousClock.now
-        if !indexes.categoryLanguages.isEmpty {
-            let languageMaps = providerLanguageMaps(context: context, categoryLanguages: indexes.categoryLanguages)
-            var languages: [ContentID: Set<String>] = [:]
-            for title in movies {
-                for variant in title.variants {
-                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
-                }
-            }
-            for title in series {
-                for variant in title.variants {
-                    collectProviderLanguages(variant, languageMaps: languageMaps, categoryLanguages: indexes.categoryLanguages, into: &languages)
-                }
-            }
-            indexes.providerLanguages = languages
-        }
-        BuildProfile.mark("providerLanguages", since: providerLangsStart)
+        indexes.categoryLanguages = categoryLanguages
+        indexes.hasMalformedMediaContentIDs = movieGroups.hasMalformedContentIDs || seriesGroups.hasMalformedContentIDs
         indexes.movieByTitleID = movieGroups.titleIndex
         indexes.movieByContent = movieGroups.contentIndex
         indexes.seriesByTitleID = seriesGroups.titleIndex
@@ -113,7 +107,8 @@ public enum CatalogBuilder {
     /// by grouping of all three kinds concurrently. Kept in one scope so `keys` is released when
     /// this returns instead of living until `build` returns (audit C5 memory peak).
     private static func groupedTitles(
-        ordered: [SourceCatalog], context: Context
+        ordered: [SourceCatalog], context: Context,
+        languageTable: ProviderLanguageTable
     ) async -> (movies: MediaGroups, series: MediaGroups, channels: ChannelGroups) {
         let keysStart = ContinuousClock.now
         async let movieKeys = parallelKeys(ordered.map(\.movies), label: "keys.movies") { mediaKey(title: $0.title, rawName: $0.rawName, id: $0.id) }
@@ -125,78 +120,48 @@ public enum CatalogBuilder {
 
         // Grouping: each kind concurrently; title construction is itself chunked in parallel.
         let groupStart = ContinuousClock.now
-        async let movieTitles = groupMedia(kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context)
-        async let seriesTitles = groupMedia(kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context)
+        async let movieTitles = groupMedia(
+            kind: .movie, lists: ordered.map(\.movies), keys: keys.movies, context: context,
+            languageTable: languageTable
+        )
+        async let seriesTitles = groupMedia(
+            kind: .series, lists: ordered.map(\.series), keys: keys.series, context: context,
+            languageTable: languageTable
+        )
         async let channelGroups = groupChannels(lists: ordered.map(\.channels), keys: keys.channels, context: context)
         let result = await (movieTitles, seriesTitles, channelGroups)
         BuildProfile.mark("grouping (all 3 parallel)", since: groupStart)
         return result
     }
 
-    /// Per source+kind category lookups for `collectProviderLanguages`: canonical category ids
-    /// and native ids each map to the declared language labels, mirroring the syntactic
-    /// canonicalization `Catalog.providerLanguages(for:)` performs per variant.
-    struct ProviderLanguageMaps {
-        /// `"<sourceID>:<kind>:"` prefix used to tell canonical ids from native ones.
-        var prefix: String
-        /// Canonical category id → languages (only consulted for prefixed ids).
-        var canonical: [String: Set<String>]
-        /// Native category id → languages (first registration wins, like `Context.resolvers`).
-        var native: [String: Set<String>]
-    }
+    /// Interned distinct language sets. Variants store only a small table id beside their
+    /// title position, so the content index keeps the same one-word dictionary values it had
+    /// before provider languages were fused into it. The ordering is deterministic: index 0 is
+    /// empty and non-empty sets are sorted by their canonical joined ISO codes.
+    struct ProviderLanguageTable: Sendable {
+        var sets: [Set<String>]
+        var idsByCategory: [String: Int]
 
-    /// Builds the per-(source, kind) language maps once: ~#categories work instead of
-    /// interpolating `"source:kind:"` prefixes for every one of ~250k variants.
-    static func providerLanguageMaps(
-        context: Context, categoryLanguages: [String: Set<String>]
-    ) -> [SourceID: [MediaKind: ProviderLanguageMaps]] {
-        var maps: [SourceID: [MediaKind: ProviderLanguageMaps]] = [:]
-        for catalog in context.catalogs {
-            for kind in [MediaKind.movie, .series] {
-                var canonical: [String: Set<String>] = [:]
-                var native: [String: Set<String>] = [:]
-                for category in catalog.categories where category.kind == kind {
-                    canonical[category.id] = categoryLanguages[category.id] ?? []
-                }
-                for category in catalog.categories where category.kind == kind {
-                    if native[category.nativeID] == nil {
-                        native[category.nativeID] = categoryLanguages[category.id] ?? []
-                    }
-                }
-                maps[catalog.sourceID, default: [:]][kind] = ProviderLanguageMaps(
-                    prefix: "\(catalog.sourceID.rawValue):\(kind.rawValue):",
-                    canonical: canonical, native: native
-                )
+        init(categoryLanguages: [String: Set<String>]) {
+            var uniqueByKey: [String: Set<String>] = [:]
+            for languages in categoryLanguages.values {
+                uniqueByKey[languages.sorted().joined(separator: "\u{1F}")] = languages
             }
-        }
-        return maps
-    }
-
-    /// Records the declared language labels of one variant (empty when its category has none),
-    /// using the same canonical-category resolution as `Catalog.providerLanguages(for:)`.
-    private static func collectProviderLanguages(
-        _ variant: MediaVariant, languageMaps: [SourceID: [MediaKind: ProviderLanguageMaps]],
-        categoryLanguages: [String: Set<String>], into result: inout [ContentID: Set<String>]
-    ) {
-        let category: (id: String?, kind: MediaKind) = switch variant {
-        case .movie(let movie): (movie.categoryID, .movie)
-        case .series(let series): (series.categoryID, .series)
-        }
-        guard let id = category.id else {
-            result[variant.id] = []
-            return
-        }
-        if let maps = languageMaps[variant.sourceID]?[category.kind] {
-            // Same rule as before: a prefixed id is already canonical, anything else is native.
-            result[variant.id] = id.hasPrefix(maps.prefix)
-                ? (maps.canonical[id] ?? [])
-                : (maps.native[id] ?? [])
-        } else {
-            // Defensive fallback (a variant whose source has no catalog entry): keep the
-            // original syntactic canonicalization.
-            let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
-            let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
-            result[variant.id] = categoryLanguages[canonicalID] ?? []
+            var sets: [Set<String>] = [[]]
+            var idsByKey: [String: Int] = [:]
+            for key in uniqueByKey.keys.sorted() {
+                guard let languages = uniqueByKey[key] else { continue }
+                idsByKey[key] = sets.count
+                sets.append(languages)
+            }
+            var idsByCategory: [String: Int] = [:]
+            idsByCategory.reserveCapacity(categoryLanguages.count)
+            for (categoryID, languages) in categoryLanguages {
+                let key = languages.sorted().joined(separator: "\u{1F}")
+                idsByCategory[categoryID] = idsByKey[key] ?? 0
+            }
+            self.sets = sets
+            self.idsByCategory = idsByCategory
         }
     }
 
@@ -211,7 +176,7 @@ public enum CatalogBuilder {
         /// The common one-category case shares Set storage across all titles in that category.
         let singleCategorySets: [String: Set<String>]
         /// Per catalog and kind: raw category reference (canonical id or native id) → resolution.
-        let resolvers: [[MediaKind: [String: ResolvedCategory]]]
+        var resolvers: [[MediaKind: [String: ResolvedCategory]]]
 
         init(catalogs: [SourceCatalog], priority: [SourceID: Int], options: CatalogBuildOptions) {
             self.catalogs = catalogs
@@ -255,6 +220,25 @@ public enum CatalogBuilder {
             self.resolvers = resolvers
         }
 
+        /// Fills every precomputed category resolution with its interned language-set id.
+        /// This is O(#categories), not O(#variants): hidden and unknown resolutions keep id 0,
+        /// exactly like the former lookup of a category absent from `categoryLanguages`.
+        mutating func applyProviderLanguageTable(_ table: ProviderLanguageTable) {
+            guard !table.idsByCategory.isEmpty else { return }
+            for catalogIndex in resolvers.indices {
+                let byKind = resolvers[catalogIndex]
+                for (kind, original) in byKind {
+                    var mapping = original
+                    for key in original.keys {
+                        guard var resolved = mapping[key] else { continue }
+                        resolved.languageID = Int32(table.idsByCategory[resolved.visibleID ?? ""] ?? 0)
+                        mapping[key] = resolved
+                    }
+                    resolvers[catalogIndex][kind] = mapping
+                }
+            }
+        }
+
         func resolver(catalog: Int, kind: MediaKind) -> [String: ResolvedCategory] {
             resolvers[catalog][kind] ?? [:]
         }
@@ -265,6 +249,11 @@ public enum CatalogBuilder {
         var visibleID: String?
         var isAdult: Bool
         var isHidden: Bool
+        /// Interned provider-language set for this category resolution (0 = none). The raw
+        /// category reference has already been resolved when an item reaches grouping, so the
+        /// content index copies this small id instead of redoing canonical/native id lookup
+        /// once per variant.
+        var languageID: Int32 = 0
     }
 
     // MARK: - Keys
@@ -329,10 +318,11 @@ public enum CatalogBuilder {
     struct MediaGroups: Sendable {
         var titles: [MediaTitle] = []
         var titleIndex: [TitleID: Int] = [:]
-        var contentIndex: [ContentID: Int] = [:]
+        var contentIndex = Catalog.MediaContentIndex()
         /// Category ids per title, in `titles` order.
         var categoryIDs: [Set<String>] = []
         var hasTaggedEditions = false
+        var hasMalformedContentIDs = false
     }
 
     /// Per-chunk output of the parallel title construction.
@@ -340,6 +330,12 @@ public enum CatalogBuilder {
         var lower: Int
         var titles: [MediaTitle] = []
         var added: [Double] = []
+        /// Flattened per-title refs in the exact order of `MediaTitle.variants`. The content
+        /// index consumes these lightweight references instead of re-binding every enum payload.
+        var variantRefs: [Ref] = []
+        var variantRefStarts: [Int] = []
+        var variantRefCounts: [Int] = []
+        var hasMalformedContentIDs = false
         var elapsed: Double = 0
         var refsProcessed: Int = 0
         var multiVariant: Int = 0
@@ -385,6 +381,8 @@ public enum CatalogBuilder {
         /// Resolved visible category per item, positional with the input lists.
         var cats: [[String?]] = []
         var adult: [[Bool]] = []
+        /// Interned provider-language set per item, positional with the input lists (0 = none).
+        var languageIDs: [[Int32]] = []
         /// Refs of the visible items per shard, each bucket in scan order (catalog, then item).
         var shardRefs: [[MediaRef]] = []
         var hasTaggedEditions = false
@@ -433,6 +431,7 @@ public enum CatalogBuilder {
         var lower = 0
         var cats: [String?] = []
         var adult: [Bool] = []
+        var languageIDs: [Int32] = []
         var buckets: [[MediaRef]] = []
         var tagged = false
         var tmdb = false
@@ -461,6 +460,7 @@ public enum CatalogBuilder {
                         var out = MediaPartitionChunk(listIndex: listIndex, lower: lower)
                         out.cats = [String?](repeating: nil, count: end - lower)
                         out.adult = [Bool](repeating: false, count: end - lower)
+                        out.languageIDs = [Int32](repeating: 0, count: end - lower)
                         out.buckets = [[MediaRef]](repeating: [], count: shards)
                         guard !Task.isCancelled else { return out }
                         // Indexed field reads, exactly like the former serial loop: binding the
@@ -472,6 +472,7 @@ public enum CatalogBuilder {
                             if !out.tagged, !list[index].tags.isEmpty { out.tagged = true }
                             out.adult[index - lower] = isAdult
                             out.cats[index - lower] = category?.visibleID
+                            out.languageIDs[index - lower] = category?.languageID ?? 0
                             if !out.tmdb, let tmdbID = list[index].tmdbID, tmdbID > 0 { out.tmdb = true }
                             let shard = shardIndex(for: listKeys[index], shards: shards)
                             out.buckets[shard].append(MediaRef(
@@ -493,6 +494,7 @@ public enum CatalogBuilder {
         var partition = MediaPartition()
         partition.cats = lists.map { [String?](repeating: nil, count: $0.count) }
         partition.adult = lists.map { [Bool](repeating: false, count: $0.count) }
+        partition.languageIDs = lists.map { [Int32](repeating: 0, count: $0.count) }
         partition.shardRefs = [[MediaRef]](repeating: [], count: shards)
         let average = max(1, total / shards)
         for shard in partition.shardRefs.indices { partition.shardRefs[shard].reserveCapacity(average) }
@@ -500,6 +502,9 @@ public enum CatalogBuilder {
         for chunk in chunks {
             partition.cats[chunk.listIndex].replaceSubrange(chunk.lower..<(chunk.lower + chunk.cats.count), with: chunk.cats)
             partition.adult[chunk.listIndex].replaceSubrange(chunk.lower..<(chunk.lower + chunk.adult.count), with: chunk.adult)
+            partition.languageIDs[chunk.listIndex].replaceSubrange(
+                chunk.lower..<(chunk.lower + chunk.languageIDs.count), with: chunk.languageIDs
+            )
             for shard in chunk.buckets.indices where !chunk.buckets[shard].isEmpty {
                 partition.shardRefs[shard].append(contentsOf: chunk.buckets[shard])
             }
@@ -557,7 +562,10 @@ public enum CatalogBuilder {
         return output
     }
 
-    static func groupMedia<V: GroupableMedia>(kind: MediaKind, lists: [[V]], keys: [[String]], context: Context) async -> MediaGroups {
+    static func groupMedia<V: GroupableMedia>(
+        kind: MediaKind, lists: [[V]], keys: [[String]], context: Context,
+        languageTable: ProviderLanguageTable
+    ) async -> MediaGroups {
         let total = lists.reduce(0) { $0 + $1.count }
         guard total > 0 else { return MediaGroups() }
         let categoryKind: MediaKind = kind == .series ? .series : .movie
@@ -630,6 +638,7 @@ public enum CatalogBuilder {
         let datedLookup = DatedGroupLookup(shards: shards, dictionaries: shardGroups.map(\.datedGroups), positions: positions)
         BuildProfile.mark("\(label) merge groups", since: mergeGroupsStart)
         let resolvedCategories = partition.cats
+        let resolvedLanguageIDs = partition.languageIDs
         let adultFlags = partition.adult
         let hasTMDBIdentity = partition.hasTMDBIdentity
         let hasTaggedEditions = partition.hasTaggedEditions
@@ -665,6 +674,8 @@ public enum CatalogBuilder {
                     guard !Task.isCancelled else { return built }
                     built.titles.reserveCapacity(upper - lower)
                     built.added.reserveCapacity(upper - lower)
+                    built.variantRefStarts.reserveCapacity(upper - lower)
+                    built.variantRefCounts.reserveCapacity(upper - lower)
                     var cleanedGenreLists: [[String]: [String]] = [:]
                     for index in lower..<upper {
                         let offer = frozenGroups[index]
@@ -687,6 +698,19 @@ public enum CatalogBuilder {
                                 if lhsLength != rhsLength { return lhsLength < rhsLength }
                                 return lists[lhsCatalog][lhsItem].id < lists[rhsCatalog][rhsItem].id
                             }
+                        }
+                        // Keep the sorted refs in flat arrays: the final content index can then
+                        // read raw fields by (catalog, item) instead of copying every MediaVariant
+                        // payload a second time just to reach its id and category.
+                        built.variantRefStarts.append(built.variantRefs.count)
+                        built.variantRefCounts.append(refs.count)
+                        for refIndex in refs.indices {
+                            let ref = refs[refIndex]
+                            if !built.hasMalformedContentIDs,
+                               !Catalog.contentID(lists[Int(ref.catalog)][Int(ref.item)].id, hasKind: kind) {
+                                built.hasMalformedContentIDs = true
+                            }
+                            built.variantRefs.append(ref)
                         }
                         let title = makeTitle(
                             id: offer.id(kind: kind), kind: kind, year: offer.name.year, refs: refs, lists: lists,
@@ -755,11 +779,20 @@ public enum CatalogBuilder {
             }
             if let tmdbID = frozenGroups[groupIndex].tmdbID { index[TitleID(kind: kind, tmdbID: tmdbID)] = position }
         }
-        async let contentIndex: [ContentID: Int] = parallelPositionIndex(positions: groupCount, workers: workers, minimumCapacity: total) { position, index in
+        async let contentEntries: [ContentID: Catalog.MediaContentIndex.Entry] = parallelPositionIndex(
+            positions: groupCount, workers: workers, minimumCapacity: total
+        ) { position, index in
             let groupIndex = orderFrozen[position]
-            let variants = frozenChunks[groupIndex / chunk].titles[groupIndex % chunk].variants
-            for variantIndex in variants.indices {
-                index[variants[variantIndex].id] = position
+            let chunkIndex = groupIndex / chunk, titleOffset = groupIndex % chunk
+            let firstRef = frozenChunks[chunkIndex].variantRefStarts[titleOffset]
+            let refCount = frozenChunks[chunkIndex].variantRefCounts[titleOffset]
+            for refOffset in 0..<refCount {
+                let ref = frozenChunks[chunkIndex].variantRefs[firstRef + refOffset]
+                let listIndex = Int(ref.catalog), itemIndex = Int(ref.item)
+                let languageID = Int(resolvedLanguageIDs[listIndex][itemIndex])
+                index[lists[listIndex][itemIndex].id] = Catalog.MediaContentIndex.Entry(
+                    titleIndex: position, languageID: languageID
+                )
             }
         }
         // Permutation: one copy per title (not two — the categories extraction is fused in).
@@ -778,8 +811,10 @@ public enum CatalogBuilder {
         }()
         let permuted = await permutation
         let result = MediaGroups(
-            titles: permuted.titles, titleIndex: await titleIndex, contentIndex: await contentIndex,
-            categoryIDs: permuted.categories, hasTaggedEditions: hasTaggedEditions
+            titles: permuted.titles, titleIndex: await titleIndex,
+            contentIndex: Catalog.MediaContentIndex(entries: await contentEntries, providerLanguageSets: languageTable.sets),
+            categoryIDs: permuted.categories, hasTaggedEditions: hasTaggedEditions,
+            hasMalformedContentIDs: chunks.contains { $0.hasMalformedContentIDs }
         )
         BuildProfile.mark("\(label) final indexes", since: finalStart)
         return result
@@ -1002,30 +1037,30 @@ public enum CatalogBuilder {
     /// positions winning — the exact overwrite sequence of the serial loop, so even colliding
     /// keys resolve identically. Insertion is the expensive part on string keys (150k+ entries),
     /// and it dominates the serial merge of the small partials.
-    static func parallelPositionIndex<Key: Hashable & Sendable>(
+    static func parallelPositionIndex<Key: Hashable & Sendable, Value: Sendable>(
         positions: Int, workers: Int, minimumCapacity: Int,
-        inserts: @escaping @Sendable (Int, inout [Key: Int]) -> Void
-    ) async -> [Key: Int] {
+        inserts: @escaping @Sendable (Int, inout [Key: Value]) -> Void
+    ) async -> [Key: Value] {
         guard positions >= 8_192, workers > 1 else {
-            var index: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity)
+            var index: [Key: Value] = Dictionary(minimumCapacity: minimumCapacity)
             for position in 0..<positions { inserts(position, &index) }
             return index
         }
         let chunk = (positions + workers - 1) / workers
-        let partials: [(Int, [Key: Int])] = await withTaskGroup(of: (Int, [Key: Int]).self) { group in
+        let partials: [(Int, [Key: Value])] = await withTaskGroup(of: (Int, [Key: Value]).self) { group in
             for lower in stride(from: 0, to: positions, by: chunk) {
                 let upper = min(lower + chunk, positions)
                 group.addTask {
-                    var partial: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity / workers + 1)
+                    var partial: [Key: Value] = Dictionary(minimumCapacity: minimumCapacity / workers + 1)
                     for position in lower..<upper { inserts(position, &partial) }
                     return (lower, partial)
                 }
             }
-            var parts: [(Int, [Key: Int])] = []
+            var parts: [(Int, [Key: Value])] = []
             for await part in group { parts.append(part) }
             return parts
         }
-        var index: [Key: Int] = Dictionary(minimumCapacity: minimumCapacity)
+        var index: [Key: Value] = Dictionary(minimumCapacity: minimumCapacity)
         for (_, partial) in partials.sorted(by: { $0.0 < $1.0 }) {
             index.merge(partial) { _, new in new }
         }
@@ -1790,8 +1825,21 @@ extension CatalogBuilder {
                 out += "\u{1F}\(group.itemCount)\u{1F}\(group.isAdult)\u{1F}\(group.sortIndex)\n"
             }
         }
-        for (key, languages) in catalog.indexes.providerLanguages.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
-            out += "L\u{1F}\(key.rawValue)\u{1F}\(languages.sorted().joined(separator: ","))\n"
+        if !catalog.indexes.categoryLanguages.isEmpty {
+            // Recreate the former unified table only in this verification path: movies first,
+            // series second, so cross-kind collisions keep the build's overwrite semantics.
+            var languagesByContent: [ContentID: Set<String>] = Dictionary(
+                minimumCapacity: catalog.indexes.movieByContent.entries.count + catalog.indexes.seriesByContent.entries.count
+            )
+            for (id, entry) in catalog.indexes.movieByContent.entries {
+                languagesByContent[id] = catalog.indexes.movieByContent.providerLanguageSets[entry.languageID]
+            }
+            for (id, entry) in catalog.indexes.seriesByContent.entries {
+                languagesByContent[id] = catalog.indexes.seriesByContent.providerLanguageSets[entry.languageID]
+            }
+            for (key, languages) in languagesByContent.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+                out += "L\u{1F}\(key.rawValue)\u{1F}\(languages.sorted().joined(separator: ","))\n"
+            }
         }
         try? out.write(toFile: path, atomically: true, encoding: .utf8)
     }

@@ -26,16 +26,77 @@ public struct Catalog: Sendable {
 
     let indexes: Indexes
 
+    /// Content-id index entry pairing the grouped-title position with the variant's
+    /// provider-language labels. The two facts share the same key and are written in the same
+    /// build pass: keeping them in one dictionary avoids duplicating a quarter-million string
+    /// keys (and their hashing cost) solely for audio curation. Both facts are packed into the
+    /// same 64-bit dictionary value the positional index already used: title positions fit in
+    /// 32 bits in any catalog the cache format accepts, and language labels are interned in the
+    /// tiny `providerLanguageSets` table (index 0 is always the empty set).
+    struct MediaContentIndex: Sendable, Equatable {
+        struct Entry: Sendable, Equatable {
+            var packed: UInt64
+
+            init(titleIndex: Int, languageID: Int) {
+                packed = UInt64(UInt32(titleIndex)) | UInt64(UInt32(languageID)) << 32
+            }
+
+            var titleIndex: Int { Int(UInt32(truncatingIfNeeded: packed)) }
+            var languageID: Int { Int(packed >> 32) }
+        }
+
+        var entries: [ContentID: Entry] = [:]
+        var providerLanguageSets: [Set<String>] = [[]]
+
+        /// Positional lookup used by the catalog's content-id APIs.
+        subscript(id: ContentID) -> Int? { entries[id]?.titleIndex }
+
+        func providerLanguages(for id: ContentID) -> Set<String>? {
+            guard let entry = entries[id] else { return nil }
+            return providerLanguageSets[entry.languageID]
+        }
+    }
+
+    /// Unified per-id language view over the movie and series indexes. Series win collisions
+    /// because the former single table inserted movies first and series second.
+    struct ProviderLanguageIndex: Sendable {
+        var movies: MediaContentIndex
+        var series: MediaContentIndex
+        var isEnabled: Bool
+
+        subscript(id: ContentID) -> Set<String>? {
+            guard isEnabled else { return nil }
+            return series.providerLanguages(for: id) ?? movies.providerLanguages(for: id)
+        }
+    }
+
+    /// Byte-level equivalent of `ContentID.kind == kind`, without allocating the kind substring.
+    /// Well-formed ids cannot collide across media kinds; malformed imports need the historical
+    /// unified-table lookup order instead of the faster kind-specific one.
+    static func contentID(_ id: ContentID, hasKind kind: MediaKind) -> Bool {
+        let bytes = id.rawValue.utf8
+        guard let first = bytes.firstIndex(of: UInt8(ascii: ":")) else { return false }
+        let start = bytes.index(after: first)
+        let end = bytes[start...].firstIndex(of: UInt8(ascii: ":")) ?? bytes.endIndex
+        return bytes[start..<end].elementsEqual(kind.rawValue.utf8)
+    }
+
     /// Lookup tables, built once by `CatalogBuilder`.
     struct Indexes: Sendable {
         var sourceIndex: [SourceID: Int] = [:]
         var categories: [String: PrismCore.Category] = [:]
         var hasTaggedEditions = false
         var categoryLanguages: [String: Set<String>] = [:]
-        /// Declared language labels per variant content id, resolved once at build time:
-        /// audio lookups sit on hot curation paths and would otherwise interpolate category
-        /// prefixes on every call.
-        var providerLanguages: [ContentID: Set<String>] = [:]
+        /// Declared language labels per variant content id, backed by the content indexes below.
+        /// The view is internal verification surface; production lookups use the kind-specific
+        /// entry directly so hot audio paths still pay for one dictionary lookup.
+        var providerLanguages: ProviderLanguageIndex {
+            ProviderLanguageIndex(
+                movies: movieByContent,
+                series: seriesByContent,
+                isEnabled: !categoryLanguages.isEmpty
+            )
+        }
         /// Category group id → (kind, index in the kind's category array).
         var categoryGroups: [String: GroupRef] = [:]
         /// Raw category id → category group id.
@@ -43,10 +104,14 @@ public struct Catalog: Sendable {
         var movieByTitleID: [TitleID: Int] = [:]
         var seriesByTitleID: [TitleID: Int] = [:]
         var channelByGroupID: [String: Int] = [:]
-        /// Movie variant content id → index in `movies`.
-        var movieByContent: [ContentID: Int] = [:]
-        /// Series variant content id → index in `series`.
-        var seriesByContent: [ContentID: Int] = [:]
+        /// Movie variant content id → index in `movies`, with its precomputed language labels.
+        var movieByContent = MediaContentIndex()
+        /// Series variant content id → index in `series`, with its precomputed language labels.
+        var seriesByContent = MediaContentIndex()
+        /// Whether imported ids ever violated `<source>:<kind>:<native>`. In that pathological
+        /// case a cross-kind collision is possible and language lookups keep the historical
+        /// unified insertion order instead of trusting the variant's kind.
+        var hasMalformedMediaContentIDs = false
         /// Channel variant content id → index in `channels`.
         var channelByContent: [ContentID: Int] = [:]
         /// Category group id → indices in the matching kind array (catalog order).
@@ -92,18 +157,39 @@ public struct Catalog: Sendable {
     }
 
     /// Declared language labels from this edition's provider category (ISO 639-1).
-    /// Catalog variants resolve through the build-time cache; foreign variants fall back to
-    /// the same category computation as before.
+    /// Catalog variants resolve through the labels fused into their content index; foreign
+    /// variants fall back to the same category computation as before.
     public func providerLanguages(for variant: MediaVariant) -> Set<String> {
-        if let cached = indexes.providerLanguages[variant.id] { return cached }
-        guard !indexes.categoryLanguages.isEmpty else { return [] }
-        let category: (id: String?, kind: MediaKind) = switch variant {
-        case .movie(let movie): (movie.categoryID, .movie)
-        case .series(let series): (series.categoryID, .series)
+        // Wildcard patterns read only the enum tag: cached lookups must not copy a whole
+        // Movie/Series payload just to learn which content index to consult.
+        let kind: MediaKind = switch variant {
+        case .movie(_): .movie
+        case .series(_): .series
         }
-        guard let id = category.id else { return [] }
+        // Well-formed catalog ids are kind-unique, so the hit path consults only the matching
+        // content index. A hit needs no further validation: with no malformed imports, that
+        // presence itself proves the id has this kind. Only a foreign miss pays for the exact
+        // collision check; malformed input keeps the former unified insertion order (series last).
+        if !indexes.hasMalformedMediaContentIDs {
+            let cached = kind == .movie
+                ? indexes.movieByContent.providerLanguages(for: variant.id)
+                : indexes.seriesByContent.providerLanguages(for: variant.id)
+            if let cached { return cached }
+            if !Self.contentID(variant.id, hasKind: kind),
+               let colliding = indexes.providerLanguages[variant.id] {
+                return colliding
+            }
+        } else if let cached = indexes.providerLanguages[variant.id] {
+            return cached
+        }
+        guard !indexes.categoryLanguages.isEmpty else { return [] }
+        let categoryID: String? = switch variant {
+        case .movie(let movie): movie.categoryID
+        case .series(let series): series.categoryID
+        }
+        guard let id = categoryID else { return [] }
         // Older imports can carry the native category ID instead of the canonical reference.
-        let prefix = "\(variant.sourceID.rawValue):\(category.kind.rawValue):"
+        let prefix = "\(variant.sourceID.rawValue):\(kind.rawValue):"
         let canonicalID = id.hasPrefix(prefix) ? id : prefix + id
         return indexes.categoryLanguages[canonicalID] ?? []
     }
