@@ -5,6 +5,7 @@ import PrismData
 @testable import PrismDesign
 import QuartzCore
 import SwiftUI
+import Synchronization
 import Testing
 @testable import PrismUI
 
@@ -582,6 +583,95 @@ struct ScrollProbeTests {
             guard let best = results[name]?.min(by: { $0.totalCPU < $1.totalCPU }) else { continue }
             print("[probe-structure] \(name): wall p50 \(format(best.p50Wall)) ms, p95 \(format(best.p95Wall)) ms, "
                 + "max \(format(best.maxWall)) ms, \(best.overBudget)/\(best.steps) over; total CPU \(format(best.totalCPU)) ms")
+        }
+    }
+
+    /// Caption-cost attribution: holds the artwork at production configuration and varies
+    /// only the caption text tree. `noFonts`/`noStyles` are pixel-changing floor probes —
+    /// they exist to price font resolution and hierarchical style resolution, not to ship.
+    @Test func captionMechanism() async throws {
+        let configurations: [(String, ProbeMountOptions)] = [
+            ("full", .full),
+            ("captions/none", .full.with { $0.captions = .none }),
+            ("captions/no-inner-frame", .full.with { $0.captions = .titleAndSubtitleNoInnerFrame }),
+            ("captions/no-primary-style", .full.with { $0.captions = .noPrimaryStyle }),
+            ("captions/foreground-color", .full.with { $0.captions = .foregroundColor }),
+            ("captions/fixed-height", .full.with { $0.captions = .fixedHeight }),
+            ("captions/combined", .full.with { $0.captions = .combined }),
+            ("captions/title-only", .full.with { $0.captions = .titleOnly }),
+            ("captions/no-styles-floor", .full.with { $0.captions = .noStyles }),
+            ("captions/no-fonts-floor", .full.with { $0.captions = .noFonts }),
+            ("captions/no-fonts-no-styles-floor", .full.with { $0.captions = .noFontsNoStyles }),
+        ]
+        try await measureInterleaved(configurations: configurations, tag: "probe-captions", repetitions: 5)
+    }
+
+    /// Placeholder-cost attribution: holds captions at production configuration and varies
+    /// only the artwork fills. `flatSameTree`/`linearOnly` price the tree structure against
+    /// the gradient fills; `bitmap` prices a per-seed pre-rendered CGImage.
+    @Test func artworkMechanism() async throws {
+        let configurations: [(String, ProbeMountOptions)] = [
+            ("full", .full),
+            ("artwork/flat", .full.with { $0.artwork = .flat }),
+            ("artwork/flat-same-tree", .full.with { $0.artwork = .flatSameTree }),
+            ("artwork/linear-only", .full.with { $0.artwork = .linearOnly }),
+            ("artwork/flattened", .full.with { $0.artwork = .surfaceFlattened }),
+            ("artwork/flattened-full", .full.with { $0.artwork = .flattenedFull }),
+            ("artwork/canvas", .full.with { $0.artwork = .canvas }),
+            ("artwork/bitmap", .full.with { $0.artwork = .bitmap }),
+        ]
+        try await measureInterleaved(configurations: configurations, tag: "probe-artwork", repetitions: 5)
+    }
+
+    /// High-precision remeasure of the byte-identical flattening candidate against the
+    /// production ZStack. 10 interleaved repetitions: with min-of-N only, differences
+    /// below ~15 ms are noise on a moderately loaded machine.
+    @Test func flatteningPrecision() async throws {
+        let configurations: [(String, ProbeMountOptions)] = [
+            ("full", .full),
+            ("artwork/flattened", .full.with { $0.artwork = .surfaceFlattened }),
+            ("artwork/flattened-full", .full.with { $0.artwork = .flattenedFull }),
+        ]
+        try await measureInterleaved(configurations: configurations, tag: "probe-flatten", repetitions: 10)
+    }
+
+    /// Shared interleaved min-of-N harness for the focused mechanism probes. Every
+    /// configuration runs once per round-robin repetition (alternating direction); the
+    /// reported line is the least-CPU run — noise can only inflate these samples.
+    private func measureInterleaved(
+        configurations: [(String, ProbeMountOptions)], tag: String, repetitions: Int
+    ) async throws {
+        var results: [String: [ProbeRunResult]] = [:]
+        for repetition in 0..<repetitions {
+            if repetition.isMultiple(of: 2) {
+                results["production", default: []].append(try await runShelfMountProbe { index in
+                    PosterCard(imageURL: nil, seed: "Film \(index)", title: "Film \(index)",
+                               subtitle: "20\(index % 25)", showsTitle: true, action: {}) {
+                        Button("Lire") {}
+                    }
+                })
+            }
+            let round = repetition.isMultiple(of: 2) ? configurations : configurations.reversed()
+            for (name, options) in round {
+                results[name, default: []].append(try await runShelfMountProbe { index in
+                    ProbeMountCard(index: index, options: options)
+                })
+            }
+            if !repetition.isMultiple(of: 2) {
+                results["production", default: []].append(try await runShelfMountProbe { index in
+                    PosterCard(imageURL: nil, seed: "Film \(index)", title: "Film \(index)",
+                               subtitle: "20\(index % 25)", showsTitle: true, action: {}) {
+                        Button("Lire") {}
+                    }
+                })
+            }
+        }
+        for (name, _) in [("production", ProbeMountOptions.full)] + configurations {
+            let values = results[name] ?? []
+            guard let best = values.min(by: { $0.totalCPU < $1.totalCPU }) else { continue }
+            let all = values.map { format($0.totalCPU) }.joined(separator: " ")
+            print("[\(tag)] \(name): wall p50 \(format(best.p50Wall)) ms, p95 \(format(best.p95Wall)) ms, "
+                + "max \(format(best.maxWall)) ms, \(best.overBudget)/\(best.steps) over; total CPU \(format(best.totalCPU)) ms; all [\(all)]")
         }
     }
 
@@ -1335,6 +1425,148 @@ private struct ProbeCanvasPlaceholder: View {
     }
 }
 
+/// Attribution probe: production placeholder minus the radial glow layer.
+private struct ProbeLinearOnlyPlaceholder: View {
+    private let palette: PlaceholderArtwork.Palette
+
+    init(seed: String) {
+        palette = PlaceholderArtwork.Palette(seed: seed)
+    }
+
+    var body: some View {
+        LinearGradient(colors: palette.gradient, startPoint: palette.start, endPoint: palette.end)
+            .accessibilityHidden(true)
+    }
+}
+
+/// Attribution probe: identical tree shape to production (`ZStack` of two fills + empty label)
+/// but flat colors instead of gradients. Isolates fill cost from tree/compositing cost.
+private struct ProbeFlatSameTreePlaceholder: View {
+    private let palette: PlaceholderArtwork.Palette
+
+    init(seed: String) {
+        palette = PlaceholderArtwork.Palette(seed: seed)
+    }
+
+    var body: some View {
+        ZStack {
+            palette.top
+            palette.bottom.opacity(0.5)
+            EmptyView()
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Same layers as production (`ZStack` linear + radial + empty label) but reordered into
+/// `linear.overlay { radial }` with the label branch preserved structurally.
+private struct ProbeFlattenedFullPlaceholder: View {
+    private let palette: PlaceholderArtwork.Palette
+
+    init(seed: String) {
+        palette = PlaceholderArtwork.Palette(seed: seed)
+    }
+
+    var body: some View {
+        LinearGradient(colors: palette.gradient, startPoint: palette.start, endPoint: palette.end)
+            .overlay {
+                RadialGradient(colors: [.white.opacity(0.10), .clear], center: palette.glowCenter, startRadius: 0, endRadius: 225)
+            }
+            .overlay { EmptyView() }
+            .accessibilityHidden(true)
+    }
+}
+
+/// Pre-rendered bitmap probe: both gradients drawn once per (seed, pixel size) into a cached
+/// CGImage through CoreGraphics, then mounted as a plain decorative image.
+private struct ProbeBitmapPlaceholder: View {
+    private let image: CGImage?
+    private let size: CGSize
+
+    init(seed: String, size: CGSize, scale: CGFloat = 2) {
+        self.size = size
+        image = ProbeBitmapCache.image(seed: seed, pointSize: size, scale: scale)
+    }
+
+    var body: some View {
+        if let image {
+            Image(decorative: image, scale: 2)
+                .frame(width: size.width, height: size.height)
+                .accessibilityHidden(true)
+        } else {
+            Color(white: 0.2)
+                .frame(width: size.width, height: size.height)
+        }
+    }
+}
+
+private enum ProbeBitmapCache {
+    private struct Key: Hashable {
+        let seed: String
+        let width: Int
+        let height: Int
+    }
+
+    private static let storage = Mutex<[Key: CGImage]>([:])
+
+    static func image(seed: String, pointSize: CGSize, scale: CGFloat) -> CGImage? {
+        let pixelWidth = Int((pointSize.width * scale).rounded(.up))
+        let pixelHeight = Int((pointSize.height * scale).rounded(.up))
+        let key = Key(seed: seed, width: pixelWidth, height: pixelHeight)
+        if let hit = storage.withLock({ $0[key] }) { return hit }
+        guard let image = render(seed: seed, pixelWidth: pixelWidth, pixelHeight: pixelHeight, scale: scale) else { return nil }
+        storage.withLock { cache in
+            if cache.count > 512 { cache.removeAll(keepingCapacity: true) }
+            cache[key] = image
+        }
+        return image
+    }
+
+    /// Reproduces `PlaceholderArtwork`'s two fills in one bitmap: linear gradient first,
+    /// then the radial glow composited on top — the same order the `ZStack` composites them.
+    private static func render(seed: String, pixelWidth: Int, pixelHeight: Int, scale: CGFloat) -> CGImage? {
+        let palette = PlaceholderArtwork.Palette(seed: seed)
+        guard let context = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        let size = CGSize(width: CGFloat(pixelWidth) / scale, height: CGFloat(pixelHeight) / scale)
+        context.scaleBy(x: scale, y: scale)
+        // Match SwiftUI's top-left origin inside the bitmap: row 0 of the image is the
+        // visual top, so unit points convert one-to-one.
+        context.translateBy(x: 0, y: size.height)
+        context.scaleBy(x: 1, y: -1)
+
+        // Replay the palette's generator sequence: the two grayscale whites are the first
+        // two draws, so the gradient endpoints are exact instead of reverse-engineered
+        // from `Color` (whose components SwiftUI does not expose).
+        var rng = StableHash.Generator(seed: seed)
+        let topW = 0.12 + rng.unit() * 0.19
+        let bottomW = 0.045 + rng.unit() * 0.045
+
+        let linearColors: [CGFloat] = [topW, topW, topW, 1, bottomW, bottomW, bottomW, 1]
+        if let gradient = CGGradient(colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(), colorComponents: linearColors, locations: [0, 1], count: 2) {
+            context.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: palette.start.x * size.width, y: palette.start.y * size.height),
+                end: CGPoint(x: palette.end.x * size.width, y: palette.end.y * size.height),
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+            )
+        }
+        let glowColors: [CGFloat] = [1, 1, 1, 0.10, 1, 1, 1, 0]
+        if let glow = CGGradient(colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(), colorComponents: glowColors, locations: [0, 1], count: 2) {
+            context.drawRadialGradient(
+                glow,
+                startCenter: CGPoint(x: palette.glowCenter.x * size.width, y: palette.glowCenter.y * size.height), startRadius: 0,
+                endCenter: CGPoint(x: palette.glowCenter.x * size.width, y: palette.glowCenter.y * size.height), endRadius: 225,
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+            )
+        }
+        return context.makeImage()
+    }
+}
+
 private enum ProbeScrollStateMode: String, CaseIterable {
     case boolOnly = "bool-only"
     case activityOnly = "activity-only"
@@ -1368,8 +1600,32 @@ private struct ProbeMountOptions: Hashable {
     enum Interaction: Hashable { case button, plainButton, tap, tapPressGesture, dragGeometry, dragGeometryBox, dragHover, none, noneGeometryState, noneGeometryBox }
     enum MenuAttachment: Hashable { case production, contextOnly, accessibilityActionsOnly, none }
     enum Accessibility: Hashable { case full, labelAndTraits, none }
-    enum Captions: Hashable { case titleAndSubtitle, titleAndSubtitleNoInnerFrame, titleOnly, combined, none }
-    enum Artwork: Hashable { case surface, surfaceFlattened, placeholder, canvas, flat }
+    enum Captions: Hashable {
+        case titleAndSubtitle, titleAndSubtitleNoInnerFrame, titleOnly, combined, none
+        /// Production minus `.foregroundStyle(.primary)` on the title (the default for Text).
+        case noPrimaryStyle
+        /// Production minus both hierarchical styles (pixel-changing floor probe).
+        case noStyles
+        /// Production minus both `.font` modifiers (pixel-changing floor probe).
+        case noFonts
+        /// Production minus fonts and styles (floor probe).
+        case noFontsNoStyles
+        /// Production inside a fixed-height caption frame (matches posterCaptionHeight layout).
+        case fixedHeight
+        /// Production with `.foregroundColor` instead of `.foregroundStyle`.
+        case foregroundColor
+    }
+    enum Artwork: Hashable {
+        case surface, surfaceFlattened, placeholder, canvas, flat
+        /// Production tree minus the radial glow layer (pixel-changing attribution probe).
+        case linearOnly
+        /// Same ZStack structure as production but flat fills (pixel-changing attribution probe).
+        case flatSameTree
+        /// One pre-rendered CGImage bitmap per seed, drawn with the same gradient parameters.
+        case bitmap
+        /// Production tree but with the radial glow flattened into the linear overlay chain.
+        case flattenedFull
+    }
     enum PressEffects: Hashable { case production, noDeadShadow, noBrightness, singleAnimation, none }
 
     var interaction: Interaction = .button
@@ -1383,6 +1639,15 @@ private struct ProbeMountOptions: Hashable {
     var pressEffects: PressEffects = .production
     var remoteArtwork = false
     var shareScrollingRead = false
+
+    fileprivate var captionsHasSubtitle: Bool {
+        switch captions {
+        case .titleAndSubtitle, .titleAndSubtitleNoInnerFrame, .noPrimaryStyle, .noStyles, .noFonts, .noFontsNoStyles, .fixedHeight, .foregroundColor:
+            true
+        case .titleOnly, .combined, .none:
+            false
+        }
+    }
 
     static let full = ProbeMountOptions()
     /// Production artwork and captions, but none of the interactive/AX chrome around them.
@@ -1547,18 +1812,49 @@ private struct ProbeMountCard: View {
                         .frame(width: width, alignment: .leading)
                 } else {
                     let lines = VStack(alignment: .leading, spacing: 2) {
-                        Text(title)
-                            .font(PrismFont.cardTitle)
-                            .foregroundStyle(.primary)
-                        if options.captions == .titleAndSubtitle || options.captions == .titleAndSubtitleNoInnerFrame {
-                            Text(subtitle)
-                                .font(PrismFont.cardMeta)
-                                .foregroundStyle(.secondary)
+                        switch options.captions {
+                        case .noFonts, .noFontsNoStyles:
+                            Text(title)
+                        case .noStyles:
+                            Text(title)
+                                .font(PrismFont.cardTitle)
+                        case .noPrimaryStyle:
+                            Text(title)
+                                .font(PrismFont.cardTitle)
+                        case .foregroundColor:
+                            Text(title)
+                                .font(PrismFont.cardTitle)
+                                .foregroundColor(.primary)
+                        default:
+                            Text(title)
+                                .font(PrismFont.cardTitle)
+                                .foregroundStyle(.primary)
+                        }
+                        if options.captionsHasSubtitle {
+                            switch options.captions {
+                            case .noFonts, .noFontsNoStyles:
+                                Text(subtitle)
+                            case .noStyles:
+                                Text(subtitle)
+                                    .font(PrismFont.cardMeta)
+                            case .foregroundColor:
+                                Text(subtitle)
+                                    .font(PrismFont.cardMeta)
+                                    .foregroundColor(.secondary)
+                            default:
+                                Text(subtitle)
+                                    .font(PrismFont.cardMeta)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                     .lineLimit(1)
                     if options.captions == .titleAndSubtitleNoInnerFrame {
                         lines
+                    } else if options.captions == .fixedHeight {
+                        // 8 (gap above) + 16.1 (13 pt line) + 2 + 13.4 (11 pt line) ≈ 39.5 —
+                        // the caption band `posterCaptionHeight` already reserves per row.
+                        lines.frame(width: width, height: 31, alignment: .topLeading)
                     } else {
                         lines.frame(width: width, alignment: .leading)
                     }
@@ -1597,6 +1893,25 @@ private struct ProbeMountCard: View {
         case .canvas:
             ArtworkSurface(radius: PrismMetrics.posterRadius) {
                 ProbeCanvasPlaceholder(seed: title)
+                    .frame(width: width, height: height)
+            }
+        case .linearOnly:
+            ArtworkSurface(radius: PrismMetrics.posterRadius) {
+                ProbeLinearOnlyPlaceholder(seed: title)
+                    .frame(width: width, height: height)
+            }
+        case .flatSameTree:
+            ArtworkSurface(radius: PrismMetrics.posterRadius) {
+                ProbeFlatSameTreePlaceholder(seed: title)
+                    .frame(width: width, height: height)
+            }
+        case .bitmap:
+            ArtworkSurface(radius: PrismMetrics.posterRadius) {
+                ProbeBitmapPlaceholder(seed: title, size: CGSize(width: width, height: height))
+            }
+        case .flattenedFull:
+            ArtworkSurface(radius: PrismMetrics.posterRadius) {
+                ProbeFlattenedFullPlaceholder(seed: title)
                     .frame(width: width, height: height)
             }
         case .flat:
